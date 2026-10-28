@@ -142,6 +142,7 @@
       railCrossMonths: 3,       // 每处跨越地面铁路
       minMonths: 12,            // 最短工期
       refundRatio: 0.5,         // 在建区段拆除时退回已付建设费的比例
+      downPayment: 0.4,         // 确认建设时先付的工程款比例，其余按工期分期支付
     },
 
     ops: {
