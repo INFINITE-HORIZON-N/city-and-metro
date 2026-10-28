@@ -232,6 +232,9 @@
     this.tasks.monthly(this).forEach((o) => this.logTask(o));
     this.econ.payGrant(y, m);
     this.econ.serviceDebt(y, m);   // 债券：到期利息与本金、逾期处理（每月一次，不会重复结算）
+    // 在建工程：按工期支付工程款；资金不足则停工，通车月份顺延一个月
+    const prog = this.econ.payProgress(y, m);
+    if (prog.stalled.length) this.stallProjects(prog.stalled);
     this.recordHistory();
     if (CM.Milestones) CM.Milestones.onMonth(this);
     if (this.draft) {
@@ -239,6 +242,20 @@
       this.invalidatePrediction('城市状态已更新（' + y + '年' + m + '月），请重新计算预测');
     }
     this.emit('month', { y: y, m: m });
+  };
+  // 在建工程停工：把该工程各区段的通车月份顺延一个月，并立即重编译，让客流与画面当月生效
+  Game.prototype.stallProjects = function (list) {
+    let moved = 0;
+    for (const p of list) for (const id of (p.segIds || [])) {
+      const s = this.net.segments[id];
+      if (s && s.openAt != null) { s.openAt += 1; moved++; }
+    }
+    if (moved) {
+      this.compiled = M.compile(this.net, this.city, this.ym());
+      this.model.setNetwork(this.compiled);
+    }
+    this.logEvent({ tag: '经营', title: '工程停工', desc: list.length + ' 项在建工程因资金不足停工，通车顺延 1 个月（累计停工 ' + list.map(function (p) { return p.halted; }).join('/') + ' 个月）' });
+    this.emit('toast', { kind: 'bad', text: '资金不足，在建工程停工，通车顺延 1 个月' });
   };
 
   // ---------------- 债券融资（经营挑战） ----------------
@@ -400,18 +417,45 @@
     const can = this.canConfirm();
     if (!can.ok) return can;
     const ev = this.draftEval(), d = this.draft;
-    // 扣费（按类别记入当月收支）
+    // 各对象本次实付的建设费（按 ref 汇总 construction 项；拆迁、升级、搬迁另计，不参与工期与分期）
+    const paidByRef = {};
+    for (const it of ev.items) if (it.kind === 'construction' && it.ref != null) paidByRef[it.ref] = (paidByRef[it.ref] || 0) + it.amount;
+    const nowYm = this.ym();
+    const BT = CFG.buildTime || {};
+    // 新建区段的工期：先算出计划，再决定本月实付多少工程款（其余按工期分期）
+    const segMonths = {};
+    const segPlan = [];
+    let maxMonths = 0;
+    if (BT.enabled) {
+      for (const id in d.net.segments) {
+        if (this.net.segments[id]) continue;
+        const sg = d.net.segments[id];
+        // 插入车站会拆分既有区段：新 id 继承原区段的工期，不重新计
+        if (sg.base && sg.base.length && this.net.segments[sg.base[0]]) continue;
+        const months = M.buildMonths(M.segGeom(d.net, sg, this.city), sg.type);
+        if (!(months > 0)) continue;
+        segMonths[id] = months;
+        segPlan.push({ id: id, cost: paidByRef[id] || 0 });
+        if (months > maxMonths) maxMonths = months;
+      }
+    }
+    const downPay = BT.enabled ? U.clamp(BT.downPayment == null ? 1 : BT.downPayment, 0, 1) : 1;
+    let defer = 0;
+    for (const s of segPlan) defer += s.cost * (1 - downPay);
+    defer = Math.max(0, defer);
+    // 扣费（按类别记入当月收支）：拆迁、升级、搬迁当月付清，工程款先付首付部分
     // 建设费用先从建设专项资金（债券募集）支付，不足部分用一般资金
-    this.econ.spendBuild(ev.byKind, '地铁建设（' + ev.changes.add.length + ' 项新建、' + ev.changes.mod.length + ' 项修改）', { y: this.clock.y, m: this.clock.m, d: this.clock.d });
+    const payNow = Object.assign({}, ev.byKind, { construction: Math.max(0, (ev.byKind.construction || 0) - defer) });
+    this.econ.spendBuild(payNow, '地铁建设（' + ev.changes.add.length + ' 项新建、' + ev.changes.mod.length + ' 项修改）' + (defer > 0.5 ? '（含工程款首付 ' + Math.round(downPay * 100) + '%）' : ''), { y: this.clock.y, m: this.clock.m, d: this.clock.d });
+    // 首付之外的工程款登记为在建工程，按工期分期支付；资金不足时停工、工期顺延
+    if (defer > (CM.Economy.MONEY_EPS || 0.5) && maxMonths > 0) {
+      this.econ.addProject({ total: defer, months: maxMonths, startYm: nowYm, segIds: segPlan.map(function (s) { return s.id; }), note: '地铁建设（工程进度款）' });
+    }
     for (const dm of ev.demolitions) this.city.demolish(dm.c, dm.frac);
     for (const id in d.net.stations) if (!this.net.stations[id]) d.net.stations[id].built = [this.clock.y, this.clock.m];
     // 新建、改建与搬迁后的位置成为新的“付费选址”，之后的免费微调以此为基准
     for (const id in d.net.stations) { const s = d.net.stations[id], o = this.net.stations[id]; if (o && !s.site) s.site = [o.x, o.y]; }
     for (const id of ev.siteReset || []) { const s = d.net.stations[id]; if (s) s.site = [s.x, s.y]; }
-    // 各对象本次实付的建设费（按 ref 汇总 construction 项；拆迁、升级、搬迁另计，不参与工期退款）
-    const paidByRef = {};
-    for (const it of ev.items) if (it.kind === 'construction' && it.ref != null) paidByRef[it.ref] = (paidByRef[it.ref] || 0) + it.amount;
-    const nowYm = this.ym();
     for (const id in d.net.segments) {
       if (this.net.segments[id]) continue;
       const sg = d.net.segments[id];
@@ -420,7 +464,7 @@
       const viaBase = sg.base && sg.base.length ? this.net.segments[sg.base[0]] : null;
       if (viaBase) { sg.openAt = viaBase.openAt; sg.paid = viaBase.paid; continue; }
       if (paidByRef[id] > 0) sg.paid = Math.round(paidByRef[id]);
-      const months = M.buildMonths(M.segGeom(d.net, sg, this.city), sg.type);
+      const months = segMonths[id] || 0;
       if (months > 0) sg.openAt = nowYm + months;
     }
     // 轨道的“已付费长度”：之后的免费小幅调整以此为基准累计

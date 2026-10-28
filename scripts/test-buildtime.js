@@ -130,6 +130,43 @@ ok(M.segOpen(L.segs[1], null) === true, 'segOpen(null) 视为已开通');
 console.log('\n== 7. 默认值 ==');
 ok(DEFAULT_ENABLED === false, '默认配置 buildTime.enabled 为 false');
 ok(DEFAULT_REFUND === 0.5, '默认退款比例为 50%');
+ok(CFG.buildTime.downPayment === 0.4, '默认工程款首付比例为 40%');
+
+console.log('\n== 8. 工程款分期 ==');
+const E = CM.Economy;
+const e1 = new E('challenge', 1990, 1);
+const f0 = e1.funds;
+const p1 = e1.addProject({ total: 1200, months: 12, startYm: U.ymIndex(1990, 1), segIds: ['g1'] });
+ok(!!p1 && Math.abs(p1.perMonth - 100) < 1e-6, '每月应付 = 总额 ÷ 工期');
+e1.openMonth(1990, 1);
+const r1 = e1.payProgress(1990, 1);
+ok(Math.abs(r1.paid - 100) < 1e-6, '首月支付 1 期');
+ok(Math.abs(e1.funds - (f0 - 100)) < 1e-6, '资金按进度款扣减');
+ok(Math.abs(e1.cur.construction - 100) < 1e-6, '进度款记入本期建设支出');
+for (let k = 2; k <= 12; k++) { e1.openMonth(1990, k); e1.payProgress(1990, k); }
+ok(e1.projects.length === 0, '付清后账本清空');
+ok(Math.abs(e1.funds - (f0 - 1200)) < 1e-6, '累计支付等于总额');
+
+console.log('\n== 9. 资金不足停工 ==');
+const e2 = new E('challenge', 1990, 1);
+e2.funds = 0; e2.capex = 0;
+e2.openMonth(1990, 1);
+const p2 = e2.addProject({ total: 1200, months: 12, startYm: U.ymIndex(1990, 1), segIds: ['g9'] });
+const end0 = p2.endYm;
+const r2 = e2.payProgress(1990, 1);
+ok(r2.stalled.length === 1, '资金不足时登记停工');
+ok(p2.halted === 1, '累计停工月数 +1');
+ok(p2.endYm === end0 + 1, '停工使工期顺延一个月');
+ok(e2.projects.length === 1, '停工不丢失账本');
+ok(Math.abs(e2.funds) < 1e-6 && Math.abs(p2.paid) < 1e-6, '停工时不动用资金、不记已付');
+
+console.log('\n== 10. 自由建造与存档 ==');
+const e3 = new E('free', 1990, 1);
+ok(e3.addProject({ total: 1000, months: 10, startYm: U.ymIndex(1990, 1) }) === null, '自由建造不登记在建工程');
+const sv = JSON.parse(JSON.stringify(e2.serialize()));
+ok(Array.isArray(sv.projects) && sv.projects.length === 1, '存档包含在建工程账本');
+const e4 = E.restore(sv);
+ok(e4.projects.length === 1 && e4.projects[0].halted === 1, '读档恢复在建工程与停工月数');
 
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

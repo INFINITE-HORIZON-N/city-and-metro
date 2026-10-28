@@ -28,6 +28,7 @@
     this.overdueParts = { interest: 0, principal: 0, penalty: 0 };   // 逾期的构成（偿还时分别记入利息、本金、费用）
     this.flow = [];            // 资金流水
     this.bondSeq = 1;
+    this.projects = [];        // 在建工程账本：确认建设时登记，工程款按工期分期支付
     this.fare = Object.assign({}, CFG.fareDefault);
     this.cur = blankMonth(y, m, this.funds, 0);
     this.ledger = [];
@@ -59,6 +60,46 @@
     if (!(amount > 0)) return;
     if (this.cur) this.cur.construction = (this.cur.construction || 0) - amount;
     if (!this.isFree()) this.funds += amount;
+  };
+  // 在建工程账本：确认建设时登记尚未付清的部分，工程款按工期分期支付。
+  // 资金不足时当月停工，由 Game 顺延该工程的通车月份（本模块不直接改线网）。
+  Economy.prototype.addProject = function (p) {
+    if (this.isFree() || !p) return null;
+    if (!(p.total > MONEY_EPS) || !(p.months > 0)) return null;
+    const proj = {
+      id: 'P' + (this.projSeq = (this.projSeq || 1) + 1),
+      total: p.total, paid: 0, perMonth: p.total / p.months,
+      startYm: p.startYm, endYm: p.startYm + p.months,
+      segIds: p.segIds || [], note: p.note || '地铁建设（工程进度款）',
+      halted: 0, done: false,
+    };
+    this.projects.push(proj);
+    return proj;
+  };
+  Economy.prototype.payProgress = function (y, m) {
+    const out = { paid: 0, stalled: [] };
+    if (this.isFree() || !this.projects.length) return out;
+    const ym = U.ymIndex(y, m);
+    const keep = [];
+    for (const p of this.projects) {
+      if (p.paid >= p.total - MONEY_EPS) continue;
+      if (ym < p.startYm) { keep.push(p); continue; }
+      const due = Math.min(p.perMonth, p.total - p.paid);
+      const avail = Math.max(0, this.funds) + Math.max(0, this.capex);
+      if (due > MONEY_EPS && avail < due) {
+        // 资金不足：本月停工，工期顺延，账本保留
+        p.halted += 1; p.endYm += 1;
+        out.stalled.push(p); keep.push(p);
+        continue;
+      }
+      if (due > MONEY_EPS) {
+        this.spendBuild({ construction: due }, p.note, { y: y, m: m, d: 1 });
+        p.paid += due; out.paid += due;
+      }
+      if (p.paid < p.total - MONEY_EPS) keep.push(p);
+    }
+    this.projects = keep;
+    return out;
   };
   // 价格指数以本地图的价格基年（CFG.econBase）为 1，涨幅可分段
   Economy.prototype.costIndex = function (year) { return U.priceIndex(year, CFG.cost.inflation, CFG.econBase || 1990); };
@@ -347,12 +388,14 @@
   Economy.prototype.serialize = function () {
     return { mode: this.mode, funds: this.funds, fare: this.fare, cur: this.cur, ledger: this.ledger, sat: this.sat, mods: this.mods, negMonths: this.negMonths, lowSatMonths: this.lowSatMonths, failed: this.failed, satFactors: this.satFactors, lastDay: this.lastDay,
       capex: this.capex, bonds: this.bonds, bondIssued: this.bondIssued, overdue: this.overdue, overdueParts: this.overdueParts || null, overdueMonths: this.overdueMonths, flow: this.flow, bondSeq: this.bondSeq, svc: this._svc == null ? null : this._svc,
+      projects: this.projects || [], projSeq: this.projSeq || 1,
       fisc: this.fisc || null };
   };
   Economy.restore = function (s) {
     const e = new Economy(s.mode, s.cur.y, s.cur.m);
     Object.assign(e, { funds: s.funds, fare: Economy.normFare(s.fare), cur: s.cur, ledger: s.ledger || [], sat: s.sat, mods: s.mods || [], negMonths: s.negMonths || 0, lowSatMonths: s.lowSatMonths || 0, failed: s.failed || null, satFactors: s.satFactors || null, lastDay: s.lastDay || null,
-      capex: s.capex || 0, bonds: s.bonds || [], bondIssued: s.bondIssued || {}, overdue: s.overdue || 0, overdueParts: s.overdueParts || null, overdueMonths: s.overdueMonths || 0, flow: s.flow || [], bondSeq: s.bondSeq || 1 });
+      capex: s.capex || 0, bonds: s.bonds || [], bondIssued: s.bondIssued || {}, overdue: s.overdue || 0, overdueParts: s.overdueParts || null, overdueMonths: s.overdueMonths || 0, flow: s.flow || [], bondSeq: s.bondSeq || 1,
+      projects: s.projects || [], projSeq: s.projSeq || 1 });
     e._svc = s.svc == null ? null : s.svc;
     e.fisc = s.fisc && isFinite(s.fisc.f) ? { y: s.fisc.y, f: s.fisc.f } : null;   // 1.7 及更早的存档没有财力系数，按 1 处理
     // 1.6 及更早的正式存档没有债券，默认债务为零。早期 1.7 开发档可能只保存逾期总账，
