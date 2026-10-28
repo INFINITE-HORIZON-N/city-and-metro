@@ -809,7 +809,10 @@
       const L = links[k];
       L.id = k;
       L.key = Math.min(L.verts[0], L.verts[L.verts.length - 1]) + '_' + Math.max(L.verts[0], L.verts[L.verts.length - 1]) + '_' + L.verts.length;
-      const cap = CFG.road.cap[L.cls] * (L.bridge ? 0.75 : 1);
+      // 个别路段的通行能力系数（如跨江通道的收费与限行，D.capMul 按路名给出）
+      const grp = D.capMul && L.name ? this.roadGroups[L.name - 1] : null;
+      const cmul = grp ? D.capMul[grp.name] : null;
+      const cap = CFG.road.cap[L.cls] * (L.bridge ? 0.75 : 1) * (cmul || 1);
       const t0 = L.lenM / (CFG.road.speed[L.cls] * 1000 / 60);
       arcFrom[2 * k] = L.a; arcTo[2 * k] = L.b; arcFrom[2 * k + 1] = L.b; arcTo[2 * k + 1] = L.a;
       arcLen[2 * k] = arcLen[2 * k + 1] = L.lenM;
