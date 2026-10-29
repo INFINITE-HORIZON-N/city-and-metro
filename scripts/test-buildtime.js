@@ -247,5 +247,38 @@ ok(CM.Mech.config('landValue').maxRise === 0.5, '地图可以覆盖单个参数'
 ok(CM.Mech.config('landValue').fullMonths === CFG.landValue.fullMonths, '未覆盖的参数仍取全局值');
 delete D.mechanics;
 
+console.log('\n== 13. 土地出让收入回流 ==');
+// 车站 1990 年投运，跳到 1995：站边地价已到顶，把附近若干格记成 1995 年出让
+const lvSt = { sx: { x: bx + 0.5, y: by + 0.5, built: [1990, 1] } };
+const LVOPT = Object.assign({ on: true }, CM.Mech.config('landValue'));
+city.updateLandValue(lvSt, at(60), LVOPT);
+const near5 = [];
+for (let d = 0; d <= 2; d++) {
+  const c = city.cellAt(bx + d + 0.5, by + 0.5);
+  if (c >= 0 && city.landRise[c] > 1) near5.push(c);
+}
+ok(near5.length > 0, '样本：站边有溢价格可用来做出让', near5.length + ' 格');
+const uyBackup = near5.map(function (c) { return city.urbanYear[c]; });
+for (const c of near5) city.urbanYear[c] = 1995;
+
+CM.Mech.attach({ mech: { landValue: 'on' } });
+const lrOn = CM.Macro.landRevenue({ city: city }, 1995);
+ok(lrOn > 0, '开启地价时，溢价区内的新增建设用地产生出让收入', Math.round(lrOn) + ' 万元');
+ok(Math.abs(lrOn - near5.reduce(function (a, c) { return a + (city.landRise[c] - 1); }, 0) * CFG.landValue.landPerCell) < 1, '收入 = 溢价之和 × 每格基准地价');
+
+CM.Mech.attach({ mech: { landValue: 'off' } });
+ok(CM.Macro.landRevenue({ city: city }, 1995) === 0, '关闭地价后没有这笔收入');
+
+CM.Mech.attach({ mech: { landValue: 'on' } });
+ok(CM.Macro.landRevenue({ city: city }, 1990) === 0, '开局年不计（初始建成区不是新增出让）');
+ok(CM.Macro.landRevenue({ city: city }, 1994) === 0, '没有新增建设用地的年份不计');
+
+const shareBackup = CFG.landValue.fiscalShare;
+CFG.landValue.fiscalShare = 0;
+ok(CM.Macro.landRevenue({ city: city }, 1995) === 0, 'fiscalShare 为 0 时退化为只罚不奖');
+CFG.landValue.fiscalShare = shareBackup;
+CM.Mech.attach(null);
+for (let k = 0; k < near5.length; k++) city.urbanYear[near5[k]] = uyBackup[k];
+
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

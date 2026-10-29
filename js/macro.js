@@ -340,6 +340,28 @@
     st.cur.pop += tot.pop;
     if (s) { st.cur.te += teRatio(st.te0, s); st.cur.nte++; st.cur.last = s; }
   }
+  // 土地出让收入：当年新增建设用地中，位于地铁溢价区的那部分按溢价折算成出让金。
+  // 只在「地价上涨」开启时计入；历史年份用当前地价近似（历史期没有地铁，误差可忽略）。
+  function landRevenue(g, Y) {
+    const city = g.city;
+    if (!city || !city.landRise || !CM.Mech || !CM.Mech.on('landValue')) return 0;
+    const cfg = CM.Mech.config('landValue');
+    const share = +cfg.fiscalShare || 0;
+    if (!(share > 0)) return 0;
+    // 开局年 urbanYear 里装的是整片初始建成区（不是新增出让），跳过
+    if (Y <= CFG.START.y) return 0;
+    const perCell = +cfg.landPerCell || 0;
+    if (!(perCell > 0)) return 0;
+    const uy = city.urbanYear, rise = city.landRise;
+    let surplus = 0;
+    for (let c = 0; c < city.N; c++) {
+      if (uy[c] !== Y) continue;
+      const r = rise[c] - 1;
+      if (r > 0) surplus += r;
+    }
+    return surplus * perCell * share;
+  }
+
   function settle(g, st, c, Yp) {
     const cur = st.cur.y === Yp && st.cur.n > 0 ? st.cur : null;
     const prev = st.rec.length ? st.rec[st.rec.length - 1] : null;
@@ -352,10 +374,11 @@
     const real = st.K * jobs * pi * st.teEff * (1 + gap) * shock;
     const nom = real * price;
     const rr = U.interp(c.revRatio, Yp), el = c.revElastic || 1.4;
-    const rev = nom * rr * (1 + (el - 1) * dev);
+    const landRev = landRevenue(g, Yp);
+    const rev = nom * rr * (1 + (el - 1) * dev) + landRev;
     const jobsBase = st.jobsA * jobsCurve(Yp + 0.5) / Math.max(1, jobsCurve(st.tA));
     const baseRev = st.K * jobsBase * pi * price * rr;
-    const rec = { y: Yp, n: cur ? cur.n : 0, part: !cur || cur.n < 12, real: real, nom: nom, price: price, infl: inflAt(st, c, Yp), gap: gap, shock: shock, te: st.teEff, jobs: jobs, pop: pop, rev: rev, baseRev: baseRev, fRaw: baseRev > 0 ? rev / baseRev : 1, pi: pi, sim: Yp > c.histEnd };
+    const rec = { y: Yp, n: cur ? cur.n : 0, part: !cur || cur.n < 12, real: real, nom: nom, price: price, infl: inflAt(st, c, Yp), gap: gap, shock: shock, te: st.teEff, jobs: jobs, pop: pop, rev: rev, landRev: landRev, baseRev: baseRev, fRaw: baseRev > 0 ? rev / baseRev : 1, pi: pi, sim: Yp > c.histEnd };
     rec.ev = allEvents(st, c).filter(function (ev) { const f = st.fired[ev.id]; return f && Math.abs(lvAt(f, ev, Yp)) > 1e-4; }).map(function (ev) { return ev.id; });
     if (prev && prev.y === Yp - 1) {
       rec.growth = real / prev.real - 1;
@@ -382,6 +405,7 @@
     g.econ.quoteFn = function (kind, y, term) { return Macro.quote(g, kind, y, term); };
   }
   Macro.sync = syncEcon;
+  Macro.landRevenue = landRevenue;   // 供测试与财政明细使用
 
   // 每月（monthGen 开头调用）：补结算到上一年、确定本年周期与预算、触发到期事件；返回需要记录的事件
   Macro.month = function (g, y, m) {

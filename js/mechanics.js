@@ -11,7 +11,7 @@
   M.LABEL = { buildTime: '施工工期', landValue: '地价上涨', incidents: '运营事故' };
   M.HINT = {
     buildTime: '新轨道建成前先“在建”，到期才投入运营；工程款可分期，资金不足会停工',
-    landValue: '车站周边地价随投运年限上涨，三年到顶；同一块地后来再拆更贵',
+    landValue: '车站周边地价三年内涨到 +35%：后来拆迁更贵，但溢价区内的新增建设用地会带来土地出让收入',
     incidents: '信号故障、突发大客流与暴雨限速',
   };
   M.DEF = { buildTime: 'off', landValue: 'off', incidents: 'off' };

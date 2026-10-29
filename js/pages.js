@@ -956,7 +956,7 @@
           h('div', null, h('small', null, (F.y || g.clock.y) + ' 年财力系数'), h('b', { class: (F.f || 1) >= 1 ? 'good' : 'warn' }, '×' + (F.f || 1).toFixed(2))),
           h('div', null, h('small', null, '地铁资金占比'), h('b', null, !free && L ? ((E.grantQuota(g.clock.y, g.clock.m) * (F.f || 1) * 12) / Math.max(1, L.rev) * 100).toFixed(1) + '%' : '—'))));
       el.appendChild(card);
-      el.appendChild(h('div', { class: 'note', style: { margin: '4px 2px 8px' } }, 'GDP 不等于财政收入：地方财政收入约为地图范围 GDP 的一定比例，随经济周期的波动更大；其中只有一部分安排给地铁。每年 1 月按上一年的实际财政收入与预期之比确定当年的财力系数（平滑后限定在 ×0.70–1.30），全年不变。' + (L ? '' : '第一个完整年度结算后开始生效。')));
+      el.appendChild(h('div', { class: 'note', style: { margin: '4px 2px 8px' } }, 'GDP 不等于财政收入：地方财政收入约为地图范围 GDP 的一定比例，随经济周期的波动更大；其中只有一部分安排给地铁。每年 1 月按上一年的实际财政收入与预期之比确定当年的财力系数（平滑后限定在 ×0.70–1.30），全年不变。' + (L ? '' : '第一个完整年度结算后开始生效。') + (L && L.landRev > 0 ? '其中约 ' + UI.fmtBig(L.landRev) + ' 来自土地出让：当年新增的建设用地里，位于地铁溢价区的那部分按溢价折算。' : '')));
     }
     if (!free) {
       const ny = g.clock.m === 12 ? g.clock.y + 1 : g.clock.y, nm = g.clock.m % 12 + 1;
