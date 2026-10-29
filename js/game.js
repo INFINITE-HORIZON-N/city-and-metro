@@ -2,6 +2,12 @@
 // 游戏状态与流程：时钟、日/月结算、跳月/跳年、建设草案、预测与存档序列化
 (function (CM) {
   const U = CM.U, CFG = CM.CFG, D = CM.DATA, M = CM.Metro;
+  // 传给 M.compile 的“当前月”：仅在工期启用时给值，否则 null（全部区段视为已开通）。
+  // 这样玩家中途关掉工期时，已带 openAt 的区段会立刻恢复为已开通，不会卡在在建状态。
+  const nowFor = function (g) {
+    const on = CM.Mech ? CM.Mech.on('buildTime') : !!(CFG.buildTime && CFG.buildTime.enabled);
+    return on ? U.ymIndex(g.clock.y, g.clock.m) : null;
+  };
 
   function Game() {
     U.Emitter.call(this);
@@ -37,7 +43,7 @@
     g.traffic = { v: CFG.TRAFFIC_MODEL };
     g.net = M.empty();
     g.mapInit = buildInitialNetwork(g);   // 开局既有地铁（东京 1950 年等），只在新建时生成一次，随存档保存
-    g.compiled = M.compile(g.net, g.city, U.ymIndex(g.clock.y, g.clock.m));
+    g.compiled = M.compile(g.net, g.city, nowFor(g));
     g.model.setNetwork(g.compiled);
     g.econ = new CM.Economy(g.mode, g.clock.y, g.clock.m);
     g.model.fare = g.econ.fare;
@@ -219,7 +225,7 @@
     yield;
     if (gr.streetsChanged || roadsChanged) { if (roadsChanged) city.updateStreets(); city.buildGraphs(); yield; }
     // 编译与模型刷新分多步执行；this.compiled 与模型网络在同一步内一起替换
-    const C = M.compile(this.net, city, this.ym());
+    const C = M.compile(this.net, city, nowFor(this));
     yield;
     yield* model.refreshCityGen(C);
     this.compiled = C;
@@ -251,7 +257,7 @@
       if (s && s.openAt != null) { s.openAt += 1; moved++; }
     }
     if (moved) {
-      this.compiled = M.compile(this.net, this.city, this.ym());
+      this.compiled = M.compile(this.net, this.city, nowFor(this));
       this.model.setNetwork(this.compiled);
     }
     this.logEvent({ tag: '经营', title: '工程停工', desc: list.length + ' 项在建工程因资金不足停工，通车顺延 1 个月（累计停工 ' + list.map(function (p) { return p.halted; }).join('/') + ' 个月）' });
@@ -400,7 +406,7 @@
   };
   Game.prototype.draftCompiled = function () {
     const d = this.draft; if (!d) return null;
-    if (d.compVer !== d.ver) { d.compiled = M.compile(d.net, this.city, this.ym()); d.compVer = d.ver; }
+    if (d.compVer !== d.ver) { d.compiled = M.compile(d.net, this.city, nowFor(this)); d.compVer = d.ver; }
     return d.compiled;
   };
   Game.prototype.canConfirm = function () {
@@ -422,11 +428,13 @@
     for (const it of ev.items) if (it.kind === 'construction' && it.ref != null) paidByRef[it.ref] = (paidByRef[it.ref] || 0) + it.amount;
     const nowYm = this.ym();
     const BT = CFG.buildTime || {};
+    // 机制矩阵：地图声明或玩家设置决定本局是否开工期（缺省回落 CFG.buildTime.enabled）
+    const btOn = CM.Mech ? CM.Mech.on('buildTime') : !!BT.enabled;
     // 新建区段的工期：先算出计划，再决定本月实付多少工程款（其余按工期分期）
     const segMonths = {};
     const segPlan = [];
     let maxMonths = 0;
-    if (BT.enabled) {
+    if (btOn) {
       for (const id in d.net.segments) {
         if (this.net.segments[id]) continue;
         const sg = d.net.segments[id];
@@ -439,7 +447,9 @@
         if (months > maxMonths) maxMonths = months;
       }
     }
-    const downPay = BT.enabled ? U.clamp(BT.downPayment == null ? 1 : BT.downPayment, 0, 1) : 1;
+    const downPay = btOn
+      ? U.clamp(CM.Mech ? CM.Mech.opt('buildTime', 'downPayment', BT.downPayment == null ? 1 : BT.downPayment) : (BT.downPayment == null ? 1 : BT.downPayment), 0, 1)
+      : 1;
     let defer = 0;
     for (const s of segPlan) defer += s.cost * (1 - downPay);
     defer = Math.max(0, defer);
@@ -493,7 +503,7 @@
     this.net = d.net;
     this.netVersion++;
     this.rev++;
-    this.compiled = M.compile(this.net, this.city, this.ym());
+    this.compiled = M.compile(this.net, this.city, nowFor(this));
     this.model.cancelPredict();
     // 沿线拆迁减少了人口与就业：立即重算小区人口岗位与出行需求，不等到月度结算
     if (ev.demolitions.length) { this.model.buildZones(); this.model.buildDemand(); }
@@ -609,7 +619,7 @@
     g.model.setDayType(CM.Model.dayType(g.clock.y, g.clock.m, g.clock.d));
     g.model.buildZones(); g.model.buildDemand();
     g.net = s.net;
-    g.compiled = M.compile(g.net, g.city, U.ymIndex(g.clock.y, g.clock.m));
+    g.compiled = M.compile(g.net, g.city, nowFor(g));
     g.model.setNetwork(g.compiled);
     g.econ = CM.Economy.restore(s.econ);
     g.model.fare = g.econ.fare;

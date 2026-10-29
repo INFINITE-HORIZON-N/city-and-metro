@@ -572,7 +572,7 @@
   // 施工工期（月）：按建设方式、长度与障碍物折算。未启用时返回 0，调用方据此跳过 openAt 的写入
   M.buildMonths = function (g, type) {
     const B = CFG.buildTime;
-    if (!B || !B.enabled) return 0;
+    if (!B || !(CM.Mech ? CM.Mech.on('buildTime') : B.enabled)) return 0;
     const D = (B.months && B.months[type]) || (B.months && B.months.underground);
     if (!D) return 0;
     let m = D.base + D.perKm * (g.lenM / 1000);
