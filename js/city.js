@@ -25,6 +25,42 @@
     if (i < 0 || j < 0 || i >= this.W || j >= this.H) return -1;
     return j * this.W + i;
   };
+  // 地铁溢价：车站周边地价随投运年限上涨（1 = 无溢价）。
+  // 只由“当前车站 + 各自投运月数”推导，不累积状态：拆站后地价自然回落，存档也不必保存。
+  // 多站覆盖的格取最大值，所以两站之间不会叠加到失控。
+  City.prototype.updateLandValue = function (stations, nowYm, opt) {
+    const rise = this.landRise, W = this.W, H = this.H;
+    if (!rise) return;
+    rise.fill(1);
+    const o = opt || {};
+    if (!o.on) return;
+    const R = o.radiusCells || 3;        // 750 m
+    const fall = o.fallCells || 1.6;     // 400 m 处衰减到 1/e
+    const max = o.maxRise || 0.35;       // 上限 +35%（总上限约 2.16 倍拆迁成本）
+    const full = o.fullMonths || 36;     // 三年到顶
+    for (const id in stations) {
+      const s = stations[id];
+      if (!s.built) continue;
+      const age = nowYm - (s.built[0] * 12 + s.built[1] - 1);
+      if (age <= 0) continue;
+      const amp = max * Math.min(1, age / full);
+      if (amp <= 0) continue;
+      const ci = Math.floor(s.x), cj = Math.floor(s.y);
+      for (let dj = -R; dj <= R; dj++) {
+        const j = cj + dj;
+        if (j < 0 || j >= H) continue;
+        for (let di = -R; di <= R; di++) {
+          const i = ci + di;
+          if (i < 0 || i >= W) continue;
+          const d = Math.sqrt(di * di + dj * dj);
+          if (d > R) continue;
+          const c = j * W + i;
+          const v = amp * Math.exp(-d / fall);
+          if (v > rise[c] - 1) rise[c] = 1 + v;
+        }
+      }
+    }
+  };
   City.prototype.zoneOf = function (c) {
     const Z = CFG.ZONE;
     const i = c % this.W, j = (c / this.W) | 0;
@@ -52,6 +88,8 @@
     this.street = new Uint8Array(N);
     this.protectedId = new Int16Array(N);
     this.taken = new Float32Array(N);
+    this.landRise = new Float32Array(N);   // 地铁溢价：1 = 无溢价，由 updateLandValue 每月重算
+    this.landRise.fill(1);
     this.urbanYear = new Uint16Array(N);
     this.isPark = new Uint8Array(N);
     this.landmarkOn = new Uint8Array(D.landmarks.length);

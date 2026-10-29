@@ -8,6 +8,11 @@
     const on = CM.Mech ? CM.Mech.on('buildTime') : !!(CFG.buildTime && CFG.buildTime.enabled);
     return on ? U.ymIndex(g.clock.y, g.clock.m) : null;
   };
+  // 某个机制生效的参数：on 标记本局是否启用，其余字段是全局配置被地图覆盖后的结果
+  const mechCfg = function (kind) {
+    if (!CM.Mech) return { on: !!(CFG[kind] && CFG[kind].enabled) };
+    return Object.assign({ on: CM.Mech.on(kind) }, CM.Mech.config(kind));
+  };
 
   function Game() {
     U.Emitter.call(this);
@@ -36,6 +41,11 @@
       if (this.model) this.model.setNetwork(this.compiled);
       if (this.draft) { this.draft.compVer = -1; this.invalidatePrediction('可选玩法已改变，请重新计算预测'); }
     }
+    // 地价：开关一变就重算，否则地图上要等到下个月才有反应，看起来像没生效
+    if (kind === 'landValue') {
+      this.city.updateLandValue(this.net.stations, this.ym(), mechCfg('landValue'));
+      if (this.draft) { this.draft.evalVer = -1; this.invalidatePrediction('可选玩法已改变，请重新计算预测'); }
+    }
     this.rev++;
     if (this.emit) { this.emit('mech', { kind: kind, mode: mode }); this.emit('autosave', 'mech'); }
     return true;
@@ -63,6 +73,7 @@
     g.net = M.empty();
     g.mapInit = buildInitialNetwork(g);   // 开局既有地铁（东京 1950 年等），只在新建时生成一次，随存档保存
     g.compiled = M.compile(g.net, g.city, nowFor(g));
+    g.city.updateLandValue(g.net.stations, U.ymIndex(g.clock.y, g.clock.m), mechCfg('landValue'));
     g.model.setNetwork(g.compiled);
     g.econ = new CM.Economy(g.mode, g.clock.y, g.clock.m);
     g.model.fare = g.econ.fare;
@@ -243,6 +254,9 @@
     const gr = city.growMonth({ year: yr, monthIndex: this.ym(), zoneAccess: model.zoneAccessNorm, cellWalk: acc ? acc.cellWalk : null, coverage: acc ? acc.coverage : 0, econ: econF });
     yield;
     if (gr.streetsChanged || roadsChanged) { if (roadsChanged) city.updateStreets(); city.buildGraphs(); yield; }
+    // 地铁溢价：随车站投运年限重算，影响之后所有拆迁与选址成本（机制关闭时把溢价清回 1）
+    city.updateLandValue(this.net.stations, this.ym(), mechCfg('landValue'));
+    yield;
     // 编译与模型刷新分多步执行；this.compiled 与模型网络在同一步内一起替换
     const C = M.compile(this.net, city, nowFor(this));
     yield;
@@ -523,6 +537,7 @@
     this.netVersion++;
     this.rev++;
     this.compiled = M.compile(this.net, this.city, nowFor(this));
+    this.city.updateLandValue(this.net.stations, this.ym(), mechCfg('landValue'));   // 新建或拆除车站后立刻更新溢价
     this.model.cancelPredict();
     // 沿线拆迁减少了人口与就业：立即重算小区人口岗位与出行需求，不等到月度结算
     if (ev.demolitions.length) { this.model.buildZones(); this.model.buildDemand(); }
@@ -643,6 +658,7 @@
     g.model.buildZones(); g.model.buildDemand();
     g.net = s.net;
     g.compiled = M.compile(g.net, g.city, nowFor(g));
+    g.city.updateLandValue(g.net.stations, U.ymIndex(g.clock.y, g.clock.m), mechCfg('landValue'));   // 读档即恢复溢价，不必等到下个月
     g.model.setNetwork(g.compiled);
     g.econ = CM.Economy.restore(s.econ);
     g.model.fare = g.econ.fare;

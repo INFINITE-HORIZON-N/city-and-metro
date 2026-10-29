@@ -145,6 +145,15 @@
       downPayment: 0.4,         // 确认建设时先付的工程款比例，其余按工期分期支付
     },
 
+    landValue: {
+      enabled: false,
+      radiusCells: 3,           // 溢出半径（格），1 格 = 250 m，即 750 m 影响范围
+      fallCells: 1.6,           // 衰减尺度（格）：400 m 处约降到 1/e
+      maxRise: 0.35,            // 上限：地价最多比基准高 35%（拆迁成本随之上涨，封顶约 2.16 倍）
+      fullMonths: 36,           // 车站投运多少个月后到达上限
+      fiscalShare: 0.0,         // 土地出让收入回流财政的比例（0 = 不回流，只罚不奖）
+    },
+
     ops: {
       carKmCost: 0.0009,        // 万元/车厢公里（≈9 元）
       stationDaily: { S: 1.5, M: 2.6, L: 4.5 }, // 万元/天

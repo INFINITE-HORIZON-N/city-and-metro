@@ -191,5 +191,61 @@ ok(CM.Mech.on('landValue') === false, '未实现的机制默认关闭');
 ok(CM.Mech.DEF.buildTime === 'off', '默认值表为全关');
 CM.Mech.attach(null);
 
+console.log('\n== 12. 地价上涨（landValue）==');
+// 样本：开发强度最高的街道格
+let bestC = -1, bestV = -1;
+for (let c = 0; c < city.N; c++) {
+  if (!city.street[c]) continue;
+  const v = city.pop[c] + city.jobs[c];
+  if (v > bestV) { bestV = v; bestC = c; }
+}
+const bx = bestC % city.W, by = (bestC / city.W) | 0;
+const dfBase = M.devFactor(city, bestC);
+ok(dfBase > 0, '样本格开发强度为正', dfBase.toFixed(3));
+
+const LV = { maxRise: 0.35, fullMonths: 36, radiusCells: 3, fallCells: 1.6 };
+const at = function (m) { return 1990 * 12 + m; };
+const near = { s1: { x: bx + 0.5, y: by + 0.5, built: [1990, 1] } };
+
+city.updateLandValue(near, at(36), Object.assign({ on: false }, LV));
+ok(Math.abs(M.devFactor(city, bestC) - dfBase) < 1e-6, '关闭地价时开发强度与原来完全一致');
+
+city.updateLandValue(near, at(0), Object.assign({ on: true }, LV));
+ok(Math.abs(M.devFactor(city, bestC) - dfBase) < 1e-6, '车站刚投运时还没有溢价');
+
+city.updateLandValue(near, at(36), Object.assign({ on: true }, LV));
+const dfOn = M.devFactor(city, bestC);
+ok(dfOn > dfBase * 1.2, '投运三年后同一格拆迁成本明显上涨', dfBase.toFixed(3) + ' → ' + dfOn.toFixed(3));
+ok(dfOn <= dfBase * 1.36 + 1e-4, '涨幅不超过配置上限', dfOn.toFixed(4) + ' vs ' + (dfBase * 1.35).toFixed(4));
+
+city.updateLandValue(near, at(18), Object.assign({ on: true }, LV));
+const dfHalf = M.devFactor(city, bestC);
+ok(dfHalf > dfBase && dfHalf < dfOn, '一年半时涨幅介于两者之间（渐进而非阶跃）', dfHalf.toFixed(3));
+
+// 半径之外不受影响：3 格外（750 m 外）
+const farC = city.cellAt(bx + 6 + 0.5, by + 0.5);
+if (farC >= 0 && city.street[farC]) {
+  city.updateLandValue(near, at(36), Object.assign({ on: true }, LV));
+  ok(M.devFactor(city, farC) <= M.devFactor(city, farC) + 1e-9, '半径之外仍然无溢价（对照通过）');
+  const riseFar = city.landRise[farC];
+  ok(Math.abs(riseFar - 1) < 1e-6, '3 格之外的溢价为 1', riseFar.toFixed(4));
+}
+
+// 拆站后回落
+city.updateLandValue({}, at(36), Object.assign({ on: true }, LV));
+ok(Math.abs(M.devFactor(city, bestC) - dfBase) < 1e-6, '车站拆除后地价回落到基准');
+
+// 中途关掉机制立刻清零
+city.updateLandValue(near, at(36), Object.assign({ on: true }, LV));
+city.updateLandValue(near, at(36), Object.assign({ on: false }, LV));
+ok(Math.abs(M.devFactor(city, bestC) - dfBase) < 1e-6, '关闭开关后溢价立刻清零，不用等拆迁发生');
+
+// 参数来自配置块，可被地图覆盖
+ok(CM.Mech.config('landValue').maxRise === CFG.landValue.maxRise, 'M.config 取全局配置块');
+D.mechanics = { landValue: { mode: 'on', maxRise: 0.5 } };
+ok(CM.Mech.config('landValue').maxRise === 0.5, '地图可以覆盖单个参数');
+ok(CM.Mech.config('landValue').fullMonths === CFG.landValue.fullMonths, '未覆盖的参数仍取全局值');
+delete D.mechanics;
+
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

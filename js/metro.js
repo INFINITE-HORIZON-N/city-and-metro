@@ -559,8 +559,10 @@
     if (c < 0) return 0;
     const L = city.lu[c];
     if (L === LU.WATER || L === LU.PARK || L === LU.HILL) return 0;
-    if (!city.street[c]) return 0.06;
-    return U.clamp((city.pop[c] + city.jobs[c]) / 2500, 0.15, 1.6) * (1 - city.taken[c]);
+    let v = city.street[c] ? U.clamp((city.pop[c] + city.jobs[c]) / 2500, 0.15, 1.6) * (1 - city.taken[c]) : 0.06;
+    // 地铁溢价：车站周边地价上涨，同一块地后来再拆就更贵（机制关闭时 landRise 恒为 1）
+    if (city.landRise) v *= city.landRise[c];
+    return v;
   };
   M.trackCost = function (g, type, year) {
     const ci = costIndex(year), C = CFG.cost;

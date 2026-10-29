@@ -5,11 +5,13 @@
 (function (CM) {
   const CFG = CM.CFG;
   const M = CM.Mech = {};
-  M.KINDS = ['buildTime', 'landValue', 'incidents'];
+  // KINDS 只列已经实现的机制：界面上出现一个拨了没反应的开关，比少一行更糟。
+  // 新机制写好之后再加进来；DEF 保留全部键，存档里已有的一律按原样读回。
+  M.KINDS = ['buildTime', 'landValue'];
   M.LABEL = { buildTime: '施工工期', landValue: '地价上涨', incidents: '运营事故' };
   M.HINT = {
     buildTime: '新轨道建成前先“在建”，到期才投入运营；工程款可分期，资金不足会停工',
-    landValue: '地铁覆盖范围内的地价逐年上涨，后续拆迁更贵',
+    landValue: '车站周边地价随投运年限上涨，三年到顶；同一块地后来再拆更贵',
     incidents: '信号故障、突发大客流与暴雨限速',
   };
   M.DEF = { buildTime: 'off', landValue: 'off', incidents: 'off' };
@@ -44,5 +46,14 @@
     const base = CFG[kind];
     if (base && base[key] !== undefined) return base[key];
     return fallback;
+  };
+  // 某个机制的整份参数：全局配置块打底，地图 data.mechanics[kind] 逐项覆盖（mode 除外）
+  M.config = function (kind) {
+    const out = {};
+    const base = CFG[kind] || {};
+    for (const k in base) out[k] = base[k];
+    const m = (CM.DATA && CM.DATA.mechanics && CM.DATA.mechanics[kind]) || {};
+    for (const k in m) if (k !== 'mode') out[k] = m[k];
+    return out;
   };
 })(window.CM);
