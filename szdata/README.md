@@ -31,3 +31,12 @@ FORCEYEAR=2026 node shoot.js out.png         # 直接把地形与人口推到 20
 ```
 
 原始 PBF 与 `features.json` 体积过大，已在 `szdata/.gitignore` 中排除；`shots/` 同理。
+
+## 建筑轮廓修正版（2026-10-28）
+
+`landmarks_osm.json` 保存选定建筑的 OSM 原始经纬度及来源编号；
+`build_landmarks.py` 使用最小旋转包围矩形生成 `js/landmarks_sz.js`。
+运行 `python3 build_landmarks.py`（依赖 `shapely`），不需要联网。
+2D 与 2.5D 共用轮廓；高度仍为简化模型，未标高的建筑使用估算值。
+
+`node geometry_test.js` 检查建筑避让、模型边界、S1 年代与旧存档迁移。

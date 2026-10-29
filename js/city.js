@@ -108,6 +108,7 @@
       else if (this.region[c] === airportK && startYear < D.airport.closeYear) this.lu[c] = LU.AIRPORT;
     }
     this.activateLandmarks(startYear);
+    this.airportOperating = this.lu.includes(LU.AIRPORT);
 
     // 1990 年人口与就业（估算）
     let sumP = 0, sumJ = 0;
@@ -220,6 +221,7 @@
   City.prototype.applyReclaim = function (year, keepLu) {
     const list = (D.reclaim || []).filter((r) => r.year > this.terrainYear && r.year <= year);
     if (year > this.terrainYear) this.terrainYear = year;
+    this.updateParks(year, keepLu);
     if (!list.length) return list;
     const N = this.N, W = this.W, FW = this.FW, BW = this.BW, BH = this.BH, Geo = CM.Geo, old = this.landFrac;
     this.buildWater();
@@ -241,7 +243,7 @@
     const wm = this.wmask, bm = this.bmask;
     for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) { const i = y * BW + x; if (bm[i] === 3 && !wm[((y >> 1) * FW) + (x >> 1)]) bm[i] = 0; }
     const free = function (v) { return v === 0; };
-    for (const r of list) for (const k of Geo.query(Geo.streetBk, r._f.bbox[0], r._f.bbox[1], r._f.bbox[2], r._f.bbox[3])) Geo.stroke(bm, BW, BH, BS, Geo.streets[k].p, 0.035, 1, free);
+    for (const r of list) for (const k of Geo.query(Geo.streetBk, r._f.bbox[0], r._f.bbox[1], r._f.bbox[2], r._f.bbox[3])) Geo.stroke(bm, BW, BH, BS, Geo.streets[k].p, 0.035 + Math.SQRT1_2 / BS, 1, free);
     // 道路格网的跨水标记
     for (let e = 0; e < this.eBlock.length; e++) {
       const uv = this.edgeVerts(e), VW = this.VW;
@@ -252,6 +254,26 @@
     return list;
   };
 
+  // 有明确开园年份的公园：显示与用地随同一时间表更新。
+  City.prototype.updateParks = function (year, keepLu) {
+    if (!D.parkYears) return;
+    const since = this._parkYear == null ? CFG.START.y : this._parkYear;
+    const feats = CM.Geo.parks.filter(f => D.parkYears[f.name] > since && D.parkYears[f.name] <= year);
+    this._parkYear = year;
+    if (!feats.length) return;
+    const pm = new Uint8Array(this.FW * this.FH);
+    CM.Geo.fill(pm, this.FW, this.FH, FS, feats);
+    const cov = CM.Geo.coverage(pm, this.FW, FS, this.W, this.H);
+    for (let c = 0; c < this.N; c++) {
+      if (!cov[c]) continue;
+      this.parkCov[c] = Math.max(this.parkCov[c], cov[c]); this.dirty.add(c);
+      if (cov[c] < 0.45 || this.landFrac[c] < 0.5 || this.lu[c] === LU.HILL || this.lu[c] === LU.AIRPORT || this.lu[c] === LU.LANDMARK) continue;
+      this.plan[c] = LU.PARK; this.isPark[c] = 1;
+      if (!keepLu || this.lu[c] === LU.PARK) { this.lu[c] = LU.PARK; this.pop[c] = this.jobs[c] = this.bh[c] = 0; }
+    }
+    this.version++;
+  };
+
   // 真实地理：水域、绿地、林地、区域（确定性，不随存档保存）
   City.prototype.buildTerrain = function () {
     const Geo = CM.Geo.init(), W = this.W, H = this.H, N = this.N;
@@ -260,7 +282,8 @@
     this.buildWater();
     const wm = this.wmask;    // 公园与林地覆盖率
     const pm = new Uint8Array(FW * FH);
-    Geo.fill(pm, FW, FH, FS, Geo.parks);
+    Geo.fill(pm, FW, FH, FS, Geo.parks.filter(f => !D.parkYears || !D.parkYears[f.name] || D.parkYears[f.name] <= this.terrainYear));
+    this._parkYear = this.terrainYear;
     this.parkCov = Geo.coverage(pm, FW, FS, W, H);
     // 尚未开幕的景点：其场地在开幕年份之前不算公园（例如 1990 年的世界之窗、欢乐谷）。
     // 现代 OSM 的公园面包含这些后来才建成的景区，不扣除会把它们提前画成绿地。
@@ -273,6 +296,7 @@
         }
       };
       for (const f of CM.Fac.list()) {
+        if (D.parkYears && D.parkYears[f.name]) continue;
         if (f.t !== 'scenic' && f.t !== 'park' && f.t !== 'stadium' && f.t !== 'venue') continue;
         const openY = f.lmK >= 0 ? ((D.landmarks[f.lmK] && D.landmarks[f.lmK].year) || 0) : f.open;
         if (!(openY > CFG.START.y)) continue;
@@ -348,8 +372,8 @@
     const bm = new Uint8Array(BW * BH);
     for (let y = 0; y < BH; y++) for (let x = 0; x < BW; x++) if (wm[((y >> 1) * FW) + (x >> 1)]) bm[y * BW + x] = 3;
     const free = function (v) { return v === 0; }, notWater = function (v) { return v < 2; };
-    for (const s of Geo.streets) Geo.stroke(bm, BW, BH, BS, s.p, 0.035, 1, free);
-    for (const r of Geo.rail) if (!(r.flags & 2)) Geo.stroke(bm, BW, BH, BS, r.p, 0.07, 2, notWater);
+    for (const s of Geo.streets) Geo.stroke(bm, BW, BH, BS, s.p, 0.035 + Math.SQRT1_2 / BS, 1, free);
+    for (const r of Geo.rail) if (!(r.flags & 2)) Geo.stroke(bm, BW, BH, BS, r.p, 0.07 + Math.SQRT1_2 / BS, 2, notWater);
     this.bmask = bm;
   };
 
@@ -405,17 +429,81 @@
     const lm = D.landmarks[k]; if (!lm) return false;
     const a = (lm.rot || 0) * Math.PI / 180, dx = x - lm.x, dy = y - lm.y;
     const u = dx * Math.cos(a) + dy * Math.sin(a), v = -dx * Math.sin(a) + dy * Math.cos(a);
+    if (lm.parts) return lm.parts.some(part => (!part.year || part.year <= this.terrainYear) && inRing(u * CFG.CELL_M, v * CFG.CELL_M, part.p.flat()));
     return Math.abs(u) <= lm.w / 2 / CFG.CELL_M && Math.abs(v) <= lm.d / 2 / CFG.CELL_M;
+  };
+  // 建筑碰撞索引独立于用地格：同一格可覆盖多座建筑，边角也不能漏掉。
+  City.prototype.landmarkGeometry = function () {
+    if (this._lmGeometry) return this._lmGeometry;
+    const buckets = new Map(), entries = [];
+    D.landmarks.forEach((lm, k) => {
+      if (lm.kind === 'campus' || lm.kind === 'park') return;
+      const a = (lm.rot || 0) * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+      const parts = lm.parts || [{ p: [[-lm.w / 2, -lm.d / 2], [lm.w / 2, -lm.d / 2], [lm.w / 2, lm.d / 2], [-lm.w / 2, lm.d / 2]] }];
+      for (const part of parts) {
+        const p = part.p.flatMap(([u, v]) => [lm.x + (u * ca - v * sa) / CFG.CELL_M, lm.y + (u * sa + v * ca) / CFG.CELL_M]);
+        const b = CM.Geo.bbox(p), e = { k: k, year: part.year || lm.year, p: p, bbox: b };
+        entries.push(e);
+        for (let j = Math.max(0, Math.floor(b[1])); j <= Math.min(this.H - 1, Math.floor(b[3])); j++) for (let i = Math.max(0, Math.floor(b[0])); i <= Math.min(this.W - 1, Math.floor(b[2])); i++) {
+          const c = j * this.W + i; if (!buckets.has(c)) buckets.set(c, []); buckets.get(c).push(e);
+        }
+      }
+    });
+    return (this._lmGeometry = { buckets: buckets, entries: entries });
+  };
+  City.prototype.protectedLandmarkAt = function (x, y) {
+    for (const e of this.landmarkGeometry().buckets.get(this.cellAt(x, y)) || []) {
+      if (this.landmarkOn[e.k] && e.year <= this.terrainYear && inRing(x, y, e.p)) return e.k;
+    }
+    return -1;
+  };
+  // 与建筑面的精确相交比例；合并重叠部件，避免重复计费。
+  City.prototype.protectedAlong = function (ax, ay, bx, by) {
+    const candidates = new Set(), buckets = this.landmarkGeometry().buckets, dx = bx - ax, dy = by - ay;
+    for (let j = Math.max(0, Math.floor(Math.min(ay, by))); j <= Math.min(this.H - 1, Math.floor(Math.max(ay, by))); j++) for (let i = Math.max(0, Math.floor(Math.min(ax, bx))); i <= Math.min(this.W - 1, Math.floor(Math.max(ax, bx))); i++) {
+      for (const e of buckets.get(j * this.W + i) || []) candidates.add(e);
+    }
+    const intervals = [], names = new Set();
+    for (const e of candidates) {
+      if (!this.landmarkOn[e.k] || e.year > this.terrainYear) continue;
+      const ts = [0, 1], p = e.p;
+      for (let i = 0, j = p.length - 2; i < p.length; j = i, i += 2) {
+        const ex = p[i] - p[j], ey = p[i + 1] - p[j + 1], den = dx * ey - dy * ex;
+        if (Math.abs(den) < 1e-12) continue;
+        const qx = p[j] - ax, qy = p[j + 1] - ay;
+        const t = (qx * ey - qy * ex) / den, u = (qx * dy - qy * dx) / den;
+        if (t > 0 && t < 1 && u >= 0 && u <= 1) ts.push(t);
+      }
+      ts.sort((a, b) => a - b);
+      for (let i = 1; i < ts.length; i++) {
+        const t = (ts[i - 1] + ts[i]) / 2;
+        if (ts[i] - ts[i - 1] > 1e-10 && inRing(ax + dx * t, ay + dy * t, p)) { intervals.push([ts[i - 1], ts[i]]); names.add(D.landmarks[e.k].name); }
+      }
+    }
+    intervals.sort((a, b) => a[0] - b[0]);
+    let fraction = 0, end = 0;
+    for (const [lo, hi] of intervals) { fraction += Math.max(0, hi - Math.max(lo, end)); end = Math.max(end, hi); }
+    return { fraction: fraction, names: Array.from(names), t: intervals.length ? (intervals[0][0] + intervals[0][1]) / 2 : 0 };
+  };
+  City.prototype.airportAt = function (x, y) {
+    const c = this.cellAt(x, y);
+    return c >= 0 && D.airport && this.airportOperating && this.regions[this.region[c]].id === 'airport';
   };
   // 地标按落成年份出现；建在填海土地上的地标要等场地成陆（中心所在格为陆地）后才出现
   City.prototype.activateLandmarks = function (year) {
     let changed = false;
     for (let k = 0; k < D.landmarks.length; k++) {
       const lm = D.landmarks[k];
-      if (this.landmarkOn[k] || lm.year > year) continue;
+      if (this.landmarkOn[k]) {
+        const phase = lm.parts ? lm.parts.filter(p => !p.year || p.year <= year).length : 1;
+        this._lmPhases = this._lmPhases || [];
+        if (this._lmPhases[k] !== phase) { this._lmPhases[k] = phase; for (const c of this.landmarkCells(lm)) this.dirty.add(c); this.version++; changed = true; }
+        continue;
+      }
+      if (lm.year > year) continue;
       const c0 = this.cellAt(lm.x, lm.y);
       if (c0 >= 0 && this.landFrac[c0] < 0.5) continue;
-      this.landmarkOn[k] = 1; changed = true;
+      this.landmarkOn[k] = 1; changed = true; this.version++;
       this.protectLandmark(k, null);
     }
     return changed;
@@ -423,6 +511,7 @@
   // 地标场地内的陆地格设为受保护（cells 为 null 时处理全部场地格，否则只处理其中的格，如刚成陆的格）
   City.prototype.protectLandmark = function (k, cells) {
     const lm = D.landmarks[k];
+    if (lm.kind === 'park') { for (const c of this.landmarkCells(lm)) this.dirty.add(c); return; }
     for (const c of this.landmarkCells(lm)) {
       if (cells && !cells.has(c)) continue;
       if (this.lu[c] === LU.WATER) continue;
@@ -528,7 +617,7 @@
       this.roadsBuilt[k] = 1; changed = true;
       // 建筑避让
       const hw = g.cls === 4 ? 0.1 : (g.cls === 3 ? 0.075 : 0.05);
-      if (!(g.flags & 2)) for (const p of g.ways) Geo2().stroke(bm, BW, BH, BS, p, (g.flags & 4) ? 0.04 : hw, 2, notWater);
+      if (!(g.flags & 2)) for (const p of g.ways) Geo2().stroke(bm, BW, BH, BS, p, ((g.flags & 4) ? 0.04 : hw) + Math.SQRT1_2 / BS, 2, notWater);
       // 车行格网：快速路与主干道（匝道除外）
       if (g.cls >= 3 && !(g.flags & 4)) {
         for (const p of g.ways) {
@@ -989,6 +1078,7 @@
     return true;
   };
   City.prototype.closeAirport = function () {
+    this.airportOperating = false;
     let n = 0;
     for (let c = 0; c < this.N; c++) {
       if (this.lu[c] === LU.AIRPORT) { this.lu[c] = LU.RURAL; this.dirty.add(c); n++; }
@@ -1128,7 +1218,7 @@
       taken: U.packTyped(this.taken, 'f32'), lu: U.packTyped(this.lu, 'u8'), street: U.packTyped(this.street, 'u8'),
       urbanYear: U.packTyped(this.urbanYear, 'u16'),
       regionOpen: Array.from(this.regionOpen), regionOpenDate: this.regionOpenDate,
-      landmarkOn: Array.from(this.landmarkOn),
+      landmarkOn: Array.from(this.landmarkOn), landmarkGeometryVersion: D.landmarkGeometryVersion || 0,
     };
   };
   City.prototype.restore = function (s, year) {
@@ -1141,12 +1231,22 @@
     this.landmarkOn = new Uint8Array(D.landmarks.length);
     this.protectedId.fill(0);
     const on = s.landmarkOn || [];
+    const moved = (s.landmarkGeometryVersion || 0) !== (D.landmarkGeometryVersion || 0);
+    if (moved) for (let c = 0; c < N; c++) if (this.lu[c] === LU.LANDMARK) {
+      const rg = this.regions[this.region[c]];
+      this.lu[c] = this.landFrac[c] < 0.5 ? LU.WATER : rg.scenic ? LU.HILL : rg.id === 'airport' ? LU.AIRPORT : this.planFor(c);
+      this.bh[c] = this.heightFor(c, year);
+    }
     for (let k = 0; k < D.landmarks.length; k++) {
       if (!on[k]) continue;
       this.landmarkOn[k] = 1;
       for (const c of this.landmarkCells(D.landmarks[k])) if (this.lu[c] === LU.LANDMARK || (D.landmarks[k].kind === 'campus' && this.lu[c] !== LU.WATER)) this.protectedId[c] = k + 1;
     }
-    this.applyReclaim(year, true);   // 历史海岸线恢复到存档年份（用地已从存档恢复）
+    this.airportOperating = this.lu.includes(LU.AIRPORT);
+    this.applyReclaim(year, !moved);   // 地标迁移时同步恢复已开放公园；普通读档保留用地
+    if (moved) for (let k = 0; k < D.landmarks.length; k++) if (this.landmarkOn[k]) this.protectLandmark(k, null);
+    // 新增地标追加在数组末尾：旧存档也能在正确年份显示 S1。
+    this.activateLandmarks(year);
     this.eArt.fill(0); this.eName.fill(0); this.roadsBuilt.fill(0);
     this.applyRoads(year);
     this.updateStreets();

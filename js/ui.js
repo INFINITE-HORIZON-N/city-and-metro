@@ -108,6 +108,14 @@
       vb('under', 'under', '地下视图', 'U', function () { self.toggleUnder(); }),
       vb('netmap', 'network', '线路示意图', 'K', function () { self.openNetMap(); }, 'plain'),
       h('div', { class: 'dock-sep' }));
+    for (const [id, label] of [['d2', '平面'], ['iso', '立体'], ['under', '地下']]) {
+      const b = this.tbtns[id]; b.appendChild(h('span', { class: 'view-label' }, label));
+      b.setAttribute('aria-label', id === 'under' ? '切换地下视图（U）' : label + '视图');
+      b.setAttribute('aria-pressed', 'false');
+    }
+    this.underCard = h('aside', { id: 'underViewCard', class: 'hud glass hidden', 'aria-label': '地下视图状态' },
+      h('div', null, h('strong', null, '地下视图'), h('span', null, '地表淡化 · 地下线路突出')),
+      h('button', { class: 'btn sm', onclick: function () { self.toggleUnder(); }, 'aria-label': '返回地上视图' }, '返回地上', h('kbd', null, 'U')));
     // 分析图层：每个图层一个按钮，再次点击关闭；开启时按钮显示该图层的颜色
     this.dockBtns = {};
     let lastGroup = null;
@@ -171,7 +179,7 @@
     this.screen = h('div', { id: 'screen', class: 'hidden' });
     this.statsEl = h('div', { id: 'stats', class: 'hidden' });
     this.fxLayer = h('div', { id: 'fxLayer' });
-    app.append(this.top, this.dock, this.legendCard, this.zoomCtl, this.right, this.toolbar, this.bstack, this.feed, this.tip, this.uitip, this.fxLayer, this.statsEl, this.screen);
+    app.append(this.top, this.dock, this.underCard, this.legendCard, this.zoomCtl, this.right, this.toolbar, this.bstack, this.feed, this.tip, this.uitip, this.fxLayer, this.statsEl, this.screen);
     this.initTips();
     this.initPress();
     this.renderDock();
@@ -227,6 +235,9 @@
       el.inert = inactive;
       el.setAttribute('aria-hidden', inactive ? 'true' : 'false');
     }
+    this.underCard.classList.toggle('hidden', !on || this.R.cam.tu !== 1);
+    this.underCard.inert = !on || this.R.cam.tu !== 1;
+    this.underCard.setAttribute('aria-hidden', String(this.underCard.inert));
     if (!on) {
       this.draftbar.classList.add('hidden'); this.legendCard.classList.add('hidden'); this.statsEl.classList.add('hidden');
       if (this.legendCard.contains(document.activeElement)) document.activeElement.blur();
@@ -607,7 +618,15 @@
     this.tbtns.s3.classList.toggle('on', sp === 3);
     this.tbtns.d2.classList.toggle('on', this.R.cam.view === 0);
     this.tbtns.iso.classList.toggle('on', this.R.cam.view === 1);
-    this.tbtns.under.classList.toggle('on', this.R.cam.tu === 1);
+    const underground = this.R.cam.tu === 1;
+    this.tbtns.under.classList.toggle('on', underground);
+    this.tbtns.under.setAttribute('aria-pressed', String(underground));
+    this.tbtns.d2.setAttribute('aria-pressed', String(this.R.cam.view === 0 && !underground));
+    this.tbtns.iso.setAttribute('aria-pressed', String(this.R.cam.view === 1 && !underground));
+    if (underground) { this.tbtns.d2.classList.remove('on'); this.tbtns.iso.classList.remove('on'); }
+    this.underCard.classList.toggle('hidden', !g || !underground || this.dock.classList.contains('hidden'));
+    this.underCard.inert = this.underCard.classList.contains('hidden');
+    this.underCard.setAttribute('aria-hidden', String(this.underCard.inert));
     this.renderToolOpts();
     if (g) this.pauseChip.classList.toggle('hidden', !(sp === 0 && !g.jumping && this.screen.classList.contains('hidden')));
   };
@@ -622,9 +641,9 @@
     if (s === 0 && was > 0 && !this.isSaved()) this.scheduleAutosave();   // 暂停时自动保存当前进度
   };
   UI.prototype.togglePause = function () { const g = this.g(); if (!g) return; this.setSpeed(g.speed > 0 ? 0 : (this.prevSpeed || 1)); };
-  UI.prototype.setView = function (iso) { if (this.R.cam.view !== (iso ? 1 : 0)) snd('swoosh'); this.R.setView(iso); this.renderToolbar(); };
+  UI.prototype.setView = function (iso) { if (this.R.cam.view !== (iso ? 1 : 0)) snd('swoosh'); this.tools.cancelDrag(); this.R.setUnder(false); this.R.setView(iso); this.renderToolbar(); };
   UI.prototype.toggleView = function () { this.setView(this.R.cam.view !== 1); };
-  UI.prototype.toggleUnder = function () { snd('swoosh'); this.R.setUnder(this.R.cam.tu !== 1); this.renderToolbar(); };
+  UI.prototype.toggleUnder = function () { this.tools.cancelDrag(); snd('swoosh'); this.R.setUnder(this.R.cam.tu !== 1); this.renderToolbar(); };
   // 浅色 / 深色：顶栏与开始界面上的按钮直接切换（不在设置里）
   UI.prototype.toggleTheme = function () { CM.Settings.set('theme', document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'); snd('toggle'); };
   UI.prototype.renderThemeBtns = function () {
