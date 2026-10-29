@@ -28,3 +28,9 @@ js/geo_sz.js 由 szdata/ 下的脚本（fetch.py / extract.py / make_sea.py / bu
 本项目预处理的 OpenStreetMap 地理数据库继续按 ODbL 1.0 提供。
 游戏的非商业使用条款不限制该数据库原许可授予的权利。
 本游戏自有代码的许可与地理数据库许可分别适用。
+
+js/landmarks_sz.js and szdata/landmarks_osm.json contain selected OpenStreetMap
+building outlines (retrieved 2026-10-28), © OpenStreetMap contributors, ODbL 1.0.
+Each source object is recorded as way/<id>; its public URL is
+https://www.openstreetmap.org/way/<id>. The local metre coordinates are generated
+by szdata/build_landmarks.py. Heights not supplied by OSM are visual estimates.

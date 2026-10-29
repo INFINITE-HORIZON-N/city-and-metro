@@ -35,7 +35,7 @@ global.navigator = { userAgent: 'node' };
 const CM = {}; global.CM = CM; window.CM = CM;
 const FILES = ['util.js', 'config.js', 'news.js', 'geo_gz.js', 'geo.js', 'data_gz.js', 'data_tutorial.js',
   'geo_hz.js', 'data_hz.js', 'geo_hk.js', 'data_hk.js', 'geo_tk.js', 'data_tk.js', 'geo_tp.js', 'data_tp.js',
-  'geo_sz.js', 'data_sz.js', 'maps.js', 'facility.js', 'city.js', 'metro.js', 'sim.js', 'economy.js', 'macro.js'];
+  'geo_sz.js', 'landmarks_sz.js', 'data_sz.js', 'maps.js', 'facility.js', 'city.js', 'metro.js', 'sim.js', 'economy.js', 'macro.js'];
 for (const f of FILES) eval(fs.readFileSync(path.join(ROOT, 'js', f), 'utf8'));
 
 CM.useMap('sz');

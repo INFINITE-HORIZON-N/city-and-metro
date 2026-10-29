@@ -1,0 +1,42 @@
+{
+  "checks": [
+    {
+      "year": 1990,
+      "buildings": 6616,
+      "landmarks": 2
+    },
+    {
+      "year": 1991,
+      "buildings": 6615,
+      "landmarks": 4
+    },
+    {
+      "year": 1998,
+      "buildings": 6449,
+      "landmarks": 7
+    },
+    {
+      "year": 2013,
+      "buildings": 6402,
+      "landmarks": 21
+    },
+    {
+      "year": 2020,
+      "buildings": 6376,
+      "landmarks": 27
+    },
+    {
+      "year": 2021,
+      "buildings": 6376,
+      "landmarks": 28
+    },
+    {
+      "year": 2026,
+      "buildings": 6376,
+      "landmarks": 29
+    }
+  ],
+  "footprintLandmarks": 17,
+  "saveMigration": "passed",
+  "waterWinding": "passed"
+}

@@ -134,7 +134,10 @@
   };
 
   // ---------------- 悬停与提示 ----------------
-  Tools.prototype.world = function (sx, sy) { return this.R.unproject(sx, sy); };
+  Tools.prototype.world = function (sx, sy, type) {
+    const build = this.tool === 'station' || this.tool === 'line';
+    return this.R.unproject(sx, sy, type || build ? this.R.typeHeight(type || this.buildType) : 0);
+  };
   Tools.prototype.updateHover = function (sx, sy, mod) {
     const g = this.game(), R = this.R;
     const w = this.world(sx, sy);
@@ -150,6 +153,7 @@
     }
     const st = R.pickStation(sx, sy);
     const seg = st ? null : R.pickSegment(sx, sy);
+    if (seg && (this.tool === 'station' || this.tool === 'line') && !mod) { Object.assign(w, R.worldOnSegment(seg, sx, sy)); this.cursor.x = w.x; this.cursor.y = w.y; }
     this.hover = st ? { kind: 'station', id: st } : (seg ? { kind: 'seg', id: seg } : null);
     let tip = null;
     const net = this.net();
@@ -205,7 +209,7 @@
       const s = net.stations[sid], e = tp.adj.get(sid)[0];
       const p = M.adjCtrl(net, e.seg, sid);
       let dx = s.x - p[0], dy = s.y - p[1]; const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
-      const q = R.P(s.x, s.y, 0), q2 = R.P(s.x + dx, s.y + dy, 0);
+      const q = R.P(s.x, s.y, R.typeHeight(s.type)), q2 = R.P(s.x + dx, s.y + dy, R.typeHeight(s.type));
       let ux = q2.x - q.x, uy = q2.y - q.y; const ul = Math.hypot(ux, uy) || 1; ux /= ul; uy /= ul;
       out.push({ kind: 'extend', station: sid, line: lid, color: line.color, ox: q.x, oy: q.y, sx: q.x + ux * 28, sy: q.y + uy * 28 });
     }
@@ -310,9 +314,10 @@
   Tools.prototype.onClick = function (sx, sy, mod, multiKey) {
     const g = this.game(), R = this.R;
     if (g.jumping) return;
-    const w = this.world(sx, sy);
+    let w = this.world(sx, sy);
     const st = R.pickStation(sx, sy);
     const seg = st ? null : R.pickSegment(sx, sy);
+    if (seg && (this.tool === 'station' || this.tool === 'line') && !mod) w = R.worldOnSegment(seg, sx, sy);
     const ui = this.ui;
     // 多选：Ctrl / Shift + 点击车站或轨道（选择、修改工具）
     if (multiKey && (st || seg) && (this.tool === 'select' || this.tool === 'edit')) { ui.toggleMulti(st ? 'station' : 'seg', st || seg); this.updateHover(sx, sy, mod); return; }
@@ -477,15 +482,15 @@
     const addSeg = function (sid) {
       const s = net.segments[sid]; if (!s) return;
       const ctrl = M.userControl(net, s);
-      for (let k = 0; k < (s.pts || []).length; k++) { const p = R.P(s.pts[k][0], s.pts[k][1], 0); out.push({ kind: 'bend', seg: sid, k: k, sx: p.x, sy: p.y }); }
+      for (let k = 0; k < (s.pts || []).length; k++) { const p = R.P(s.pts[k][0], s.pts[k][1], R.typeHeight(s.type)); out.push({ kind: 'bend', seg: sid, k: k, sx: p.x, sy: p.y }); }
       for (let k = 0; k + 1 < ctrl.length; k++) {
         const mx = (ctrl[k][0] + ctrl[k + 1][0]) / 2, my = (ctrl[k][1] + ctrl[k + 1][1]) / 2;
-        const p = R.P(mx, my, 0); out.push({ kind: 'mid', seg: sid, k: k, sx: p.x, sy: p.y });
+        const p = R.P(mx, my, R.typeHeight(s.type)); out.push({ kind: 'mid', seg: sid, k: k, sx: p.x, sy: p.y });
       }
     };
     if (sel.kind === 'seg') addSeg(sel.id);
     if (sel.kind === 'station' && net.stations[sel.id]) {
-      const s = net.stations[sel.id], p = R.P(s.x, s.y, 0);
+      const s = net.stations[sel.id], p = R.P(s.x, s.y, R.typeHeight(s.type));
       out.push({ kind: 'station', id: sel.id, sx: p.x, sy: p.y });
       for (const id in net.segments) { const sg = net.segments[id]; if (sg.a === sel.id || sg.b === sel.id) addSeg(id); }
     }
@@ -498,7 +503,9 @@
     return best ? Object.assign({}, best) : null;
   };
   Tools.prototype.dragTo = function (sx, sy) {
-    const g = this.game(), d = this.drag, w = this.world(sx, sy);
+    const g = this.game(), d = this.drag, net0 = this.net();
+    const item = d.kind === 'station' ? net0.stations[d.id] : net0.segments[d.seg];
+    const w = this.world(sx, sy, item ? item.type : this.buildType);
     g.liveEdit(function (net) {
       if (d.kind === 'station') { const s = net.stations[d.id]; if (s) { s.x = w.x; s.y = w.y; } }
       else if (d.kind === 'bend') { const s = net.segments[d.seg]; if (s && s.pts[d.k]) s.pts[d.k] = [w.x, w.y]; }
@@ -546,7 +553,7 @@
       case 'e': this.setTool('edit'); break;
       case 'x': this.setTool('demolish'); break;
       case 't': this.ui.toggleView(); break;
-      case 'u': this.ui.toggleUnder(); break;
+      case 'u': if (!e.repeat) this.ui.toggleUnder(); break;
       case 'g': this.ui.openStats(); break;
       case 'k': this.ui.openNetMap(); break;
       case '/': e.preventDefault(); this.ui.openSearch(); break;
@@ -588,19 +595,20 @@
       const st = this.hover && this.hover.kind === 'station' ? net.stations[this.hover.id] : null;
       const end = st ? [st.x, st.y] : [cur.x, cur.y];
       const geo = this.previewGeom(end).geo;
+      const heights = M.heightProfile(geo, net.stations[this.chain].type, this.buildType, st ? st.type : this.buildType);
       const lid = this.lineChoice;
       const col = net.lines[lid] ? net.lines[lid].color : CM.DATA.lineColorsNice[(Object.keys(net.lines).length) % CM.DATA.lineColorsNice.length];
       ctx.lineJoin = 'round'; ctx.lineCap = 'round';
       ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = R.lineWidthPx() + 3;
-      ctx.beginPath(); geo.pts.forEach(function (p, i) { const q = R.P(p[0], p[1], 0); if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y); }); ctx.stroke();
+      ctx.beginPath(); geo.pts.forEach(function (p, i) { const q = R.P(p[0], p[1], R.displayHeight(heights[i])); if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y); }); ctx.stroke();
       ctx.strokeStyle = this.hint && this.hint.bad ? '#d63031' : col; ctx.lineWidth = R.lineWidthPx(); ctx.setLineDash([8, 6]); ctx.lineDashOffset = -R.time * 20;
       ctx.stroke(); ctx.setLineDash([]); ctx.lineDashOffset = 0;
-      for (const b of this.bends) { const q = R.P(b[0], b[1], 0); ctx.fillStyle = '#fff'; ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
-      if (!st) { const q = R.P(end[0], end[1], 0); ctx.strokeStyle = this.hint && this.hint.bad ? '#d63031' : col; ctx.lineWidth = 2.5; ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.beginPath(); ctx.arc(q.x, q.y, 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
+      for (const b of this.bends) { const q = R.P(b[0], b[1], R.typeHeight(this.buildType)); ctx.fillStyle = '#fff'; ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
+      if (!st) { const q = R.P(end[0], end[1], R.typeHeight(this.buildType)); ctx.strokeStyle = this.hint && this.hint.bad ? '#d63031' : col; ctx.lineWidth = 2.5; ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.beginPath(); ctx.arc(q.x, q.y, 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
     }
     // 建站预览
     if (this.tool === 'station' && cur && !this.hover) {
-      const q = R.P(cur.x, cur.y, 0);
+      const q = R.P(cur.x, cur.y, R.typeHeight(this.buildType));
       const ok = M.checkSite(g.city, cur.x, cur.y, this.buildType).ok;
       ctx.strokeStyle = ok ? '#1e88e5' : '#d63031'; ctx.lineWidth = 2; ctx.fillStyle = 'rgba(255,255,255,0.8)';
       ctx.beginPath(); ctx.arc(q.x, q.y, 7, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
@@ -617,16 +625,17 @@
       const imp = this.ui.demolishImpact(this.hover);
       ctx.lineCap = 'round'; ctx.lineJoin = 'round';
       if (imp) for (const id of imp.removed) if (R.segPx && R.segPx.get(id)) { ctx.strokeStyle = 'rgba(214,48,49,0.7)'; ctx.lineWidth = R.lineWidthPx() + 6; R.strokeArr(ctx, R.segPx.get(id)); }
-      if (this.hover.kind === 'station') { const s = net.stations[this.hover.id]; if (s) { const q = R.P(s.x, s.y, 0); ctx.strokeStyle = 'rgba(214,48,49,0.9)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(q.x, q.y, 12, 0, Math.PI * 2); ctx.stroke(); ctx.beginPath(); ctx.moveTo(q.x - 6, q.y - 6); ctx.lineTo(q.x + 6, q.y + 6); ctx.moveTo(q.x + 6, q.y - 6); ctx.lineTo(q.x - 6, q.y + 6); ctx.stroke(); } }
+      if (this.hover.kind === 'station') { const s = net.stations[this.hover.id]; if (s) { const q = R.P(s.x, s.y, R.typeHeight(s.type)); ctx.strokeStyle = 'rgba(214,48,49,0.9)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(q.x, q.y, 12, 0, Math.PI * 2); ctx.stroke(); ctx.beginPath(); ctx.moveTo(q.x - 6, q.y - 6); ctx.lineTo(q.x + 6, q.y + 6); ctx.moveTo(q.x + 6, q.y - 6); ctx.lineTo(q.x - 6, q.y + 6); ctx.stroke(); } }
       if (imp) {
         for (const id of imp.added) {
           const sg = imp.after.segments[id], ln = imp.after.lines[sg.line];
-          const pts = M.segGeom(imp.after, sg, g.city).pts;
-          ctx.beginPath(); pts.forEach(function (p, i) { const q = R.P(p[0], p[1], 0); if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y); });
+          const geo = M.segGeom(imp.after, sg, g.city), pts = geo.pts;
+          const heights = M.heightProfile(geo, imp.after.stations[sg.a].type, sg.type, imp.after.stations[sg.b].type);
+          ctx.beginPath(); pts.forEach(function (p, i) { const q = R.P(p[0], p[1], R.displayHeight(heights[i])); if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y); });
           ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth = R.lineWidthPx() + 3; ctx.stroke();
           ctx.strokeStyle = ln ? ln.color : '#2e9d57'; ctx.lineWidth = R.lineWidthPx(); ctx.setLineDash([7, 5]); ctx.stroke(); ctx.setLineDash([]);
         }
-        const ring = function (sid, col) { const s = imp.after.stations[sid]; if (!s) return; const q = R.P(s.x, s.y, 0); ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.arc(q.x, q.y, 11, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]); };
+        const ring = function (sid, col) { const s = imp.after.stations[sid]; if (!s) return; const q = R.P(s.x, s.y, R.typeHeight(s.type)); ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.arc(q.x, q.y, 11, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]); };
         for (const sid of imp.lost) ring(sid, 'rgba(110,118,130,0.95)');
         for (const sid of imp.lostXfer) ring(sid, 'rgba(232,130,30,0.95)');
       }
@@ -638,7 +647,7 @@
       mu.segs.forEach(function (id) { if (R.segPx && R.segPx.get(id)) { ctx.strokeStyle = 'rgba(30,136,229,0.45)'; ctx.lineWidth = R.lineWidthPx() + 9; R.strokeArr(ctx, R.segPx.get(id)); } });
       mu.stations.forEach(function (sid) {
         const s = net.stations[sid]; if (!s) return;
-        const q = R.P(s.x, s.y, 0);
+        const q = R.P(s.x, s.y, R.typeHeight(s.type));
         ctx.fillStyle = 'rgba(30,136,229,0.18)'; ctx.strokeStyle = '#1e88e5'; ctx.lineWidth = 2.5;
         ctx.beginPath(); ctx.arc(q.x, q.y, 13, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
       });
@@ -677,7 +686,7 @@
             R.strokeArr(ctx, R.segPx.get(c.ref));
           }
           if (c.kind === 'station' && net.stations[c.ref]) {
-            const s = net.stations[c.ref], q = R.P(s.x, s.y, 0);
+            const s = net.stations[c.ref], q = R.P(s.x, s.y, R.typeHeight(s.type));
             ctx.strokeStyle = 'rgba(214,48,49,0.85)'; ctx.lineWidth = on ? 4 : 2.5;
             ctx.beginPath(); ctx.arc(q.x, q.y, 11 + pulse * 3, 0, Math.PI * 2); ctx.stroke();
           }

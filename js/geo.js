@@ -183,7 +183,18 @@
   };
   // 在画布上描出要素路径
   Geo.tracePoly = function (ctx, f) {
-    for (const r of f.rings) { const p = r.p; ctx.moveTo(p[0], p[1]); for (let k = 2; k < p.length; k += 2) ctx.lineTo(p[k], p[k + 1]); ctx.lineTo(p[0], p[1]); }
+    // 统一外环/内洞的绕向，允许多个要素用 nonzero 取并集。
+    // OSM 的同一片海会同时属于海湾、伶仃洋和珠江口，不能对它们整体做奇偶填充。
+    for (const r of f.rings) {
+      const p = r.p; if (p.length < 6) continue;
+      let area = 0;
+      for (let k = 0, j = p.length - 2; k < p.length; j = k, k += 2) area += p[j] * p[k + 1] - p[k] * p[j + 1];
+      const reverse = (area > 0) !== r.outer;
+      const start = reverse ? p.length - 2 : 0, step = reverse ? -2 : 2;
+      ctx.moveTo(p[start], p[start + 1]);
+      for (let k = start + step; k >= 0 && k < p.length; k += step) ctx.lineTo(p[k], p[k + 1]);
+      ctx.closePath();
+    }
   };
   Geo.traceLine = function (ctx, p) { ctx.moveTo(p[0], p[1]); for (let k = 2; k < p.length; k += 2) ctx.lineTo(p[k], p[k + 1]); };
 })(window.CM);

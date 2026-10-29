@@ -1,24 +1,8 @@
-# Local credentials and machine-specific files
-.env
-.env.*
-!.env.example
-.dev.vars
-.dev.vars.*
-*.pem
-*.key
-.codex/
-.agents/
-.claude/
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Generated deployment files and tooling
+# 生成数据与本地文件，不入库
+szdata/guangdong.osm.pbf
+szdata/features.json
+szdata/buildings.json
+szdata/shots/
+szdata/sz-2026.json
 dist/
-node_modules/
-.wrangler/
-.tools/
-*.log
-*.tmp
-
+.DS_Store

@@ -506,6 +506,7 @@
       events: this.events.slice(-300),
       history: this.history.slice(-1200),
       firedEvents: this.firedEvents,
+      firedEventKeys: D.events.filter((e, k) => this.firedEvents[k]).map(e => e.y + ':' + e.m + ':' + e.title),
       favs: this.favs,
       tutorial: this.tutorial || null,
       milestones: this.milestones || null,
@@ -542,7 +543,10 @@
     g.econ = CM.Economy.restore(s.econ);
     g.model.fare = g.econ.fare;
     g.tasks = CM.Tasks.restore(s.tasks);
-    g.events = s.events || []; g.history = s.history || []; g.firedEvents = s.firedEvents || {};
+    g.events = s.events || []; g.history = s.history || []; g.firedEvents = {};
+    // 使用稳定事件身份；旧档按存档日期回填，新增/插入事件不会错位或重复弹出。
+    const firedKeys = s.firedEventKeys ? new Set(s.firedEventKeys) : null;
+    D.events.forEach((e, k) => { if (firedKeys ? firedKeys.has(e.y + ':' + e.m + ':' + e.title) : U.ymIndex(e.y, e.m) <= U.ymIndex(g.clock.y, g.clock.m)) g.firedEvents[k] = 1; });
     g.favs = { stations: (s.favs && s.favs.stations) || [], lines: (s.favs && s.favs.lines) || [], names: (s.favs && s.favs.names) || {} };
     g.mapInit = s.mapInit || null;
     g.milestones = s.milestones || null;
