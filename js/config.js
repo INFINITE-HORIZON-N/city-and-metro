@@ -2,14 +2,15 @@
 // 全局参数。PRD 中标注"待确认"的数值在此给出可调整的默认值（DEFAULT），评审确认后只需修改本文件。
 (function (CM) {
   CM.CFG = {
-    GAME_VERSION: '2.0.0',
-    TRAFFIC_MODEL: 2,      // 交通模型版本：2 = v1.9 起的出行目的、重要设施与工作日/周末模型（旧存档为 1，载入时升级）
+    GAME_VERSION: '2.2.0',
+    TRAFFIC_MODEL: 4,      // 轻量更新与交通任务复核；旧档升级前备份
+    RULES_REVISION: 3,     // 网页版规则修订：设施接驳、按格开放与景区费用；升级前备份，不重算历史
     SAVE_FORMAT: 'city-metro-save',
     SAVE_VERSION: 2,
     SAVE_MIN_VERSION: 2,   // 1.1 起地图改为真实地理，旧版存档的城市数据与之不兼容
 
-    // 地图：每格 250 m，120×96 格 ≈ 30 km × 24 km；交通小区 4×4 格（1 km²）
-    W: 120, H: 96, CELL_M: 250, ZONE: 4,
+    // 地图：每格 250 m，120×144 格 ≈ 30 km × 36 km；交通小区 4×4 格（1 km²）
+    W: 120, H: 144, CELL_M: 250, ZONE: 4,
     START: { y: 1990, m: 1, d: 1, minute: 6 * 60 },
     // 货币与价格基年（各地图在 maps.js 中替换）：内部金额单位为「万 + 本城货币」，票价为本城货币
     money: { code: 'CNY', unit: '元', wan: '万元', yi: '亿元', sym: '¥' },
@@ -17,8 +18,11 @@
 
     time: {
       secPerHour: 2.5,          // 1× 速度下，现实秒/游戏小时（一天 60 秒）
-      speeds: [1, 3, 8],        // 加速档位
+      speeds: [1, 3, 8, 24],    // 加速档位；24× 极速档约 13 分钟一个游戏年（含月结）
       visualPerSec: 24,         // 1× 下动态对象的"视觉时间"（游戏秒/现实秒），列车车辆按此运动
+      visualMaxSpeed: 8,        // 列车、车辆与行人最多按 8× 表现：极速档只加快时钟，画面保持可看清
+      nightFast: 4,             // 地铁停运的 00:00–06:00 时钟按所选速度的 4 倍掠过（设置「游戏」可关闭）
+      peaks: [[420, 540], [1020, 1140]],   // 工作日早晚高峰（分钟）：开启「高峰慢放」时按 1× 运行
     },
 
     // 一天的出行时段（模型分时段计算）
@@ -40,6 +44,8 @@
       color: { hw: '#3468d6', sc: '#8e5bd6', sh: '#e8642c', md: '#d63a5a', lz: '#1aa266', hb: '#0f8fa8' },
       // 周末出行量相对工作日的倍数（双休日制度下）；周六仍上班、上课的年代按 workWeek 提高通勤与上学（见 sim.js weekendMult）
       weekend: { hw: 0.32, sc: 0.04, sh: 1.55, md: 0.55, lz: 2.1, hb: 1.12 },
+      // 重要设施吸引比例的放大系数与各目的设施合计上限（v2.1 第二轮：设施出行需求偏少）
+      facBoost: 1.25, facCap: 0.55,
       weekWeights: { wd: 5 / 7, we: 2 / 7 },   // 周平均：5 个工作日 + 2 个周末日
       // 各时段占该目的出行的比例 [AM, MD, PM, EV]：o 去程（家→目的地；枢纽为城市→车站/机场），r 返程
       split: {
@@ -88,7 +94,7 @@
       fMax: 30,                 // 最小间隔 2 分钟
       targetLF: 0.85,
       stationCap: { S: 9000, M: 20000, L: 40000 }, // 车站每小时进出站+换乘能力 DEFAULT
-      minSpacingM: 350,         // 最小站距 DEFAULT
+      minSpacingM: 200,         // 独立车站最小间距；站外换乘仍按实际步行路径上限判断
       // 线形约束（参考城市轨道交通设计规范的量级，DEFAULT）
       minRadiusM: 250,          // 正线最小曲线半径：低于此值不允许
       warnRadiusM: 400,         // 低于此值需限速通过
@@ -96,6 +102,8 @@
       platformHalfM: 70,        // 站台直线段半长
       maxGrade: 0.03,           // 最大坡度（地下/地面/高架转换坡道）
       levelM: { underground: -15, surface: 0, elevated: 12 }, // 轨面高程（米）
+      levelFactor: 0.6,         // 天地换乘：同站增设另一层站台按该建设方式车站造价的 60% 计（共用站厅与出入口）DEFAULT
+      levelXferMin: 1.5,        // 天地换乘：进出非主站台层多走的垂直通道时间（分钟，上下车各计一次）DEFAULT
       sizeName: { S: '小型', M: '中型', L: '大型' },
       typeName: { underground: '地下', surface: '地面', elevated: '高架' },
       height: { underground: -0.11, surface: 0.0, elevated: 0.075 }, // 视觉高度（格）
@@ -106,6 +114,7 @@
       trackPerKm: { underground: 30000, surface: 6000, elevated: 12000 },
       riverPerKm: { underground: 22000, surface: 16000, elevated: 16000 }, // 越江隧道 / 跨江桥梁 附加
       hillPerKm: 12000,         // 山体隧道附加
+      envTrack: 0.35, envStation: 0.5, // 景区轨道 / 车站的环境保护附加费
       protectedPerKm: 6000,     // 保护建筑下方隧道加固附加
       // 跨越地面铁路（每处）：按本城单价折算的等效长度（km）。地下线下穿需加固与监测，高架线需上跨铁路的大跨度桥
       railCrossKm: { underground: 0.25, elevated: 0.35 },
@@ -133,8 +142,10 @@
       inflation: 0.04,
     },
 
-    // 全网统一票价（元/次，换乘不另收费）；滑块范围与步长 DEFAULT
+    // 开局票价（元/次，换乘不另收费）：统一票价，或按里程计费时的起步价；滑块范围与步长 DEFAULT
     fareDefault: { mode: 'flat', flat: 2 },
+    // 按里程计费的默认参数（新开局）：起步价含 km0 公里，之后每 step 公里加价 inc（起步价的倍数），封顶 cap（起步价的倍数）
+    fareDist: { km0: 6, step: 6, inc: 0.5, cap: 2.5 },
     fareRange: { min: 0, max: 10, step: 0.5 },
 
     choice: {
@@ -164,7 +175,6 @@
       cap: [0, 0, 1700, 3200, 5600],  // 单向小时通行能力（车/小时）
       speed: [0, 15, 28, 38, 65],     // 自由流速度 km/h
       bprA: 0.15, bprB: 4,
-      msa: 0.4,
       // 系统道路改造（拓宽、信号优化、立交）带来的通行能力增长系数（估算）
       capGrowth: [[1990, 1.0], [1995, 1.25], [2000, 1.6], [2005, 2.0], [2010, 2.4], [2020, 2.9], [2040, 3.3]],
     },
@@ -187,7 +197,8 @@
     },
 
     growth: {
-      popCurve: [[1990, 3.0e6], [1995, 3.45e6], [2000, 4.25e6], [2005, 5.15e6], [2010, 6.2e6], [2015, 6.9e6], [2020, 7.7e6], [2030, 8.5e6], [2045, 9.2e6], [2070, 9.8e6], [2300, 10.2e6]],
+      // v2.1 地图扩大后包含番禺市桥、钟村、南村与白云嘉禾、均禾一带（估算：1990 年约增加 45 万人，2020 年约增加 140 万人）
+      popCurve: [[1990, 3.28e6], [1995, 3.9e6], [2000, 4.85e6], [2005, 5.95e6], [2010, 7.3e6], [2015, 8.2e6], [2020, 9.1e6], [2030, 10.0e6], [2045, 10.8e6], [2070, 11.4e6], [2300, 11.9e6]],
       histEnd: 2020,            // 此后为模拟增长
       jobsRatio: [[1990, 0.50], [2000, 0.53], [2010, 0.56], [2030, 0.58]],
       metroBoostMax: 0.06,
@@ -195,6 +206,6 @@
 
     saves: { prefix: 'cm1.', maxManual: 12 },
     // 动态对象上限（代表性展示）：汽车、车站行人、街道行人、列车上下车乘客（每帧）；声音：列车声部与同时播放的环境短音
-    perf: { solverBudgetMs: 5, chunkBudgetMs: 6, cacheMaxPx: 24e6, maxCars: 320, maxPeds: 180, maxWalkers: 120, maxRiders: 120, trainVoices: 3, maxOneShots: 6 },
+    perf: { solverBudgetMs: 5, chunkBudgetMs: 6, sharpBudgetMs: 8, movingBudgetMs: 3, prefetchMs: 2, warmBudgetMs: 10, cacheMaxPx: 24e6, maxCars: 320, maxPeds: 180, maxWalkers: 120, maxRiders: 120, trainVoices: 3, maxOneShots: 6 },
   };
 })(window.CM);

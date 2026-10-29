@@ -166,6 +166,20 @@
   const DATA = {
     city: '青湾', riverName: '青江', tutorial: true, noDynTasks: true, fictional: true,
     stages: [[2003, '起步期'], [2008, '科技园开发期']], stageLast: '城市扩张期',
+    // 历史发展阶段（v2.2，eras.js；青湾为虚构城市）：grow 只改变人口与岗位增长的去向，corridors 为片区间通勤与购物去向倍数
+    eras: [
+      { id: 'tu-e1', from: 2000, name: '起步期', tag: '虚构',
+        summary: '虚构：城市集中在青江北岸的老城、西关与东关，东部工业区提供大量岗位。估算：老城趋于饱和，新增人口主要落在西关、东关与北站片区。',
+        grow: { pop: { oldtown: 0.7, xiguan: 1.2, dongguan: 1.2, beizhan: 1.2 }, jobs: { oldtown: 1.2, eastind: 1.3 } } },
+      { id: 'tu-e2', from: 2003, name: '科技园开发期', tag: '虚构',
+        summary: '虚构：科技园与大学城在南岸东部开放建设。估算：科技园的岗位与学生快速增加，南岸新区成为新的居住地，跨江通勤增加。',
+        grow: { pop: { nanan: 1.5, tech: 1.5, oldtown: 0.6 }, jobs: { tech: 2.0, nanan: 1.3 } },
+        demand: { sc: 1.1 }, corridors: [{ a: 'tech', b: 'oldtown', f: 1.15 }, { a: 'nanan', b: 'oldtown', f: 1.1 }] },
+      { id: 'tu-e3', from: 2008, name: '城市扩张期', tag: '虚构',
+        summary: '虚构：江湾中心落成，城市向外围扩张。估算：南岸新区的商务岗位增加，外围地区开始成为居住地。',
+        grow: { pop: { outer: 1.3, nanan: 1.3, tech: 1.2, oldtown: 0.6 }, jobs: { nanan: 1.5, tech: 1.4, oldtown: 0.9 } },
+        demand: { decayHW: 1.1 }, corridors: [{ a: 'nanan', b: 'oldtown', f: 1.15 }] },
+    ],
     dataNote: [['虚构设定', 'info', '青湾是为新手教程设计的虚构小城：地形、道路、地名、人口与历史事件均为虚构，不对应任何真实城市。'], ['模拟', 'sim', '城市发展、居民出行、道路拥堵、客流与财政为游戏模拟结果。']],
     airport: { name: '', closeYear: 9999 },
     regions: [

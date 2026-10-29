@@ -105,8 +105,14 @@
   function onReclaim(g, r) { if (r.minor) return; add(g, 'reclaim-' + r.id, { cat: 'city', icon: 'map', big: !!r.big, title: '填海成陆：' + r.name, desc: r.desc || '' }); }
   // 开局：起点与（若有）接管的既有地铁
   function onStart(g) {
-    add(g, 'start', { cat: 'history', icon: 'flag', title: CFG.START.y + ' 年 · ' + (D.city || '城市') + '，从这里开始', desc: (D.events && D.events[0] && D.events[0].desc) || '' });
+    add(g, 'start', { cat: 'history', icon: 'flag', title: (g.startYear || CFG.START.y) + ' 年 · ' + (D.city || '城市') + '，从这里开始', desc: g.startYear ? '自由建造：从 ' + g.startYear + ' 年开始，此前的城市发展按历史资料推演。' : ((D.events && D.events[0] && D.events[0].desc) || '') });
     if (g.mapInit && g.mapInit.metro) add(g, 'inherit', { cat: 'metro', icon: 'train', big: true, title: '接管既有地铁', desc: g.mapInit.metro });
+  }
+  // 历史发展阶段（v2.2）：阶段开始（背景为史实 / 估算）与上一阶段的总结（游戏模拟结果）；记在城市纪事，不弹出庆祝
+  function onEra(g, era, rec, kind) {
+    if (!era) return;
+    if (kind === 'end') add(g, 'eraend-' + era.id, { cat: 'city', icon: 'chart', title: '阶段总结：' + era.name, desc: rec && rec.text ? rec.text : '', tag: '模拟' }, g.clock);
+    else add(g, 'era-' + era.id, { cat: 'history', icon: 'calYear', big: true, title: '进入「' + era.name + '」', desc: era.summary || '', tag: era.tag || '史实' }, g.clock);
   }
   // 旧存档：按月度历史补记可推断的里程碑（日期取首次达到的月份），其余按当前状态补记
   function backfill(g) {
@@ -145,5 +151,5 @@
     return out;
   }
 
-  CM.Milestones = { CAT: CAT, state: state, onNetwork: onNetwork, onMonth: onMonth, onEvent: onEvent, onLandmarks: onLandmarks, onReclaim: onReclaim, onStart: onStart, backfill: backfill, next: next, netInfo: netInfo };
+  CM.Milestones = { CAT: CAT, state: state, onNetwork: onNetwork, onMonth: onMonth, onEvent: onEvent, onLandmarks: onLandmarks, onReclaim: onReclaim, onStart: onStart, onEra: onEra, backfill: backfill, next: next, netInfo: netInfo };
 })(window.CM);

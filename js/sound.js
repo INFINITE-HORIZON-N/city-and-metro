@@ -153,10 +153,24 @@
     horn: function (d) { tone(392, 0.24, 'square', 0.012, 0, null, 0.01, d); tone(494, 0.24, 'square', 0.009, 0, null, 0.01, d); },
     ship: function (d) { tone(98, 1.8, 'sawtooth', 0.02, 0, 96, 0.25, d); tone(147, 1.8, 'sawtooth', 0.012, 0, 145, 0.25, d); },
     bikeBell: function (d) { bell(2350, 0.18, 0.018, 0, d); bell(2350, 0.25, 0.016, 0.12, d); },
+    // 分区环境短音（v2.2）：机场、车站、景区、居住区、商业区、办公区、工业区各自的典型声音，音量都很轻
+    jetPass: function (d) { noise(7, 'lowpass', 260, 0.7, 0.05, 0, 900, d); noise(6, 'bandpass', 1800, 0.8, 0.012, 0.6, 3200, d); tone(210, 6, 'sawtooth', 0.004, 0.4, 150, 1.2, d); },   // 远处客机起飞的轰鸣
+    paChime: function (d) { bell(523, 0.5, 0.012, 0, d); bell(659, 0.5, 0.011, 0.28, d); bell(784, 0.8, 0.01, 0.56, d); },   // 广播提示音
+    stationChime: function (d) { bell(880, 0.5, 0.012, 0, d); bell(698, 0.7, 0.011, 0.32, d); },
+    trainHorn: function (d) { tone(311, 0.9, 'sawtooth', 0.006, 0, 305, 0.08, d); tone(392, 0.9, 'sawtooth', 0.005, 0, 386, 0.08, d); },   // 远处列车鸣笛
+    templeBell: function (d) { bell(147, 3.2, 0.02, 0, d); tone(294.6, 2.2, 'sine', 0.006, 0, null, 0.01, d); },
+    churchBell: function (d) { for (let k = 0; k < 3; k++) bell([392, 330, 262][k], 1.6, 0.012, k * 0.55, d); },
+    dog: function (d) { for (let k = 0; k < 2; k++) { tone(520, 0.11, 'square', 0.004, k * 0.26, 300, 0.01, d); noise(0.1, 'bandpass', 900, 1.5, 0.008, k * 0.26, null, d); } },
+    shopChime: function (d) { bell(1568, 0.3, 0.008, 0, d); bell(1319, 0.4, 0.007, 0.14, d); },
+    carPass: function (d) { noise(1.6, 'bandpass', 380, 0.8, 0.02, 0, 1200, d); noise(1.2, 'bandpass', 1200, 0.8, 0.012, 0.6, 360, d); },
+    scooter: function (d) { tone(150, 1.3, 'sawtooth', 0.004, 0, 240, 0.15, d); noise(1.2, 'bandpass', 700, 1.2, 0.006, 0, 1100, d); },
+    clank: function (d) { [410, 1130, 2170].forEach(function (f, i) { tone(f, 0.35 - i * 0.08, 'sine', 0.01 / (i + 1), 0, null, 0.002, d); }); noise(0.06, 'highpass', 2500, 0.8, 0.012, 0, null, d); },
+    reverseBeep: function (d) { for (let k = 0; k < 3; k++) tone(1050, 0.22, 'sine', 0.006, k * 0.5, null, 0.01, d); },
   };
 
   const Sound = {
     get enabled() { return pref.enabled; },
+    // 开场动画音效：返回 { stop() }；不能发声（关闭声音、浏览器尚未允许自动播放）时返回 null
     get volume() { return pref.volume; },
     play: function (name) {
       if (!pref.enabled || !SFX[name]) return;

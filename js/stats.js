@@ -1,6 +1,7 @@
 'use strict';
 // 统计面板：概览指标卡 + 交通 / 城市 / 财政 / 线路图表（SVG，悬停十字线与提示、图例、表格视图）
 (function (CM) {
+  const AX = CM.Accessibility;
   const U = CM.U;
   const h = U.h;
   // 分类色（固定顺序，不循环）：浅色 / 深色各自一套
@@ -9,9 +10,10 @@
     dark: ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'],
   };
   const TABS = [['overview', '概览', 'chart'], ['traffic', '交通', 'metro'], ['econ', '经济', 'trend'], ['finance', '财政', 'wallet'], ['milestones', '城市纪事', 'book']];
+  let patternSerial = 0;
   let ui = null, tab = 'overview', range = 'all', isOpen = false, charts = [], body = null, sig = '';
 
-  function pal() { return PALETTE[document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light']; }
+  function pal() { return AX.enabled() ? AX.palette() : PALETTE[document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light']; }
   function game() { return ui && ui.g ? ui.g() : CM.game; }
   function esc(s) { return U.esc ? U.esc(String(s)) : String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
 
@@ -53,7 +55,7 @@
     const tBtn = null;
     card.append(h('div', { class: 'ch-head' }, o.icon ? CM.icon(o.icon, 16, 'muted') : null, h('div', { class: 'ch-title' }, o.title), tBtn));
     if (o.sub) card.appendChild(h('div', { class: 'ch-sub' }, o.sub));
-    if (legendItems && legendItems.length >= 2) card.appendChild(h('div', { class: 'ch-legend' }, legendItems.map(function (it) { return h('span', null, h('i', { class: it.sq ? 'sq' : '', style: { background: it.color } }), it.name); })));
+    if (legendItems && legendItems.length >= 2) card.appendChild(h('div', { class: 'ch-legend' }, legendItems.map(function (it, k) { return h('span', null, AX.enabled() && !it.sq ? h('span', { html: '<svg width="28" height="12" aria-hidden="true"><path d="M1 6H27" stroke="' + it.color + '" stroke-width="2.5" stroke-dasharray="' + AX.dash(k) + '"/></svg>' }) : h('i', { class: it.sq ? 'sq' : '', style: { background: it.color, backgroundImage: AX.enabled() && it.sq ? AX.patternCSS(k) : '', backgroundSize: '8px 8px' } }), it.name + (AX.enabled() && !it.sq ? '（' + AX.dashName(k) + '）' : '')); })));
     card.append(plot, tbl);
     return { card: card, plot: plot, tip: tip };
   }
@@ -105,7 +107,7 @@
         s += '<line x1="' + pl + '" x2="' + (W - pr) + '" y1="' + y + '" y2="' + y + '" style="stroke:var(--faint)" stroke-dasharray="4 4" stroke-width="1"/>';
         s += '<text x="' + (W - pr) + '" y="' + y + '" dy="-4" text-anchor="end" style="fill:var(--muted)">' + esc(r.label) + '</text>';
       }
-      o.series.forEach(function (sr) {
+      o.series.forEach(function (sr, seriesIndex) {
         let d = '', pen = false, first = -1, last = -1;
         for (let i = 0; i < n; i++) {
           const v = sr.vals[i];
@@ -119,7 +121,7 @@
           const y0 = Y(Math.max(nt.lo, 0)).toFixed(1);
           s += '<path d="' + d + 'L' + X(last).toFixed(1) + ' ' + y0 + 'L' + X(first).toFixed(1) + ' ' + y0 + 'Z" fill="' + sr.color + '" fill-opacity="0.1"/>';
         }
-        s += '<path d="' + d + '" fill="none" stroke="' + sr.color + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+        s += '<path d="' + d + '" fill="none" stroke="' + sr.color + '"' + (AX.enabled() ? ' stroke-dasharray="' + AX.dash(seriesIndex) + '"' : '') + ' stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
         if (last >= 0) s += '<circle cx="' + X(last).toFixed(1) + '" cy="' + Y(sr.vals[last]).toFixed(1) + '" r="4" fill="' + sr.color + '" style="stroke:var(--surface-solid)" stroke-width="2"/>';
       });
       s += '<g class="hov" style="display:none"><line y1="' + pt + '" y2="' + (Hh - pb) + '" style="stroke:var(--line-strong)" stroke-width="1"/>' + o.series.map(function (sr) { return '<circle r="4.5" fill="' + sr.color + '" style="stroke:var(--surface-solid)" stroke-width="2"/>'; }).join('') + '</g>';
@@ -165,11 +167,13 @@
       const hi = Math.max.apply(null, tots);
       const W = Math.max(260, sh.plot.clientWidth || 420), Hh = o.height || 180;
       const pl = 48, pr = 10, pt = 10, pb = 22;
+      const patternPrefix = 'cb-stack-' + (++patternSerial);
       const nt = niceTicks(0, hi > 0 ? hi : 1, 4);
       const Y = function (v) { return pt + (1 - v / nt.hi) * (Hh - pt - pb); };
       const slot = (W - pl - pr) / n, bw = Math.max(2, Math.min(26, slot * 0.68));
       const X = function (i) { return pl + slot * (i + 0.5); };
       let s = '<svg viewBox="0 0 ' + W + ' ' + Hh + '" height="' + Hh + '" font-size="10.5">';
+      if (AX.enabled()) s += '<defs>' + o.series.map(function (sr, k) { const shapes = ['<path d="M-2 2L2-2M0 8L8 0M6 10L10 6"/>', '<path d="M-2 6L2 10M0 0L8 8M6-2L10 2"/>', '<path d="M0 4H8"/>', '<circle cx="4" cy="4" r="1" fill="#fff"/>']; return '<pattern id="' + patternPrefix + '-' + k + '" width="8" height="8" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="' + sr.color + '"/><g stroke="#fff" stroke-opacity=".7" stroke-width="1">' + shapes[k % 4] + '</g></pattern>'; }).join('') + '</defs>';
       for (const t of nt.ticks) { const y = Y(t).toFixed(1); s += '<line x1="' + pl + '" x2="' + (W - pr) + '" y1="' + y + '" y2="' + y + '" style="stroke:var(' + (t === 0 ? '--line-strong' : '--line') + ')"/><text x="' + (pl - 6) + '" y="' + y + '" dy="3.5" text-anchor="end" style="fill:var(--muted)">' + esc(o.axisFmt(t)) + '</text>'; }
       const nx = Math.min(n, Math.max(2, Math.floor((W - pl) / 64))), seen = {};
       for (let q = 0; q < nx; q++) { const i = nx === 1 ? 0 : Math.round(q / (nx - 1) * (n - 1)); if (seen[i]) continue; seen[i] = 1; s += '<text x="' + X(i).toFixed(1) + '" y="' + (Hh - 5) + '" text-anchor="middle" style="fill:var(--muted)">' + esc(o.xs[i]) + '</text>'; }
@@ -181,7 +185,7 @@
           const y1 = Y(acc), y2 = Y(acc + v); acc += v;
           let top = y2, hh = y1 - y2;
           if (acc < tots[i] - 1e-9 && hh > 3) { top += 2; hh -= 2; }
-          s += '<rect x="' + (X(i) - bw / 2).toFixed(1) + '" y="' + top.toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + Math.max(0.8, hh).toFixed(1) + '" rx="' + Math.min(3, bw / 4) + '" fill="' + sr.color + '"/>';
+          s += '<rect x="' + (X(i) - bw / 2).toFixed(1) + '" y="' + top.toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + Math.max(0.8, hh).toFixed(1) + '" rx="' + Math.min(3, bw / 4) + '" fill="' + (AX.enabled() ? 'url(#' + patternPrefix + '-' + k + ')' : sr.color) + '"/>';
         });
         s += '</g>';
       }
@@ -317,6 +321,10 @@
   // ---------- 各页 ----------
   function axisPeople(v) { return Math.abs(v) >= 1e4 ? (v / 1e4).toFixed(Math.abs(v) >= 1e5 || v === 0 ? 0 : 1) + '万' : String(Math.round(v)); }
   function axisPct(v) { return Math.round(v * 100) + '%'; }
+  // 货币时期（巴黎）：图表数值换算为当期显示货币（坐标刻度按显示值取整），提示框再按显示值格式化
+  function DV() { return (CM.CFG.money && CM.CFG.money.div) || 1; }
+  function cv(v) { return v == null ? v : v / DV(); }
+  function fm(v) { return U.fmtMoney(v * DV()); }
   function axisYi(v) { return v === 0 ? '0' : (v / 10000).toFixed(Math.abs(v) >= 1e5 ? 0 : 1) + '亿'; }
   function xsOf(H) {
     const span = H.length;
@@ -332,7 +340,7 @@
     if (!mnet || !sd || !mnet.C.routes.length) return [];
     const byLine = new Map();
     mnet.C.routes.forEach(function (rt, i) {
-      let o = byLine.get(rt.lineId); if (!o) { o = { name: rt.line ? rt.line.name : rt.label, color: rt.color, v: 0 }; byLine.set(rt.lineId, o); }
+      let o = byLine.get(rt.lineId); if (!o) { o = { name: rt.line ? rt.line.name : rt.label, color: AX.line(rt.line || { id: rt.lineId, color: rt.color }), v: 0 }; byLine.set(rt.lineId, o); }
       o.v += sd.routeBoard[i] || 0;
     });
     return Array.from(byLine.values()).sort(function (a, b) { return b.v - a.v; }).map(function (o) { return { name: o.name, v: o.v, color: o.color }; });
@@ -395,8 +403,8 @@
     const anyDebt = E.ledger.some(function (r) { return r.bond || svc(r); }) || E.bonds.length;
     const cg = h('div', { class: 'chart-grid' });
     cg.append(
-      ts(H, '资金与债务', '一般资金为负时需尽快扭亏（长期负余额会导致挑战失败）；建设专项资金只能用于建设', [{ name: '一般资金', color: P[3], vals: pick(H, 'funds') }].concat(anyDebt ? [{ name: '建设专项资金', color: P[2], vals: pick(H, 'capex') }, { name: '债务余额', color: P[6], vals: pick(H, 'debt') }] : []), { fmt: function (v) { return U.fmtMoney(v); }, axisFmt: axisYi, area: !anyDebt, icon: 'coin', refs: [{ v: 0, label: '' }] }),
-      lineChart({ title: '收入与支出', sub: (E.ledger.length > 36 ? '按年' : '按月') + '合计：财政收入 = 拨款 + 票款 + 奖励（借款不计入）；支出 = 建设 + 运营' + (anyDebt ? '；偿债 = 利息 + 本金 + 逾期费用' : ''), icon: 'wallet', labels: rows, xs: rows.map(function (o) { return o.x; }), tips: rows.map(function (o) { return o.lab; }), series: [{ name: '财政收入', color: P[2], vals: rows.map(function (o) { return inc(o.r); }) }, { name: '建设与运营支出', color: P[1], vals: rows.map(function (o) { return exp(o.r); }) }].concat(anyDebt ? [{ name: '偿债', color: P[6], vals: rows.map(function (o) { return svc(o.r); }) }] : []), fmt: function (v) { return U.fmtMoney(v); }, axisFmt: axisYi, empty: '尚无完整月份的记录。' }));
+      ts(H, '资金与债务', '一般资金为负时需尽快扭亏（长期负余额会导致挑战失败）；建设专项资金只能用于建设', [{ name: '一般资金', color: P[3], vals: pick(H, 'funds').map(cv) }].concat(anyDebt ? [{ name: '建设专项资金', color: P[2], vals: pick(H, 'capex').map(cv) }, { name: '债务余额', color: P[6], vals: pick(H, 'debt').map(cv) }] : []), { fmt: fm, axisFmt: axisYi, area: !anyDebt, icon: 'coin', refs: [{ v: 0, label: '' }] }),
+      lineChart({ title: '收入与支出', sub: (E.ledger.length > 36 ? '按年' : '按月') + '合计：财政收入 = 拨款 + 票款 + 奖励（借款不计入）；支出 = 建设 + 运营' + (anyDebt ? '；偿债 = 利息 + 本金 + 逾期费用' : ''), icon: 'wallet', labels: rows, xs: rows.map(function (o) { return o.x; }), tips: rows.map(function (o) { return o.lab; }), series: [{ name: '财政收入', color: P[2], vals: rows.map(function (o) { return cv(inc(o.r)); }) }, { name: '建设与运营支出', color: P[1], vals: rows.map(function (o) { return cv(exp(o.r)); }) }].concat(anyDebt ? [{ name: '偿债', color: P[6], vals: rows.map(function (o) { return cv(svc(o.r)); }) }] : []), fmt: fm, axisFmt: axisYi, empty: '尚无完整月份的记录。' }));
     el.appendChild(cg);
   }
   // ---------- 城市经济：GDP、增长率（游戏结果 / 预测 / 史实参考分开）、地方财政与地铁拨款、交通与周期 ----------
@@ -411,7 +419,7 @@
     grid.append(
       kpi({ icon: 'trend', badge: 'b-violet', label: (L ? L.y : fc.y) + ' 年地图范围 GDP' + (L ? '' : '（预测）'), value: big(L ? L.nom : fc.nom), vals: vals('nom'), note: L && L.part ? '接入当年（' + L.n + ' 个月）' : (L ? '名义值，按当年价格' : '第一个完整年度明年 1 月结算') }),
       kpi({ icon: 'pulse', badge: mv.env.cls === 'good' ? 'b-green' : (mv.env.cls === 'bad' ? 'b-red' : (mv.env.cls === 'warn' ? 'b-orange' : 'b-blue')), label: (L && L.growth != null ? L.y + ' 年实际增长' : fc.y + ' 年预测增长'), value: L && L.growth != null ? pctS(L.growth) : pctS(fc.growth), vals: vals('growth'), note: '当前经济环境：' + mv.env.label + (L ? ' · ' + L.y + ' 年价格涨幅 ' + pctS(L.infl) : '') }),
-      kpi({ icon: 'people', badge: 'b-blue', label: '人均 GDP', value: L ? U.fmtInt(L.nom * 1e4 / Math.max(1, L.pop)) : U.fmtInt(fc.nom * 1e4 / Math.max(1, g.city.totals().pop)), unit: CM.CFG.money.unit, vals: recs.slice(-12).map(function (r) { return r.nom / Math.max(1, r.pop); }), note: '地图范围常住人口' }),
+      kpi({ icon: 'people', badge: 'b-blue', label: '人均 GDP', value: L ? U.fmtInt(cv(L.nom * 1e4 / Math.max(1, L.pop))) : U.fmtInt(cv(fc.nom * 1e4 / Math.max(1, g.city.totals().pop))), unit: CM.CFG.money.unit, vals: recs.slice(-12).map(function (r) { return r.nom / Math.max(1, r.pop); }), note: '地图范围常住人口' }),
       kpi({ icon: 'bank', badge: 'b-gold', label: '地方财政收入', value: L ? big(L.rev) : '待结算', vals: vals('rev'), note: L ? '为预期的 ' + Math.round(L.fRaw * 100) + '% · ' + (mv.fisc ? mv.fisc.y + ' 年财力 ×' + mv.fisc.f.toFixed(2) : '') : '' }),
       kpi({ icon: 'metro', badge: 'b-teal', label: '交通对经济', value: pctS(mv.te.eff - 1, 2), vals: vals('te'), note: '当前交通效率 ' + pctS(mv.te.now - 1, 2) }),
       kpi({ icon: 'bolt', badge: mv.shocks.length ? 'b-orange' : 'b-slate', label: '经济事件', value: String(mv.shocks.length), unit: '项影响中', vals: [], note: mv.shocks.length ? mv.shocks.map(function (s) { return s.ev.title.replace(/^模拟：/, ''); }).slice(0, 2).join('、') : (mv.sim ? '模拟阶段' : '暂无') }));
@@ -421,8 +429,8 @@
     const fcRow = { lab: fc.y + ' 年 · 预测', x: String(fc.y), r: null };
     const all = rows.concat([fcRow]);
     cg.append(lineChart({ title: '地图范围 GDP', sub: '名义值按当年价格；实际值按 ' + base + ' 年价格（剔除价格变化）。最后一点为本年预测', icon: 'trend', labels: all, xs: all.map(function (o) { return o.x; }), tips: all.map(function (o) { return o.lab; }),
-      series: [{ name: '名义 GDP', color: P[0], vals: rows.map(function (o) { return o.r.nom; }).concat([fc.nom]) }, { name: '实际 GDP（' + base + ' 年价格）', color: P[2], vals: rows.map(function (o) { return o.r.real; }).concat([fc.real]) }],
-      fmt: function (v) { return big(v); }, axisFmt: function (v) { return v >= 1e8 ? (v / 1e8).toFixed(1) + '万亿' : (v / 1e4).toFixed(0) + '亿'; }, empty: '至少需要两个年度的记录。' }));
+      series: [{ name: '名义 GDP', color: P[0], vals: rows.map(function (o) { return cv(o.r.nom); }).concat([cv(fc.nom)]) }, { name: '实际 GDP（' + base + ' 年价格）', color: P[2], vals: rows.map(function (o) { return cv(o.r.real); }).concat([cv(fc.real)]) }],
+      fmt: function (v) { return big(v * DV()); }, axisFmt: function (v) { return v >= 1e8 ? (v / 1e8).toFixed(1) + '万亿' : (v / 1e4).toFixed(0) + '亿'; }, empty: '至少需要两个年度的记录。' }));
     const items = recs.map(function (r) { return { lab: r.y + ' 年', x: String(r.y), v: r.growth == null ? null : r.growth, ref: CM.Macro.refAt(c, r.y) }; });
     items.push({ lab: fc.y + ' 年（预测，不含尚未发生的事件）', x: String(fc.y), v: fc.growth, fc: true, ref: CM.Macro.refAt(c, fc.y) });
     cg.append(growthChart({ title: '实际增长率', sub: '柱：本局地图范围的游戏结果（虚线柱为本年预测）' + (c.ref ? '；橙色：' + c.ref.label + '（全国 / 地区口径的近似参考，菱形为当年值，虚线为时期平均）' : ''), icon: 'chart', items: items, refLabel: c.ref ? c.ref.label : null, wide: false }));
@@ -430,8 +438,8 @@
     const byY = {};
     for (const r of g.econ.ledger) byY[r.y] = (byY[r.y] || 0) + (r.grant || 0);
     cg.append(lineChart({ title: free ? '地方财政收入' : '地方财政收入与地铁拨款', sub: 'GDP 不等于财政收入；拨款只占财政收入的一部分' + (anyGrant ? '（拨款为当年已发放合计）' : ''), icon: 'bank', labels: rows, xs: rows.map(function (o) { return o.x; }), tips: rows.map(function (o) { return o.lab; }),
-      series: [{ name: '地方财政收入', color: P[3], vals: rows.map(function (o) { return o.r.rev; }) }].concat(anyGrant ? [{ name: '地铁拨款', color: P[1], vals: rows.map(function (o) { return byY[o.r.y] != null ? byY[o.r.y] : null; }) }] : []),
-      fmt: function (v) { return big(v); }, axisFmt: function (v) { return v >= 1e8 ? (v / 1e8).toFixed(1) + '万亿' : (v / 1e4).toFixed(0) + '亿'; }, empty: '至少需要两个年度的记录。' }));
+      series: [{ name: '地方财政收入', color: P[3], vals: rows.map(function (o) { return cv(o.r.rev); }) }].concat(anyGrant ? [{ name: '地铁拨款', color: P[1], vals: rows.map(function (o) { return byY[o.r.y] != null ? cv(byY[o.r.y]) : null; }) }] : []),
+      fmt: function (v) { return big(v * DV()); }, axisFmt: function (v) { return v >= 1e8 ? (v / 1e8).toFixed(1) + '万亿' : (v / 1e4).toFixed(0) + '亿'; }, empty: '至少需要两个年度的记录。' }));
     cg.append(lineChart({ title: '交通效率与经济周期', sub: '交通效率：已计入 GDP 的生产率影响；周期与事件：经济周期与事件冲击使 GDP 偏离趋势的幅度', icon: 'pulse', labels: rows, xs: rows.map(function (o) { return o.x; }), tips: rows.map(function (o) { return o.lab; }),
       series: [{ name: '交通效率', color: P[2], vals: rows.map(function (o) { return o.r.te - 1; }) }, { name: '周期与事件', color: P[7], vals: rows.map(function (o) { return (1 + o.r.gap) * o.r.shock - 1; }) }],
       fmt: function (v) { return pctS(v, 2); }, axisFmt: function (v) { return (v * 100).toFixed(0) + '%'; }, min0: false, refs: [{ v: 0, label: '' }], empty: '至少需要两个年度的记录。' }));
@@ -659,7 +667,7 @@
   }
   // 需要重画的条件：图表最后一点是“当前”值（标注到日）；纪事页只随里程碑与主题变化
   function signature(g) {
-    const th = document.documentElement.dataset.theme, n = g.milestones ? g.milestones.list.length : 0;
+    const th = document.documentElement.dataset.theme + '|' + AX.flag(), n = g.milestones ? g.milestones.list.length : 0;
     if (tab === 'milestones') return 'ms|' + n + '|' + th + '|' + (window.innerWidth < 820 ? 1 : 2);
     if (tab === 'econ') return 'ec|' + g.clock.y + '-' + g.clock.m + '|' + (g.macro ? g.macro.rec.length + '|' + g.macro.gv : '') + '|' + th;
     return g.clock.y + '-' + g.clock.m + '-' + g.clock.d + '|' + (g.model.dailyStale ? 0 : 1) + '|' + g.history.length + '|' + g.econ.ledger.length + '|' + g.netVersion + '|' + th + '|' + n;

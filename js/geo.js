@@ -54,6 +54,10 @@
       if (typeof row[1] === 'number') { const p = dec(row[2]); Geo.waterLines.push({ name: names[row[0]] || '', w: row[1], p: p, bbox: bboxOf(p) }); }
       else Geo.water.push(polyFeat(row, names));
     }
+    // 水面上的细碎陆地（v2.2）：水面多边形中面积很小（约 3,800 m² 以下的礁石、小块）或很细长（宽约 30 m 以下的防波堤、窄码头）的洞
+    // 按水面处理，画面上不再出现一条条白线与碎块；较宽的码头、填海地与岛屿保留
+    const ringStat = function (p) { let a = 0, l = 0; const n = p.length / 2; for (let k = 0; k < n; k++) { const j = (k + 1) % n, x0 = p[2 * k], y0 = p[2 * k + 1], x1 = p[2 * j], y1 = p[2 * j + 1]; a += x0 * y1 - x1 * y0; l += Math.hypot(x1 - x0, y1 - y0); } return [Math.abs(a) / 2, l]; };
+    for (const f of Geo.water) f.rings = f.rings.filter(function (r) { if (r.outer) return true; const s = ringStat(r.p); return !(s[0] < 0.06 || (s[0] < 1.5 && s[0] / (s[1] || 1) < 0.065)); });
     Geo.roads = G.roads.map(function (r) { const p = dec(r[3]); return { name: names[r[0]] || '', cls: r[1], flags: r[2], p: p, bbox: bboxOf(p) }; });
     Geo.streets = G.streets ? G.streets.split('!').map(function (s) { const p = dec(s); return { p: p, bbox: bboxOf(p) }; }) : [];
     Geo.rail = G.rail.map(function (r) { const p = dec(r[2]); return { name: names[r[0]] || '', flags: r[1], p: p, bbox: bboxOf(p), year: r[3] || 0 }; });   // year：开通年份（可缺省）
@@ -103,7 +107,7 @@
         const row = y * FW;
         for (let k = 0; k + 1 < xs.length; k += 2) {
           const a = Math.max(0, Math.ceil(xs[k] - 0.5)), b = Math.min(FW - 1, Math.floor(xs[k + 1] - 0.5));
-          for (let x = a; x <= b; x++) mask[row + x] = val;
+          if (a <= b) mask.fill(val, row + a, row + b + 1);
         }
       }
     }

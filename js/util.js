@@ -11,6 +11,27 @@ window.CM = window.CM || {};
   U.dist = function (ax, ay, bx, by) { const dx = bx - ax, dy = by - ay; return Math.sqrt(dx * dx + dy * dy); };
   U.now = function () { return performance.now(); };
 
+  // 历史水域只修订现有格网内的部分，不因资料范围更大而扩大地图。
+  U.clipMapPolygon = function (points, width, height) {
+    let out = points.map(function (p) { return [p[0], p[1]]; });
+    for (const edge of [[0, 0, 1], [0, width, -1], [1, 0, 1], [1, height, -1]]) {
+      const input = out; out = [];
+      if (!input.length) break;
+      const axis = edge[0], bound = edge[1], sign = edge[2];
+      let a = input[input.length - 1], insideA = (a[axis] - bound) * sign >= 0;
+      for (const b of input) {
+        const insideB = (b[axis] - bound) * sign >= 0;
+        if (insideA !== insideB) {
+          const t = (bound - a[axis]) / (b[axis] - a[axis]);
+          const p = [U.lerp(a[0], b[0], t), U.lerp(a[1], b[1], t)]; p[axis] = bound; out.push(p);
+        }
+        if (insideB) out.push(b);
+        a = b; insideA = insideB;
+      }
+    }
+    return out.filter(function (p, i) { const prev = out[(i + out.length - 1) % out.length]; return U.dist(p[0], p[1], prev[0], prev[1]) > 1e-7; });
+  };
+
   // 确定性哈希随机（用于逐格的稳定随机）
   U.hash2 = function (x, y, s) {
     let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul((s | 0) + 1, 1442695041)) | 0;
@@ -199,6 +220,12 @@ window.CM = window.CM || {};
     if (wan === Infinity) return '∞';
     if (!isFinite(wan)) return '—';
     const mo = money || (CM.CFG && CM.CFG.money) || { wan: '万元', yi: '亿元' };
+    // 货币时期（巴黎）：内部金额始终为同一记账单位，显示时按当期货币折算（div = 每 1 显示单位折合的内部单位）
+    wan = wan / (mo.div || 1);
+    if (CM.I18n && CM.I18n.get()==='en') {
+      const amount=wan*10000,abs=Math.abs(amount),scale=abs>=1e9?1e9:abs>=1e6?1e6:abs>=1e3?1e3:1,suffix=scale===1e9?'B':scale===1e6?'M':scale===1e3?'k':'';
+      return new Intl.NumberFormat('en',{maximumFractionDigits:digits===undefined?2:digits}).format(amount/scale)+suffix+' '+(mo.code||CM.I18n.text(mo.unit||''));
+    }
     const neg = wan < 0; const a = Math.abs(wan);
     let s;
     if (a >= 10000) s = (a / 10000).toFixed(digits === undefined ? (a >= 1e6 ? 0 : 2) : digits) + ' ' + mo.yi;
@@ -207,20 +234,40 @@ window.CM = window.CM || {};
     return (neg ? '−' : '') + s;
   };
   // 价格指数：base 为价格基年；rate 为年涨幅，或分段 [[起始年, 涨幅], …]（按年连乘）
+  // 国内地图常用的 GCJ-02 经纬度 → OpenStreetMap 使用的 WGS-84（公开的近似公式，误差约数米）。
+  // 中国内地新地图的数据文件按 GCJ-02 填写坐标时用它换算（中国内地的偏移约数百米）
+  U.gcj2wgs = (function () {
+    const A = 6378245.0, EE = 0.00669342162296594323, PI = Math.PI;
+    const tLat = function (x, y) { let r = -100 + 2 * x + 3 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x)); r += (20 * Math.sin(6 * x * PI) + 20 * Math.sin(2 * x * PI)) * 2 / 3; r += (20 * Math.sin(y * PI) + 40 * Math.sin(y / 3 * PI)) * 2 / 3; r += (160 * Math.sin(y / 12 * PI) + 320 * Math.sin(y * PI / 30)) * 2 / 3; return r; };
+    const tLon = function (x, y) { let r = 300 + x + 2 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x)); r += (20 * Math.sin(6 * x * PI) + 20 * Math.sin(2 * x * PI)) * 2 / 3; r += (20 * Math.sin(x * PI) + 40 * Math.sin(x / 3 * PI)) * 2 / 3; r += (150 * Math.sin(x / 12 * PI) + 300 * Math.sin(x / 30 * PI)) * 2 / 3; return r; };
+    return function (lat, lon) {
+      const rad = lat / 180 * PI, s = Math.sin(rad), m = 1 - EE * s * s, sm = Math.sqrt(m);
+      const dLat = tLat(lon - 105, lat - 35) * 180 / ((A * (1 - EE)) / (m * sm) * PI), dLon = tLon(lon - 105, lat - 35) * 180 / (A / sm * Math.cos(rad) * PI);
+      return [lat - dLat, lon - dLon];
+    };
+  })();
+  // 分段涨幅表的累计指数按整年缓存（逐年表可长达百余项，如巴黎 1900–2020）；累乘顺序与逐年计算相同，结果不变
+  const piCache = new WeakMap();
   U.priceIndex = function (year, rate, base) {
     if (year <= base) return 1;
     if (typeof rate === 'number') return Math.pow(1 + rate, year - base);
-    let f = 1;
-    for (let y = base; y < year; y++) {
+    let c = piCache.get(rate);
+    if (!c || c.base !== base) { c = { base: base, f: [1], r: [] }; piCache.set(rate, c); }
+    const n = Math.floor(year) - base;
+    while (c.f.length <= n + 1) {
+      const y = base + c.f.length - 1;
       let r = rate[0][1]; for (const s of rate) if (y >= s[0]) r = s[1];
-      const step = Math.min(1, year - y);
-      f *= Math.pow(1 + r, step);
+      c.r.push(r); c.f.push(c.f[c.f.length - 1] * Math.pow(1 + r, 1));
     }
-    return f;
+    const frac = year - Math.floor(year);
+    return frac > 0 ? c.f[n] * Math.pow(1 + c.r[n], frac) : c.f[n];
   };
-  U.fmtYi = function (wan, d) { return (wan / 10000).toFixed(d === undefined ? 2 : d); };
+  U.fmtYi = function (wan, d) { return (U.cur(wan) / 10000).toFixed(d === undefined ? 2 : d); };
+  // 内部金额 → 当前显示货币（只有设置了货币时期的地图 div ≠ 1）
+  U.cur = function (v) { const mo = CM.CFG && CM.CFG.money; return v / ((mo && mo.div) || 1); };
   U.fmtPeople = function (n) {
     if (!isFinite(n)) return '—';
+    if (CM.I18n && CM.I18n.get()==='en') return new Intl.NumberFormat('en',{notation:'compact',maximumFractionDigits:1}).format(n);
     const a = Math.abs(n);
     if (a >= 1e4) return (n / 1e4).toFixed(a >= 1e6 ? 0 : 1) + ' 万';
     return Math.round(n).toLocaleString('zh-CN');

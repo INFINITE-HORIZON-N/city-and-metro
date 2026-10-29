@@ -1,6 +1,7 @@
 'use strict';
 // 界面框架：顶部 HUD、图层坞、详情面板（概览 → 展开详情）、工具坞、草案栏、冲突处理、开始界面与对话框
 (function (CM) {
+  const AX = CM.Accessibility;
   const U = CM.U, CFG = CM.CFG, D = CM.DATA, M = CM.Metro;
   const h = U.h, I = CM.ICON, ic = CM.icon;
   const snd = function (name) { if (CM.Sound) CM.Sound.play(name); };
@@ -8,12 +9,12 @@
   // 分析图层（v1.9 起分为三组）：城市（人口、职住、设施出行需求）· 交通（拥堵、出行方向）· 地铁（覆盖、车站客流、服务缺口）
   const LAYER_GROUPS = [['city', '城市'], ['traffic', '交通'], ['metro', '地铁']];
   const LAYERS = [
-    { id: 'pop', group: 'city', name: '人口密度', icon: 'lyPop', color: '#e9641f', desc: '各街区常住人口' },
+    { id: 'pop', metric: true, group: 'city', name: '人口密度', icon: 'lyPop', color: '#e9641f', desc: '各街区常住人口' },
     { id: 'jobs', group: 'city', name: '住宅与就业', icon: 'lyJobs', color: '#6447dc', desc: '居住与岗位的分布' },
     { id: 'fac', group: 'city', name: '设施出行需求', icon: 'lyFac', color: '#c2410c', desc: '重要设施与各片区吸引的出行（按目的）' },
-    { id: 'cong', group: 'traffic', name: '道路拥堵', icon: 'lyCong', color: '#df3030', desc: '主要道路当前的拥堵程度' },
+    { id: 'cong', metric: true, group: 'traffic', name: '道路拥堵', icon: 'lyCong', color: '#df3030', desc: '主要道路当前的拥堵程度' },
     { id: 'flow', group: 'traffic', name: '出行方向', icon: 'lyFlow', color: '#2557d6', desc: '各片区的主要出行方向' },
-    { id: 'cover', group: 'metro', name: '地铁覆盖', icon: 'lyCover', color: '#14a252', desc: '步行可达车站的范围与阻隔' },
+    { id: 'cover', metric: true, group: 'metro', name: '地铁覆盖', icon: 'lyCover', color: '#14a252', desc: '步行可达车站的范围与阻隔' },
     { id: 'station', group: 'metro', name: '车站客流', icon: 'lyStation', color: '#109e90', desc: '客流与运力负荷' },
     { id: 'gap', group: 'metro', name: '地铁服务缺口', icon: 'lyGap', color: '#b91c1c', desc: '出行需求大但地铁服务不足的地方' },
   ];
@@ -23,7 +24,7 @@
   const PAGE_ICON = {
     build: ['hammer', 'b-blue'], station: ['station', 'b-teal'], line: ['route', 'b-blue'], road: ['car', 'b-orange'], zone: ['map', 'b-slate'],
     finance: ['coin', 'b-gold'], tasks: ['flag', 'b-violet'], date: ['clock', 'b-teal'], saves: ['save', 'b-blue'], help: ['help', 'b-slate'], data: ['info', 'b-slate'],
-    metric: ['chart', 'b-blue'], multi: ['layers', 'b-blue'], facility: ['pin', 'b-orange'],
+    metric: ['chart', 'b-blue'], multi: ['layers', 'b-blue'], facility: ['pin', 'b-orange'], guide: ['book', 'b-green'],
   };
   const METRIC_ICON = { pop: ['people', 'b-blue'], share: ['metro', 'b-teal'], cong: ['car', 'b-orange'], commute: ['timer', 'b-violet'], sat: ['smile', 'b-green'] };
   // 统一交互反馈的范围：按钮、可点击的行与卡片、列表选项与标签页
@@ -47,16 +48,16 @@
 
   // ======================== 外框 ========================
   // 布局：左上「城市与时间」（日期、速度、推进）；右上「指标」与「操作」（任务、统计、设置、菜单）；
-  // 左侧「视图与图层」；底部中间「建设工具」；右下「缩放」；右侧详情面板。
+  // 左下「地图控制」与图层弹层；底部中间「建设工具」；右侧详情面板。
   UI.prototype.buildChrome = function () {
     const app = document.getElementById('app');
     const self = this;
     this.pills = {};
-    const pill = function (key, label, icon, badgeCls, cls) {
+    const pill = function (key, label, icon, badgeCls, cls, layer) {
       const badge = h('span', { class: 'badge ' + badgeCls }, ic(icon));
       const v = h('span', { class: 'v' }, '—'), k = h('span', { class: 'k' }, label);
       const b = h('button', { class: 'pill ' + (cls || ''), 'data-tip': label + ' · 点击查看详情', onclick: function () { self.openTop(key); } }, badge, h('span', { class: 'tx' }, k, v));
-      self.pills[key] = { el: b, v: v, k: k, badge: badge };
+      self.pills[key] = { el: b, v: v, k: k, badge: badge, layer: layer || null };
       return b;
     };
     // 日期（带一天进度环）
@@ -69,62 +70,71 @@
     const datePill = h('button', { class: 'pill daypill', 'data-tip': '日期、时段与城市发展', onclick: function () { self.openTop('date'); } }, ring, h('span', { class: 'tx' }, dateK, dateV));
     this.pills.date = { el: datePill, v: dateV, k: dateK };
     this.tbtns = {};
-    const spd = function (id, label, n, tip, key) {
-      const b = h('button', { class: 'sbtn' + (n === 0 ? ' pz' : ''), 'data-tip': tip, 'data-key': key, onclick: function () { if (n === 0) self.togglePause(); else self.setSpeed(n); } }, n === 0 ? ic('pause') : label);
-      self.tbtns[id] = b; return b;
+    this.timeOptions = {};
+    const timeKeys = function (b) {
+      b.addEventListener('keydown', function (e) {
+        if ((e.key === 'Enter' || e.key === ' ') && !e.ctrlKey && !e.metaKey && !e.altKey) { e.stopPropagation(); if (e.repeat) e.preventDefault(); }
+      });
+      return b;
     };
-    const jmp = function (id, label, n, tip) { const b = h('button', { class: 'jbtn', 'data-tip': tip, onclick: function () { self.jump(n); } }, label); self.tbtns[id] = b; return b; };
+    const spd = function (id, label, n, tip, key) {
+      const b = h('button', { class: 'sbtn' + (n === 0 ? ' pz' : ''), 'data-tip': tip, 'data-act': key, onclick: function () { if (n === 0) self.togglePause(); else self.setSpeed(n); } }, n === 0 ? ic('pause') : label);
+      self.tbtns[id] = b; return timeKeys(b);
+    };
+    const jmp = function (id, label, n, tip, act) { const b = h('button', { class: 'jbtn', 'data-tip': tip, 'data-act': act, onclick: function () { self.jump(n); } }, label); self.tbtns[id] = b; return timeKeys(b); };
+    const timeFold = function (kind, tip) {
+      const o = self.timeOptions[kind] = { value: h('span', { class: 'gone' }) };
+      o.button = h('button', { class: (kind === 'speed' ? 'sbtn' : 'jbtn') + ' time-fold', 'data-tip': tip, 'aria-label': tip, 'aria-expanded': 'false', 'aria-haspopup': 'menu', 'aria-controls': 'time-options-' + kind, onclick: function () { self.toggleTimeOptions(kind); } }, o.value, ic('chev', 14));
+      o.button.addEventListener('keydown', function (e) { if (e.key === 'ArrowDown') { e.preventDefault(); e.stopPropagation(); self.toggleTimeOptions(kind, true); } });
+      return timeKeys(o.button);
+    };
     // 右上操作按钮
     this.hbtns = {};
-    const hb = function (key, icon, tip, onclick, keyHint) { const b = h('button', { class: 'hbtn', 'data-tip': tip, 'data-key': keyHint || null, onclick: onclick }, ic(icon)); self.hbtns[key] = b; return b; };
+    const hb = function (key, icon, tip, onclick, act) { const b = h('button', { class: 'hbtn', 'data-tip': tip, 'data-act': act || null, onclick: onclick }, ic(icon)); self.hbtns[key] = b; return b; };
     this.taskCnt = h('span', { class: 'cnt' }, '0');
-    const taskBtn = hb('tasks', 'flag', '任务', function () { self.openTop('tasks'); });
+    const taskBtn = hb('tasks', 'flag', '任务', function () { self.openTop('tasks'); }, 'ui.tasks');
     taskBtn.appendChild(this.taskCnt);
     this.top = h('header', { id: 'hudTop', class: 'hud hidden' },
       h('div', { class: 'cluster glass citybar' },
-        h('div', { class: 'brand' }, h('img', { src: 'img/logo-white.png', alt: '城市与地铁' })),
         datePill,
-        h('div', { class: 'speed' }, spd('pause', '', 0, '暂停 / 继续', '空格'), spd('s1', '1×', 1, '正常速度', '1'), spd('s2', '3×', 2, '3 倍速', '2'), spd('s3', '8×', 3, '8 倍速', '3')),
-        h('div', { class: 'jumps' }, jmp('month', '+1月', 1, '推进 1 个月'), jmp('year', '+1年', 12, '推进 1 年（结束后显示变化）'))),
+        h('div', { class: 'speed' }, spd('pause', '', 0, '暂停 / 继续', 'pause'), spd('s1', '1×', 1, '正常速度', 'speed1'), spd('s2', '3×', 2, '3 倍速', 'speed2'), timeFold('speed', '更多倍速与高峰慢放')),
+        h('div', { class: 'jumps' }, jmp('month', '+1月', 1, '推进 1 个月', 'jumpMonth'), timeFold('jump', '更多时间推进选项'))),
       h('div', { class: 'spacer' }),
       h('div', { class: 'cluster glass metrics' },
-        pill('money', '资金', 'coin', 'b-gold'), pill('econ', '经济增长', 'trend', 'b-violet', 'opt2'), pill('pop', '人口', 'people', 'b-blue', 'opt2'), pill('share', '地铁分担率', 'metro', 'b-teal', 'opt3'),
-        pill('cong', '拥堵指数', 'car', 'b-orange', 'opt5'), pill('sat', '满意度', 'smile', 'b-green', 'opt4')),
+        pill('money', '资金', 'coin', 'b-gold'), pill('econ', '经济增长', 'trend', 'b-violet', 'opt2'), pill('pop', '人口', 'people', 'b-blue', 'opt2', 'pop'), pill('share', '地铁分担率', 'metro', 'b-teal', 'opt3', 'cover'),
+        pill('cong', '拥堵指数', 'car', 'b-orange', 'opt5', 'cong'), pill('sat', '满意度', 'smile', 'b-green', 'opt4'),
+        this.mFold = h('button', { class: 'pill mfold off', 'data-tip': '展开其余指标', 'aria-expanded': 'false', onclick: function () { self.toggleMetricsMore(); } }, h('span', { class: 'mf-n' }, ''), ic('chev'))),
       h('div', { class: 'cluster glass actions' },
-        hb('search', 'search', '搜索车站、线路、道路、区域', function () { self.openSearch(); }, '/'),
+        hb('search', 'search', '搜索车站、线路、道路、区域', function () { self.openSearch(); }, 'ui.search'),
         taskBtn,
-        hb('stats', 'chart', '城市统计', function () { self.openStats(); }, 'G'),
-        hb('theme', 'moon', '深色模式', function () { self.toggleTheme(); }, 'N'),
+        hb('stats', 'chart', '城市统计', function () { self.openStats(); }, 'ui.stats'),
+        hb('theme', 'moon', '深色模式', function () { self.toggleTheme(); }, 'ui.theme'),
         hb('settings', 'gear', '设置', function () { self.showSettings(); }),
         hb('menu', 'menu', '菜单', function (e) { self.showMenu(e.currentTarget); })));
     // 窄屏（手机）顶栏只保留常用按钮：深浅模式与设置改在菜单中
     this.hbtns.theme.classList.add('wide-only'); this.hbtns.settings.classList.add('wide-only');
-    // 左侧：视图（2D / 2.5D / 地下 / 线路图）与图层（一个按钮，弹出图层列表）
-    const vb = function (id, icon, tip, key, onclick, cls) { const b = h('button', { class: 'dockbtn ' + (cls || 'view'), 'data-tip': tip, 'data-key': key || null, 'data-side': 'right', onclick: onclick }, ic(icon)); self.tbtns[id] = b; return b; };
-    this.dock = h('aside', { id: 'dock', class: 'hud glass hidden' },
-      vb('d2', 'view2d', '2D 地图', null, function () { self.setView(false); }),
-      vb('iso', 'view3d', '2.5D 城市', 'T', function () { self.setView(true); }),
-      vb('under', 'under', '地下视图', 'U', function () { self.toggleUnder(); }),
-      vb('netmap', 'network', '线路示意图', 'K', function () { self.openNetMap(); }, 'plain'),
-      h('div', { class: 'dock-sep' }));
-    // 分析图层：每个图层一个按钮，再次点击关闭；开启时按钮显示该图层的颜色
+    // 左下：地图控制（v2.2 界面整理）——图层（弹出带名称与说明的图层面板）、2D / 2.5D 切换、地下视图、线路示意图，其下为缩放与指北针
+    const vb = function (id, icon, tip, act, onclick, cls) { const b = h('button', { class: 'dockbtn ' + (cls || 'view'), 'data-tip': tip, 'data-act': act || null, 'data-side': 'right', onclick: onclick }, ic(icon)); self.tbtns[id] = b; return b; };
+    this.layerBtn = h('button', { class: 'dockbtn layers', 'data-tip': '图层', 'data-side': 'right', 'aria-haspopup': 'dialog', 'aria-expanded': 'false', onclick: function () { self.toggleLayerPanel(); } }, ic('layers'), h('span', { class: 'lb' }, '图层'));
     this.dockBtns = {};
-    let lastGroup = null;
-    for (const L of LAYERS) {
-      if (lastGroup && L.group !== lastGroup) this.dock.appendChild(h('div', { class: 'dock-sep thin' }));
-      lastGroup = L.group;
-      const gname = (LAYER_GROUPS.find(function (x) { return x[0] === L.group; }) || ['', ''])[1];
-      const b = h('button', { class: 'dockbtn layer', 'data-tip': gname + ' · ' + L.name + ' · ' + L.desc, 'data-side': 'right', onclick: function () { self.setLayer(self.layer === L.id ? 'none' : L.id); } }, ic(L.icon));
-      b.style.setProperty('--lc', L.color);
-      this.dockBtns[L.id] = b; this.dock.appendChild(b);
-    }
+    this.layerPanel = h('div', { id: 'layerPanel', class: 'glass hidden', role: 'dialog', 'aria-label': '图层', inert: true });
+    window.addEventListener('pointerdown', function (e) { if (!self.layerPanel.classList.contains('hidden') && !self.layerPanel.contains(e.target) && !self.layerBtn.contains(e.target)) self.toggleLayerPanel(false); }, true);
     this.legendCard = h('aside', { id: 'legendCard', class: 'hud glass hidden' });
-    // 左下：缩放
     const R = this.R;
-    this.zoomCtl = h('div', { id: 'zoomCtl', class: 'hud glass hidden' },
-      h('button', { 'data-tip': '放大', 'data-key': '+', 'data-side': 'right', onclick: function () { R.zoomAt(R.w / 2, R.h / 2, 1.5); } }, ic('plus')),
-      h('button', { 'data-tip': '缩小', 'data-key': '−', 'data-side': 'right', onclick: function () { R.zoomAt(R.w / 2, R.h / 2, 1 / 1.5); } }, ic('minus')),
-      h('button', { 'data-tip': '全图', 'data-key': 'F', 'data-side': 'right', onclick: function () { R.fitAll(); } }, ic('expand')));
+    this.zoomCtl = h('div', { id: 'zoomCtl' },
+      h('button', { 'data-tip': '放大', 'data-act': 'cam.zoomIn', 'data-side': 'right', onclick: function () { R.zoomAt(R.w / 2, R.h / 2, 1.5); } }, ic('plus')),
+      h('button', { 'data-tip': '缩小', 'data-act': 'cam.zoomOut', 'data-side': 'right', onclick: function () { R.zoomAt(R.w / 2, R.h / 2, 1 / 1.5); } }, ic('minus')),
+      // 2D 与 2.5D 都平滑回到全图。
+      this.compass = h('button', { class: 'compass', 'data-tip': '视角复位：回到全图', 'data-act': 'cam.fit', 'data-side': 'right', 'aria-label': '视角复位', onclick: function () { self.resetView(); },
+        html: '<svg class="needle" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10.2" fill="none" stroke="currentColor" stroke-opacity=".35" stroke-width="1.4"/><path d="M12 3.6 15.1 12H8.9Z" fill="#e0483e"/><path d="M12 20.4 8.9 12h6.2Z" fill="currentColor" fill-opacity=".55"/></svg>' }));
+    this.dock = h('aside', { id: 'dock', class: 'hud glass hidden' },
+      this.layerBtn,
+      h('div', { class: 'dock-sep' }),
+      vb('view', 'view3d', '切换 2D / 2.5D', 'view.toggle', function () { self.toggleView(); }),
+      vb('under', 'under', '地下视图', 'view.under', function () { self.toggleUnder(); }),
+      vb('netmap', 'network', '线路示意图', 'view.netmap', function () { self.openNetMap(); }, 'plain'),
+      h('div', { class: 'dock-sep' }),
+      this.zoomCtl);
     // 右侧详情
     this.right = h('aside', { id: 'rightPanel', class: 'hud glass panel closed hidden', inert: true, 'aria-hidden': 'true' });
     this.rTitle = h('div', { class: 'p-title' }, '');
@@ -143,22 +153,23 @@
     this.right.append(h('div', { class: 'p-head' }, this.rBack, this.rBadge, this.rTitle, h('button', { class: 'iconbtn', 'data-tip': '收起', 'data-key': 'Esc', onclick: function () { self.closePanel(); } }, ic('close'))), this.rBody);
     // 底部：建设工具
     const tb = function (id, icon, label, key, onclick, cls) {
-      const b = h('button', { class: 'tbtn ' + (cls || ''), 'data-tip': label, 'data-key': key, onclick: onclick }, ic(icon), h('span', { class: 'lb' }, label));
+      const b = h('button', { class: 'tbtn ' + (cls || ''), 'data-tip': label, 'data-act': key, onclick: onclick }, ic(icon), h('span', { class: 'lb' }, label));
       self.tbtns[id] = b; return b;
     };
     this.toolInd = h('span', { class: 'tind' });
     this.toolbar = h('nav', { id: 'toolbar', class: 'hud glass hidden' }, this.toolInd,
-      tb('select', 'cursor', '选择', 'V', function () { self.tools.setTool('select'); }),
-      tb('station', 'station', '建站', 'B', function () { self.tools.setTool('station'); }),
-      tb('line', 'route', '绘线', 'L', function () { self.tools.setTool('line'); }),
-      tb('edit', 'pencil', '修改', 'E', function () { self.tools.setTool('edit'); }),
-      tb('demolish', 'bulldozer', '拆除', 'X', function () { self.tools.setTool('demolish'); }, 'danger'));
+      tb('select', 'cursor', '选择', 'tool.select', function () { self.tools.setTool('select'); }),
+      tb('station', 'station', '建站', 'tool.station', function () { self.tools.setTool('station'); }),
+      tb('line', 'route', '绘线', 'tool.line', function () { self.tools.setTool('line'); }),
+      tb('edit', 'pencil', '修改', 'tool.edit', function () { self.tools.setTool('edit'); }),
+      tb('demolish', 'bulldozer', '拆除', 'tool.demolish', function () { self.tools.setTool('demolish'); }, 'danger'));
     // 工具条上方：建设草案栏 + 当前工具的选项条（线路、建设方式、车站规模）
     this.draftbar = h('div', { id: 'draftbar', class: 'glass hidden' });
     this.toolopts = h('div', { id: 'toolopts', class: 'glass hidden' });
     this.bstack = h('div', { id: 'buildStack', class: 'hud hidden' }, this.draftbar, this.toolopts);
     // 顶部中间信息流：暂停提示、状态横幅、消息
-    this.pauseChip = h('button', { class: 'pausechip hidden', onclick: function () { self.togglePause(); } }, ic('pause'), h('span', null, '已暂停'), h('kbd', null, '空格'), h('span', { class: 'muted' }, '继续'));
+    this.pauseChip = h('button', { class: 'pausechip hidden', onclick: function () { self.togglePause(); } }, ic('pause'), h('span', null, '已暂停'), this.pauseKbd = h('kbd', null, CM.Keys.hint('pause') || '▶'), h('span', { class: 'muted' }, '继续'));
+    CM.Keys.onChange = function () { if (self.pauseKbd) self.pauseKbd.textContent = CM.Keys.hint('pause') || '▶'; if (CM.Tutorial) CM.Tutorial.refreshKeys(); };
     this.banner = h('div', { id: 'banner' });
     this.toasts = h('div', { id: 'toasts' });
     this.feed = h('div', { id: 'feed', class: 'hidden' }, this.pauseChip, this.banner, this.toasts);
@@ -170,19 +181,65 @@
     this.screen = h('div', { id: 'screen', class: 'hidden' });
     this.statsEl = h('div', { id: 'stats', class: 'hidden' });
     this.fxLayer = h('div', { id: 'fxLayer' });
-    app.append(this.top, this.dock, this.legendCard, this.zoomCtl, this.right, this.toolbar, this.bstack, this.feed, this.tip, this.uitip, this.fxLayer, this.statsEl, this.screen);
+    // 折叠的指标：放在顶栏下方的下拉框里，点击「+N」展开；点指标打开详情或点空白处收起
+    this.mMore = h('div', { class: 'dropdown mmore off' });
+    this.mMore.addEventListener('click', function (e) { if (e.target.closest('.pill')) self.toggleMetricsMore(false); });
+    window.addEventListener('pointerdown', function (e) { if (!self.mMore.classList.contains('off') && !self.mMore.contains(e.target) && !self.mFold.contains(e.target)) self.toggleMetricsMore(false); }, true);
+    document.body.appendChild(this.mMore);
+    this.timeOptions.speed.menu = h('div', { id: 'time-options-speed', class: 'dropdown time-options off', role: 'menu', 'aria-label': '更多倍速', 'aria-hidden': 'true' },
+      spd('s3', '8×', 3, '8 倍速', 'speed3'), spd('s4', '24×', 4, '极速：24 倍速（列车与车流按 8× 表现）', 'speed4'),
+      this.tbtns.peak = h('button', { class: 'sbtn peak', 'data-act': 'time.peakSlow', 'data-silent': '1', onclick: function () { self.togglePeakSlow(); } }, ic('hourglass'), h('span', null, '高峰慢放')));
+    this.timeOptions.jump.menu = h('div', { id: 'time-options-jump', class: 'dropdown time-options off', role: 'menu', 'aria-label': '更多时间推进选项', 'aria-hidden': 'true' },
+      jmp('quarter', '+3月', 3, '推进 3 个月（结束后显示变化）', 'jumpQuarter'), jmp('year', '+1年', 12, '推进 1 年（结束后显示变化）', 'jumpYear'));
+    for (const kind of Object.keys(this.timeOptions)) {
+      const o = this.timeOptions[kind]; o.menu.inert = true;
+      for (const b of o.menu.children) b.setAttribute('role', b === self.tbtns.peak ? 'menuitemcheckbox' : kind === 'speed' ? 'menuitemradio' : 'menuitem');
+      o.menu.addEventListener('focusout', function () { setTimeout(function () { if (!o.menu.contains(document.activeElement) && document.activeElement !== o.button) self.toggleTimeOptions(kind, false); }, 0); });
+      document.body.appendChild(o.menu);
+    }
+    window.addEventListener('pointerdown', function (e) { for (const kind of Object.keys(self.timeOptions)) { const o = self.timeOptions[kind]; if (!o.menu.contains(e.target) && !o.button.contains(e.target)) self.toggleTimeOptions(kind, false); } }, true);
+    window.addEventListener('keydown', function (e) {
+      const kind = Object.keys(self.timeOptions).find(function (k) { return !self.timeOptions[k].menu.classList.contains('off'); });
+      if (!kind) return;
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); self.toggleTimeOptions(kind, false, true); return; }
+      const dd = self.timeOptions[kind].menu;
+      if (dd.contains(document.activeElement) && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); e.stopPropagation(); if (!e.repeat) document.activeElement.click(); return; }
+      if (!dd.contains(document.activeElement) || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return;
+      e.preventDefault(); e.stopPropagation();
+      const bs = Array.from(dd.querySelectorAll('button')), i = bs.indexOf(document.activeElement);
+      bs[e.key === 'Home' ? 0 : e.key === 'End' ? bs.length - 1 : (i + (e.key === 'ArrowUp' ? -1 : 1) + bs.length) % bs.length].focus();
+    }, true);
+    app.append(this.top, this.dock, this.legendCard, this.layerPanel, this.right, this.toolbar, this.bstack, this.feed, this.tip, this.uitip, this.fxLayer, this.statsEl, this.screen);
     this.initTips();
     this.initPress();
     this.renderDock();
+    this.viewportProbe = h('div', { class: 'viewport-insets', 'aria-hidden': 'true' });
+    app.appendChild(this.viewportProbe);
     this.layoutHud();
     window.addEventListener('resize', function () { self.layoutHud(); });
-    CM.Settings.on(function (k) { if (k === 'uiScale') { self.layoutHud(); requestAnimationFrame(function () { self.renderToolbar(); }); } if (k === 'theme') self.renderThemeBtns(); });
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', function () { self.layoutHud(); });
+      window.visualViewport.addEventListener('scroll', function () { self.queueLayout(); });
+    }
+    this.right.addEventListener('focusin', function () { self.queueLayout(); });
+    this.right.addEventListener('focusout', function () { self.queueLayout(); });
+    // 只观察外框尺寸，不在每帧或每次文字更新时重新布局。
+    if (window.ResizeObserver) {
+      this.layoutObserver = new ResizeObserver(function () { self.queueLayout(); });
+      for (const el of [this.top, this.toolbar, this.bstack, this.right, this.legendCard]) this.layoutObserver.observe(el);
+    }
+    CM.Settings.on(function (k) {
+      if (k === 'grid' || k === 'gridSnap' || k === 'peakSlow') self.renderToolbar();
+      if (k === 'uiScale') { self.layoutHud(); requestAnimationFrame(function () { self.renderToolbar(); }); }
+      if (k === 'theme') { self.renderThemeBtns(); if (AX.enabled()) { self.renderDock(); if (self.stack.length) self.rerenderPage(); } }
+      if (k === 'colorBlind') { self._toKey = null; self.renderToolOpts(); self.renderDock(); if (self.stack.length) self.rerenderPage(); }
+    });
     this.renderThemeBtns();
   };
   // 消息与提示条居中于地图未被遮挡的区域（右侧面板打开时向左让开，避免挡住面板上的分页）
   UI.prototype.placeFeed = function () {
     const f = this.feed; if (!f) return;
-    if (window.innerWidth <= 760) { f.style.left = ''; f.style.maxWidth = ''; }
+    if (this.compact()) { f.style.left = ''; f.style.maxWidth = ''; }
     else {
       const z = CM.Settings.get('uiScale') || 1;
       const open = this.right && !this.right.classList.contains('closed') && !this.right.classList.contains('hidden');
@@ -201,22 +258,94 @@
         chip.classList.toggle('overlap', a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top);
       }
     }
+    this.queueLayout();
+  };
+  UI.prototype.compact = function () {
+    return matchMedia('(max-width: 760px), (max-width: 1024px) and (max-height: 520px) and (pointer: coarse)').matches;
+  };
+  // 软键盘和浏览器工具栏缩小的是可视视口，不一定是 innerHeight。
+  UI.prototype.viewport = function () {
+    const v = window.visualViewport, s = this.viewportProbe ? getComputedStyle(this.viewportProbe) : null;
+    const x = v ? v.offsetLeft : 0, y = v ? v.offsetTop : 0, w = v ? v.width : innerWidth, h = v ? v.height : innerHeight;
+    const pad = function (k) { return s ? parseFloat(s[k]) || 0 : 0; };
+    return { x: x, y: y, w: w, h: h, left: x + pad('paddingLeft'), top: y + pad('paddingTop'), right: x + w - pad('paddingRight'), bottom: y + h - pad('paddingBottom') };
+  };
+  UI.prototype.queueLayout = function () {
+    if (this._layoutFrame) return;
+    const self = this;
+    this._layoutFrame = requestAnimationFrame(function () { self._layoutFrame = 0; self.measureLayout(); });
+  };
+  UI.prototype.measureLayout = function () {
+    const root = document.documentElement, v = this.viewport();
+    const px = function (key, val) { const str = Math.round(val * 100) / 100 + 'px'; if (root.style.getPropertyValue(key) !== str) root.style.setProperty(key, str); };
+    px('--view-top', v.y); px('--view-left', v.x); px('--view-width', v.w); px('--view-height', v.h);
+    px('--view-bottom', Math.max(0, innerHeight - v.y - v.h)); px('--view-right', Math.max(0, innerWidth - v.x - v.w));
+    const active = document.activeElement;
+    const typing = active && this.right.contains(active) && (active.tagName === 'TEXTAREA' || (active.tagName === 'INPUT' && /^(text|search|number|email|url|tel|password)$/.test(active.type)));
+    root.classList.toggle('panel-editing', !!(this.compact() && typing && (v.h < innerHeight - 120 || v.h < 420)));
+    this.right.classList.toggle('short-body', this.compact() && this.rBody.clientHeight < 160);
+    this.fitHud();
+    const hud = this.top.getBoundingClientRect(), toolbar = this.toolbar.getBoundingClientRect();
+    const visible = function (el) { return el && !el.classList.contains('hidden') && !el.classList.contains('closed') && el.getClientRects().length; };
+    px('--mobile-hud-bottom', hud.bottom + 6);
+    let controlsTop = toolbar.top;
+    const follow = document.getElementById('followCard');
+    if (document.body.classList.contains('following') && follow) controlsTop = Math.min(controlsTop, follow.getBoundingClientRect().top);
+    if (!document.body.classList.contains('following') && visible(this.bstack) && (visible(this.draftbar) || visible(this.toolopts))) controlsTop = Math.min(controlsTop, this.bstack.getBoundingClientRect().top);
+    px('--mobile-controls-top', controlsTop);
+    px('--mobile-panel-bottom', Math.max(0, innerHeight - controlsTop + 8));
+    // 底部抽屉出现后，图层图例与教程只使用上方剩余空间。
+    // 使用布局位置，避免抽屉入场动画的临时位移让地图控件占用抽屉空间。
+    const panelTop = this.compact() && innerHeight >= innerWidth && visible(this.right) ? this.right.offsetTop * (CM.Settings.get('uiScale') || 1) : controlsTop;
+    px('--mobile-side-bottom', panelTop);
+    const sidePanel = this.compact() && innerWidth > innerHeight && visible(this.right) ? this.right.getBoundingClientRect() : null;
+    px('--mobile-left-width', sidePanel ? Math.max(0, sidePanel.left - v.left - 68 * (CM.Settings.get('uiScale') || 1)) : v.right - v.left);
+    px('--mobile-feed-right', sidePanel ? innerWidth - sidePanel.left + 8 : innerWidth - v.right + 8);
+    const coach = document.getElementById('coach');
+    px('--mobile-legend-top', visible(coach) ? coach.getBoundingClientRect().bottom + 8 : hud.bottom + 6);
+    let feedTop = hud.bottom + 6;
+    for (const el of [document.getElementById('coach'), this.legendCard]) if (visible(el)) feedTop = Math.max(feedTop, el.getBoundingClientRect().bottom + 8);
+    px('--mobile-feed-top', feedTop);
+    px('--mobile-feed-height', Math.max(0, Math.min(v.h * .35, panelTop - feedTop - 8)));
+    if (this.dropdown && this.dropdown._place) this.dropdown._place();
+    if (this.searchEl && this.searchEl._place) this.searchEl._place();
+    if (this.linePicker && this.linePicker.el._place) this.linePicker.el._place();
   };
   // 顶栏按有效宽度收起次要内容（界面放大时同样适用）
   UI.prototype.layoutHud = function () {
+    this.closeTimeOptions(); this.unfoldMetrics();
     this.placeFeed();
     const w = window.innerWidth / (CM.Settings.get('uiScale') || 1);
-    for (const b of [1540, 1400, 1260, 1080, 960, 820]) this.top.classList.toggle('lt' + b, w < b);
+    for (const b of [1540, 1400, 1260, 1080, 960, 820, 400, 360, 300]) this.top.classList.toggle('lt' + b, w < b);
     for (const k in this.pills) this.pills[k].el.classList.remove('squeezed');
-    const self = this; requestAnimationFrame(function () { self.fitHud(); if (self.dropdown && self.dropdown._place) self.dropdown._place(); });
+    this.queueLayout();
   };
   // 指标栏放不下时，按优先级从低到高收起（经济 → 满意度 → 分担率 → 人口 → 拥堵）
+  const METRIC_ORDER = ['money', 'econ', 'pop', 'share', 'cong', 'sat'];
+  UI.prototype.metricEl = function (key) {
+    const p = this.pills[key]; if (!p) return null;
+    if (p.el.dataset.fold && this.mMore.classList.contains('off')) return this.mFold;
+    return p.el;
+  };
   UI.prototype.fitHud = function () {
     const m = this.top.querySelector('.cluster.metrics'); if (!m || !m.clientWidth) return;
+    const over = function () { return m.scrollWidth > m.clientWidth + 1; };
+    // CSS 为窄屏隐藏的指标也进入「+N」，不能只收起溢出的可见指标。
     for (const k of ['econ', 'sat', 'share', 'pop', 'cong']) {
-      if (m.scrollWidth <= m.clientWidth + 1) break;
-      const el = this.pills[k].el; if (getComputedStyle(el).display !== 'none') el.classList.add('squeezed');
+      const el = this.pills[k].el;
+      if (el.parentNode === m && !el.classList.contains('gone') && getComputedStyle(el).display === 'none') { el.dataset.fold = '1'; this.mMore.appendChild(el); }
     }
+    if (over() || this.mMore.children.length) this.mFold.classList.remove('off');
+    for (const k of ['econ', 'sat', 'share', 'pop', 'cong']) {
+      if (!over()) break;
+      const el = this.pills[k].el; if (el.parentNode !== m || getComputedStyle(el).display === 'none') continue;
+      el.dataset.fold = '1'; this.mMore.appendChild(el);
+    }
+    const folded = METRIC_ORDER.filter(function (k) { return this.pills[k].el.dataset.fold; }, this);
+    for (const k of folded) this.mMore.appendChild(this.pills[k].el);
+    const n = folded.filter(function (k) { return !this.pills[k].el.classList.contains('gone'); }, this).length;
+    this.mFold.querySelector('.mf-n').textContent = '+' + n;
+    this.mFold.classList.toggle('off', !n);
   };
   UI.prototype.showHUD = function (on) {
     for (const el of [this.top, this.dock, this.right, this.toolbar, this.zoomCtl, this.feed, this.bstack]) {
@@ -227,6 +356,9 @@
       el.setAttribute('aria-hidden', inactive ? 'true' : 'false');
     }
     if (!on) {
+      this.closeTimeOptions();
+      this.toggleLayerPanel(false);
+      this.toggleMetricsMore(false);
       this.draftbar.classList.add('hidden'); this.legendCard.classList.add('hidden'); this.statsEl.classList.add('hidden');
       if (this.legendCard.contains(document.activeElement)) document.activeElement.blur();
       this.legendCard.inert = true; this.legendCard.setAttribute('aria-hidden', 'true');
@@ -238,7 +370,10 @@
     const tipEl = this.uitip;
     let cur = null, timer = null;
     const show = function (el) {
-      const key = el.getAttribute('data-key');
+      // data-act：提示中的按键取自当前键位（设置中可自定义），优先于固定的 data-key
+      const act = el.getAttribute('data-act');
+      let key = el.getAttribute('data-key');
+      if (act && CM.Keys) { const hk = CM.Keys.hint(act), pre = el.getAttribute('data-key-pre'); key = pre ? (hk ? pre + ' / ' + hk : pre) : hk; }
       tipEl.innerHTML = '';
       // 注意：原生 append(null) 会把 null 写成文字，没有快捷键时不能传 null
       tipEl.appendChild(h('span', null, el.getAttribute('data-tip')));
@@ -290,12 +425,35 @@
       wrap.appendChild(rp);
       setTimeout(function () { rp.remove(); }, 600);
     }, true);
+    // 光标柔光（v2.1）：悬停的按钮 / 卡片记下光标位置，CSS 用它画一抹跟随的柔光；每帧最多更新一次
+    const GLOW_SEL = '.btn, .start-btn, .mode-card, .map-mode, .msel-item';
+    let glowEl = null, gx = 0, gy = 0, glowRaf = 0;
+    document.addEventListener('pointermove', function (e) {
+      if (e.pointerType === 'touch' || CM.Settings.reducedMotion()) return;
+      const b = e.target.closest && e.target.closest(GLOW_SEL);
+      if (!b) { glowEl = null; return; }
+      glowEl = b; gx = e.clientX; gy = e.clientY;
+      if (glowRaf) return;
+      glowRaf = requestAnimationFrame(function () {
+        glowRaf = 0; if (!glowEl) return;
+        const r = glowEl.getBoundingClientRect();
+        glowEl.style.setProperty('--mx', (gx - r.left).toFixed(0) + 'px'); glowEl.style.setProperty('--my', (gy - r.top).toFixed(0) + 'px');
+      });
+    }, { passive: true });
   };
-  UI.prototype.blocking = function () { return !this.screen.classList.contains('hidden') || !this.statsEl.classList.contains('hidden') || !!(CM.NetMap && CM.NetMap.isOpen()) || !!(this.g() && this.g().jumping); };
+  UI.prototype.blocking = function () {
+    return !this.screen.classList.contains('hidden') || !this.statsEl.classList.contains('hidden') || !!(CM.NetMap && CM.NetMap.isOpen()) || !!(this.g() && this.g().jumping);
+  };
+  UI.prototype.celebrationBlocked = function () {
+    return this.blocking() || (this.compact() && (!this.right.classList.contains('closed') || !this.legendCard.classList.contains('hidden') || this.layerPanelOpen() || !!this.searchEl || !!this.dropdown || !!this.linePicker || !!document.getElementById('coach') || !!document.getElementById('followCard') || !!(this.g() && this.g().draft)));
+  };
 
   // ======================== 游戏接入 ========================
   UI.prototype.attachGame = function (g) {
     const self = this;
+    this.toggleLayerPanel(false);
+    this._tot = null; this._totCity = null; this._popShown = null; this._funds = null; this._congT = 0;
+    for (const pill of [this.pills.pop, this.pills.money]) pill.v._tw = null;
     this.clearCelebrations();
     this.selection = null; this.stack = []; this.closePanel(true);
     this.layer = 'none'; this.R.layer = 'none'; this.renderDock();
@@ -304,6 +462,8 @@
     g.on('draftLive', function () { self.lastDraftChange = performance.now(); });
     g.on('prediction', function () { self.refreshPrediction(); self.renderDraftbar(); });
     g.on('network', function () { self.markUnsaved(); self.rerenderPage(); });
+    g.on('tasksUpdated', function () { self.markUnsaved(); if (self.stack.length) self.rerenderPage(); });
+    g.on('trafficImpact', function () { self.markUnsaved(); if (self.stack.length) self.rerenderPage(); });
     g.on('finance', function () { self.markUnsaved(); self.rerenderPage(); self.scheduleAutosave(); });
     g.on('month', function () { self.markUnsaved(); self.rerenderPage(); if (!g.jumping) { self.scheduleAutosave(); if (g.speed > 0) snd('month'); } });
     g.on('autosave', function () { self.scheduleAutosave(); });
@@ -339,8 +499,9 @@
   // ======================== 每帧 ========================
   UI.prototype.tick = function (dt, force) {
     const g = this.g(); if (!g) return;
+    if (CM.Quick) CM.Quick.tick();
     if (this._celebrationActive || this._celebrationQueue.length) {
-      if (this.blocking()) {
+      if (this.celebrationBlocked()) {
         const active = this._celebrationActive;
         if (active) {
           clearTimeout(this._celebrationTimer); clearTimeout(this._celebrationExitTimer);
@@ -381,7 +542,9 @@
     const W = g.model.weights(g.clock.minute);
     const per = CFG.periods[g.model.hourPeriod[Math.floor(g.clock.minute / 60) % 24]];
     c.date.v.innerHTML = U.esc(g.clock.y + '年' + g.clock.m + '月' + g.clock.d + '日') + ' <small>' + U.fmtClock(g.clock.minute) + '</small>';
-    c.date.k.textContent = UI.weekdayName(g.clock) + ' · ' + per.name;
+    const slowing = g.peakSlowNow();
+    c.date.k.textContent = UI.weekdayName(g.clock) + ' · ' + per.name + (slowing ? ' · 慢放中' : '');
+    if (slowing !== this._peakOn) { this._peakOn = slowing; this.tbtns.peak.classList.toggle('active', slowing); }
     c.date.el.setAttribute('data-tip', g.stageName() + ' · 点击查看日期、时段与城市发展');
     const rg = this.dayRing, frac = (g.clock.minute % 1440) / 1440;
     rg.arc.setAttribute('stroke-dashoffset', String(rg.C * (1 - frac)));
@@ -395,7 +558,7 @@
       this._funds = f;
       c.money.v.className = 'v' + (f < 0 ? ' bad' : '');
     }
-    const tot = this._tot && this._totVer === g.city.version ? this._tot : (this._tot = g.city.totals(), this._totVer = g.city.version, this._tot);
+    const tot = this._tot && this._totCity === g.city && this._totVer === g.city.version ? this._tot : (this._tot = g.city.totals(), this._totCity = g.city, this._totVer = g.city.version, this._tot);
     this.tweenNum(c.pop.v, this._popShown == null ? tot.pop : this._popShown, tot.pop, U.fmtPeople);
     this._popShown = tot.pop;
     const hist = g.history, prev = hist.length > 1 ? hist[hist.length - 2] : null;
@@ -408,8 +571,8 @@
     c.share.v.innerHTML = U.fmtPct(d.metroShare || 0) + ' ' + trend(d.metroShare || 0, prev && prev.share, true, true);
     if (!this._congT || performance.now() - this._congT > 900) { this._congT = performance.now(); this._cong = g.model.cityCongAt(W); }
     const cg = this._cong;
-    c.cong.v.innerHTML = cg.toFixed(2) + ' <small>' + (cg < 1.25 ? '畅通' : (cg < 1.6 ? '缓行' : '拥堵')) + '</small>';
-    c.cong.badge.className = 'badge ' + (cg < 1.25 ? 'b-green' : (cg < 1.6 ? 'b-orange' : 'b-red'));
+    c.cong.v.innerHTML = cg.toFixed(2) + ' <small>' + CM.Model.congestionNames[CM.Model.congestionLevel(cg)] + '</small>';
+    c.cong.badge.className = 'badge ' + ['b-green', 'b-gold', 'b-orange', 'b-red'][CM.Model.congestionLevel(cg)];
     // 城市经济：最近一年的实际增速（尚无完整年度时为本年预测）与经济环境；教程等未启用的地图不显示
     const hasEco = !!(g.macro && CM.Macro);
     c.econ.el.classList.toggle('gone', !hasEco);
@@ -505,7 +668,7 @@
     }, CM.Settings.reducedMotion() ? 0 : 350);
   };
   UI.prototype.showNextCelebration = function () {
-    if (this._celebrationActive || !this._celebrationQueue.length || this.blocking()) return;
+    if (this._celebrationActive || !this._celebrationQueue.length || this.celebrationBlocked()) return;
     const self = this, item = this._celebrationQueue.shift(), title = item.title, sub = item.sub, color = item.color;
     const rm = CM.Settings.reducedMotion() || item.shown;
     const count = h('span', { class: 'celebrate-count', hidden: !this._celebrationQueue.length }, '另有 ' + this._celebrationQueue.length + ' 条');
@@ -536,7 +699,7 @@
   UI.prototype.updateBanner = function () {
     const g = this.g();
     const items = g.econ.warnings().map(function (w) { return { cls: w.level, icon: 'warn', text: w.text, page: 'finance' }; });
-    if (g.model.sinceChange < 1 && g.netVersion > 0) items.push({ cls: 'info', icon: 'metro', text: '新的线路网络已投入运营，居民出行选择正在重新计算…', page: null });
+    if (!g.model.settled && g.netVersion > 0) items.push({ cls: 'info', icon: 'metro', text: '交通数据正在更新，居民出行选择正在重新计算…', page: null });
     if (g.econ.failed) items.unshift({ cls: 'danger', icon: 'error', text: '经营挑战已失败（点击查看）', page: 'failed' });
     const key = JSON.stringify(items);
     if (key === this._bannerKey) return;
@@ -604,13 +767,29 @@
     this.tbtns.s1.classList.toggle('on', sp === 1);
     this.tbtns.s2.classList.toggle('on', sp === 2);
     this.tbtns.s3.classList.toggle('on', sp === 3);
-    this.tbtns.d2.classList.toggle('on', this.R.cam.view === 0);
-    this.tbtns.iso.classList.toggle('on', this.R.cam.view === 1);
+    this.tbtns.s4.classList.toggle('on', sp === 4);
+    for (const n of [3, 4]) this.tbtns['s' + n].setAttribute('aria-checked', sp === n ? 'true' : 'false');
+    const fold = this.timeOptions.speed, high = sp >= 3;
+    fold.value.textContent = high ? CFG.time.speeds[sp - 1] + '×' : '';
+    fold.value.classList.toggle('gone', !high); fold.button.classList.toggle('has-on', high);
+    const pk = !!CM.Settings.get('peakSlow');
+    this.tbtns.peak.classList.toggle('on', pk);
+    this.tbtns.peak.setAttribute('aria-checked', pk ? 'true' : 'false');
+    this.tbtns.peak.setAttribute('data-tip', '高峰慢放：' + (pk ? '已开启' : '已关闭') + ' · 开启后工作日早高峰（7–9 时）与晚高峰（17–19 时）自动按 1× 运行，高峰结束后恢复所选速度');
+    const iso = this.R.cam.view === 1, vb = this.tbtns.view;
+    if (vb._iso !== iso) {
+      vb._iso = iso; vb.replaceChildren(ic(iso ? 'view2d' : 'view3d'), h('span', { class: 'lb' }, iso ? '2D' : '2.5D'));
+      vb.setAttribute('data-tip', iso ? '切换到 2D 地图' : '切换到 2.5D 城市');
+    }
+    fold.button.classList.toggle('peak', pk);
+    if (this.layerPanelOpen()) this.renderLayerPanel();
     this.tbtns.under.classList.toggle('on', this.R.cam.tu === 1);
+    if (this.tbtns.grid) this.tbtns.grid.classList.toggle('on', !!(CM.Grid && CM.Grid.on()));
     this.renderToolOpts();
     if (g) this.pauseChip.classList.toggle('hidden', !(sp === 0 && !g.jumping && this.screen.classList.contains('hidden')));
   };
   UI.prototype.setSpeed = function (s) {
+    this.closeTimeOptions();
     const g = this.g(); if (!g || g.jumping) return;
     s = U.clamp(s, 0, CFG.time.speeds.length);
     if (g.econ.failed && s > 0) { this.toast('经营挑战已失败，请选择后续操作', 'bad'); this.showFailure(g.econ.failed); return; }
@@ -621,28 +800,51 @@
     if (s === 0 && was > 0 && !this.isSaved()) this.scheduleAutosave();   // 暂停时自动保存当前进度
   };
   UI.prototype.togglePause = function () { const g = this.g(); if (!g) return; this.setSpeed(g.speed > 0 ? 0 : (this.prevSpeed || 1)); };
+  // 高峰慢放：设置长期保存；只改变高峰期间的时钟倍数，所选速度不变
+  UI.prototype.togglePeakSlow = function () {
+    const on = !CM.Settings.get('peakSlow');
+    CM.Settings.set('peakSlow', on); snd('toggle');
+    this.renderToolbar();
+    this.toast(on ? '已开启高峰慢放：工作日 7–9 时与 17–19 时自动按 1× 运行，便于观察高峰运营；高峰结束后恢复所选速度' : '已关闭高峰慢放：全天按所选速度运行', 'info');
+  };
   UI.prototype.setView = function (iso) { if (this.R.cam.view !== (iso ? 1 : 0)) snd('swoosh'); this.R.setView(iso); this.renderToolbar(); };
+  UI.prototype.resetView = function () { this.R.fitAllSmooth(); snd('swoosh'); };
   UI.prototype.toggleView = function () { this.setView(this.R.cam.view !== 1); };
   UI.prototype.toggleUnder = function () { snd('swoosh'); this.R.setUnder(this.R.cam.tu !== 1); this.renderToolbar(); };
-  // 浅色 / 深色：顶栏与开始界面上的按钮直接切换（不在设置里）
+  // 经纬网格（视图工具）：开关保存在本机；吸附只在网格显示时生效，默认 G 显示、Shift+G 吸附。
+  UI.prototype.toggleGrid = function () { if (!CM.Grid) return; CM.Grid.toggle(); snd('toggle'); };
+  UI.prototype.toggleGridSnap = function () {
+    if (!CM.Grid) return;
+    if (!CM.Grid.on()) { CM.Grid.toggle(); if (!CM.Settings.get('gridSnap')) CM.Grid.toggleSnap(); }
+    else CM.Grid.toggleSnap();
+    snd('toggle');
+    this.toast(CM.Grid.snapOn() ? '已开启网格吸附：新车站、线路与转弯点落在网格交叉点（' + CM.Grid.describe(this.R) + '，随缩放变化）' : '已关闭网格吸附', 'info');
+  };
+  // 浅色 / 深色：游戏顶栏与开始界面上的按钮快速切换；完整选项（含跟随系统）在「设置 → 画面」
   UI.prototype.toggleTheme = function () { CM.Settings.set('theme', document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'); snd('toggle'); };
   UI.prototype.renderThemeBtns = function () {
     const dark = CM.Settings.resolvedTheme() === 'dark';
     for (const b of [this.hbtns && this.hbtns.theme, this.startTheme]) {
       if (!b) continue;
-      b.innerHTML = ''; b.appendChild(ic(dark ? 'sun' : 'moon'));
+      // 图标切换时旋转弹入（太阳 ↔ 月亮），首次绘制不播放
+      const was = b.dataset.dark, now = dark ? '1' : '0';
+      b.innerHTML = ''; const svg = ic(dark ? 'sun' : 'moon'); b.appendChild(svg);
+      if (was !== undefined && was !== now && !CM.Settings.reducedMotion()) svg.classList.add('theme-ico-in');
+      b.dataset.dark = now;
       b.setAttribute('data-tip', dark ? '切换为浅色模式' : '切换为深色模式');
     }
   };
   UI.prototype.toggleSound = function () { CM.Settings.set('sound', !CM.Settings.get('sound')); if (CM.Settings.get('sound')) snd('toggle'); this.toast(CM.Settings.get('sound') ? '音效已开启' : '音效已关闭', 'info'); };
-  UI.prototype.openStats = function (tab) { if (CM.Stats && this.g()) { this.tools.cancelDrag(); snd('open'); CM.Stats.open(this, typeof tab === 'string' ? tab : null); } };
+  UI.prototype.openStats = function (tab) { if (CM.Stats && this.g()) { this.toggleLayerPanel(false); this.closeTimeOptions(); this.tools.cancelDrag(); snd('open'); CM.Stats.open(this, typeof tab === 'string' ? tab : null); } };
   UI.prototype.openNetMap = function () {
+    this.toggleLayerPanel(false); this.closeTimeOptions();
     if (!CM.NetMap || !this.g()) return;
     this.tools.cancelDrag();
     if (CM.NetMap.isOpen()) { CM.NetMap.close(); return; }
     this.closeSearch(); snd('open'); CM.NetMap.open(this);
   };
   UI.prototype.jump = function (n) {
+    this.closeTimeOptions();
     const g = this.g(); if (!g) return;
     if (g.econ.failed) { this.showFailure(g.econ.failed); return; }
     if (!g.startJump(n)) this.toast('正在结算，请稍候', 'info');
@@ -654,12 +856,32 @@
     if (this.topIs(['build']) && !this.g().draft) this.closePanel();
   };
   // 工具选项条：绘线时显示正在绘制的线路（可切换为新线路或支线）、建设方式与新站规模
+  UI.prototype.lineColorInput = function (getColor, onPick, prefix) {
+    const self = this, label = prefix || '';
+    const choose = function (value) {
+      if (self._replacingToolOpts || self._replacingPage || !/^#[0-9a-f]{6}$/i.test(value)) return;
+      onPick(value.toLowerCase()); box.syncColor();
+    };
+    const picker = h('input', { type: 'color', class: 'lc-picker', value: getColor(), 'aria-label': label + '自定义颜色', onchange: function () { choose(picker.value); } });
+    const preview = h('span', { class: 'lc-preview', style: { background: getColor() } });
+    const box = h('div', { class: 'lc-cur' }, preview,
+      h('label', { class: 'btn sm lc-custom', 'data-tip': '用取色器选择任意颜色' }, picker, ic('pencil', 14), '自定义'));
+    box.syncColor = function () { const c = getColor(); preview.style.background = c; picker.value = /^#[0-9a-f]{6}$/i.test(c) ? c : '#000000'; };
+    return box;
+  };
   UI.prototype.renderToolOpts = function () {
     const g = this.g(), T = this.tools, el = this.toolopts;
     if (!el) return;
-    if (!g || !T || T.tool === 'select') { el.classList.add('hidden'); el.innerHTML = ''; this._toKey = null; return; }
+    if (!g || !T || T.tool === 'select') {
+      el.classList.add('hidden'); this._replacingToolOpts = true;
+      try { el.innerHTML = ''; } finally { this._replacingToolOpts = false; }
+      this._toKey = null; return;
+    }
     const net = g.draft ? g.draft.net : g.net;
-    const key = [T.tool, T.chain, T.lineChoice, T.buildType, T.stationSize, g.draft ? g.draft.ver : 0, g.clock.y].join('|');
+    const gridOn = !!(CM.Grid && CM.Grid.on()), snapOn = !!(CM.Grid && CM.Grid.snapOn());
+    const colorLine = T.chain && net.lines[T.lineChoice];
+    const lineColor = colorLine ? colorLine.color : T.nextLineColor(true);
+    const key = [T.tool, T.chain, T.lineChoice, T.buildType, T.stationSize, g.draft ? g.draft.ver : 0, g.clock.y, gridOn, snapOn, lineColor].join('|');
     if (key === this._toKey && !el.classList.contains('hidden')) return;
     this._toKey = key;
     const self = this, mc = CFG.metro, y = g.clock.y;
@@ -669,10 +891,19 @@
       return c;
     };
     const grp = function (label, ctl) { return h('div', { class: 'to-grp' }, h('span', { class: 'to-k' }, label), ctl); };
-    const hint = function (icon, text) { return h('div', { class: 'to-hint' }, ic(icon), h('span', null, text)); };
+    const hint = function (icon, text) { return h('div', { class: 'to-hint', 'data-tip': gridOn || T.tool === 'line' ? text : null }, ic(icon), h('span', null, text)); };
+    // 网格吸附（只在显示经纬网格时出现）
+    const snapCtl = function () {
+      if (!gridOn) return [];
+      const b = h('button', { class: snapOn ? 'on' : '', 'aria-pressed': snapOn ? 'true' : 'false', 'data-silent': '1', 'data-act': 'view.gridSnap',
+        'data-tip': snapOn ? '已吸附：新车站、线路点与转弯点落在网格交叉点（间隔随缩放变化）；点击关闭' : '点击开启：新车站、线路点与转弯点落在网格交叉点',
+        onclick: function () { CM.Grid.toggleSnap(); snd('soft'); } }, ic('graticule', 14), '吸附交点');
+      return [h('span', { class: 'to-sep' }), h('div', { class: 'seg-ctl sm' }, b)];
+    };
     const typeCtl = grp('方式', segc(T.buildType, [['underground', '地下', '造价最高；越江为隧道，可穿越山体与保护建筑'], ['surface', '地面', '造价最低；越江为桥梁，两条地面线不能平交'], ['elevated', '高架', '造价居中；越江为桥梁']], function (v) { T.buildType = v; }));
     const sizeCtl = function (label) { return grp(label, segc(T.stationSize, ['S', 'M', 'L'].map(function (sz) { return [sz, mc.sizeName[sz].replace('型', ''), mc.sizeName[sz] + '车站：' + U.fmtInt(mc.stationCap[sz]) + ' 人次/时 · 编组上限 ' + mc.carsBySize[sz] + ' 节 · 约 ' + U.fmtMoney(M.stationCost(T.buildType, sz, y))]; }), function (v) { T.stationSize = v; })); };
-    el.innerHTML = '';
+    this._replacingToolOpts = true;
+    try { el.innerHTML = ''; } finally { this._replacingToolOpts = false; }
     if (T.tool === 'line') {
       if (!T.chain || !net.stations[T.chain]) el.appendChild(hint('route', '点击空地开始新线路 · 点击线路端点继续延长'));
       else {
@@ -681,20 +912,35 @@
           const tp = M.lineTopo(net, lid), L = net.lines[lid];
           if (tp.topo === 'loop' || tp.topo === 'invalid') continue;
           const end = tp.adj && tp.adj.get(T.chain) && tp.adj.get(T.chain).length === 1;
-          opts.push([lid, (end ? '延长 ' : '') + L.name + (end ? '' : ' 支线'), end ? '继续延长 ' + L.name : '从这里分出 ' + L.name + ' 的支线', L.color]);
+          opts.push([lid, (end ? '延长 ' : '') + L.name + (end ? '' : ' 支线'), end ? '继续延长 ' + L.name : '从这里分出 ' + L.name + ' 的支线', AX.line(L)]);
         }
-        if (T.lineChoice !== 'new' && net.lines[T.lineChoice] && !opts.some(function (o) { return o[0] === T.lineChoice; })) opts.push([T.lineChoice, net.lines[T.lineChoice].name, '', net.lines[T.lineChoice].color]);
+        if (T.lineChoice !== 'new' && net.lines[T.lineChoice] && !opts.some(function (o) { return o[0] === T.lineChoice; })) opts.push([T.lineChoice, net.lines[T.lineChoice].name, '', AX.line(net.lines[T.lineChoice])]);
         el.appendChild(grp('线路', segc(T.lineChoice, opts, function (v) { T.lineChoice = v; T.lineLock = true; })));
       }
-      el.append(h('span', { class: 'to-sep' }), typeCtl, sizeCtl('新站'));
-      if (T.chain) el.appendChild(h('button', { class: 'btn sm ghost', 'data-tip': '结束本次绘线', 'data-key': '右键 / Enter', onclick: function () { T.endChain(); } }, ic('check'), '完成'));
+      const colors = this.lineColorInput(function () { return colorLine ? colorLine.color : T.nextLineColor(true); }, function (c) {
+        if (colorLine) { self.setLineLook(colorLine.id, { color: c }); self.refreshObjectPage(); }
+        else { T.newLineColor = c; self.renderToolOpts(); }
+        const rc = (CM.Settings.get('recentColors') || []).filter(function (x) { return x !== c; }); rc.unshift(c); CM.Settings.set('recentColors', rc.slice(0, 8));
+      }, '绘线');
+      const colorGroup = grp(colorLine ? '线路颜色' : '新线颜色', colors);
+      colorGroup.classList.add('to-color');
+      colorGroup.setAttribute('data-tip', (colorLine ? '修改当前线路整条线的颜色，立即生效且不产生费用' : '为即将新建的线路选色，预览与建成后的线路使用同一颜色') + (AX.enabled() ? '；色盲辅助已开启，地图使用辅助配色，所选原色会保留' : ''));
+      // 线形（v2.1）：平滑曲线把 Shift+点击的转弯点当作控制柄；穿点为原画法，曲线逐点穿过转弯点
+      const curveCtl = grp('线形', segc(T.curveMode, [['smooth', '平滑', '平滑曲线：Shift+点击放置的转弯点是控制柄，线路圆顺地从附近经过，放一个控制柄即可画出大半径弯道'], ['pass', '穿点', '穿过转弯点：线路逐点经过每个转弯点（原画法），适合贴着道路或河岸走线']], function (v) { T.curveMode = v; CM.Settings.set('curveMode', v); }));
+      el.append(colorGroup, h('span', { class: 'to-sep' }), typeCtl, sizeCtl('新站'), curveCtl);
+      el.append.apply(el, snapCtl());
+      if (T.chain) el.appendChild(h('button', { class: 'btn sm ghost', 'data-tip': '结束本次绘线', 'data-key-pre': '右键', 'data-act': 'build.finish', onclick: function () { T.endChain(); } }, ic('check'), '完成'));
     } else if (T.tool === 'station') {
       el.append(hint('station', '点击空地建站 · 点击轨道插入车站'), h('span', { class: 'to-sep' }), typeCtl, sizeCtl('规模'));
+      el.append.apply(el, snapCtl());
     } else if (T.tool === 'edit') {
-      el.appendChild(hint('pencil', '拖动车站或圆点调整线形 · 拖动菱形增加转弯点 · 双击删除转弯点 · Ctrl+点击多选'));
+      el.appendChild(hint('pencil', '拖动车站或圆点调整线形 · 拖动菱形增加转弯点 · 双击删除转弯点 · 选中车站后拖动旋转手柄调整站台方向 · Ctrl+点击多选'));
+      el.append.apply(el, snapCtl());
     } else if (T.tool === 'demolish') {
       el.appendChild(hint('bulldozer', '悬停查看拆除后的变化 · 点击拆除（进入草案，可撤销）'));
     }
+    el.classList.toggle('has-snap', gridOn && T.tool !== 'demolish');   // 窄窗口中把说明文字收成图标，给吸附开关留出位置
+    el.classList.toggle('has-color', T.tool === 'line');
     el.classList.remove('hidden');
   };
   // 绘线起点是多条线路的端点时：在车站旁弹出选择框，确认延长哪条线路（或改为新线路）。
@@ -708,7 +954,7 @@
       const L = net.lines[lid], tp = M.lineTopo(net, lid);
       // 线路另一端的终点名，帮助区分方向相近的线路
       const other = (tp.leaves || []).filter(function (x) { return x !== sid; }).map(function (x) { return net.stations[x] && net.stations[x].name; }).filter(Boolean);
-      opts.push({ lid: lid, color: L.color, label: '延长 ' + L.name, sub: (other.length ? '另一端：' + other.slice(0, 2).join('、') + ' · ' : '') + tp.stations.length + ' 站' });
+      opts.push({ lid: lid, color: AX.line(L), label: '延长 ' + L.name, sub: (other.length ? '另一端：' + other.slice(0, 2).join('、') + ' · ' : '') + tp.stations.length + ' 站' });
     }
     opts.push({ lid: 'new', color: T.nextLineColor(), label: '新建线路', sub: '从「' + s.name + '」开始，与已有线路换乘' });
     const box = h('div', { class: 'line-picker glass', role: 'dialog', 'aria-label': '选择要延长的线路' },
@@ -728,11 +974,19 @@
       return true;
     };
     document.body.appendChild(box);
-    const R = this.R, q = R.P(s.x, s.y, 0), w = box.offsetWidth, hh = box.offsetHeight;
-    let x = q.x + 22, y = q.y - hh / 2;
-    if (x + w > window.innerWidth - 10) x = q.x - w - 22;
-    box.style.left = U.clamp(x, 8, window.innerWidth - w - 8) + 'px';
-    box.style.top = U.clamp(y, 70, window.innerHeight - hh - 90) + 'px';
+    box._place = function () {
+      const v = self.viewport(), z = CM.Settings.get('uiScale') || 1, q = self.R.P(s.x, s.y, 0);
+      const top = self.compact() ? self.top.getBoundingClientRect().bottom + 6 : v.top + 8;
+      const bottom = self.compact() ? Math.min(v.bottom, self.toolbar.getBoundingClientRect().top - 8) : v.bottom;
+      box.style.maxWidth = Math.max(0, v.right - v.left - 16) / z + 'px';
+      box.style.maxHeight = Math.max(0, bottom - top - 8) / z + 'px';
+      const r = box.getBoundingClientRect();
+      let x = q.x + 22;
+      if (x + r.width > v.right - 8) x = q.x - r.width - 22;
+      box.style.left = U.clamp(x, v.left + 8, Math.max(v.left + 8, v.right - r.width - 8)) / z + 'px';
+      box.style.top = U.clamp(q.y - r.height / 2, top, Math.max(top, bottom - r.height - 8)) / z + 'px';
+    };
+    box._place();
     this.linePicker = { el: box, sid: sid, pick: pick, btns: btns };
   };
   UI.prototype.closeLinePicker = function () {
@@ -745,12 +999,13 @@
     if (CM.Stats && CM.Stats.isOpen()) { CM.Stats.close(); return; }
     if (CM.NetMap && CM.NetMap.isOpen()) { CM.NetMap.close(); return; }
     if (!this.screen.classList.contains('hidden') && this.screenEsc) { this.screenEsc(); return; }
-    if (this.dropdown) { this.dropdown.remove(); this.dropdown = null; return; }
+    if (this.dropdown) { this.closeMenu(); return; }
+    if (this.layerPanelOpen()) { this.toggleLayerPanel(false); return; }
     if (this.searchEl) { this.closeSearch(); return; }
     if (this.R.hl) { this.R.setHighlight(null); return; }
     if (this.multi) { this.clearMulti(); return; }
-    if (this.layer !== 'none' && !this.stack.length) { this.setLayer('none'); return; }
-    if (this.stack.length) { this.closePanel(); return; }
+    if (this.stack.length) { this.closePanel(); return; }   // Esc 先收起右侧面板（指标自带的图层随之恢复），再按一次关闭仍开着的图层
+    if (this.layer !== 'none') { this.setLayer('none'); return; }
     this.select(null);
   };
 
@@ -771,10 +1026,10 @@
       ev.conflicts.length ? h('button', { class: 'cfbadge', 'data-tip': '查看冲突位置与解决办法', onclick: function () { self.showConflicts(); } }, ic('error'), ev.conflicts.length + ' 处冲突') : null,
       ev.warnings.length && !ev.conflicts.length ? h('button', { class: 'cfbadge warn', 'data-tip': '查看提示', onclick: function () { self.open['dr-warn'] = true; self.openPage('build', null, { root: true }); } }, ic('warn'), ev.warnings.length) : null,
       h('span', { class: 'db-sep' }),
-      h('button', { class: 'iconbtn', 'data-tip': '撤销', 'data-key': 'Ctrl+Z', onclick: function () { self.undo(); }, disabled: !g.draft.undo.length }, ic('undo')),
-      h('button', { class: 'iconbtn', 'data-tip': '重做', 'data-key': 'Ctrl+Y', onclick: function () { self.redo(); }, disabled: !g.draft.redo.length }, ic('redo')),
+      h('button', { class: 'iconbtn', 'data-tip': '撤销', 'data-act': 'build.undo', onclick: function () { self.undo(); }, disabled: !g.draft.undo.length }, ic('undo')),
+      h('button', { class: 'iconbtn', 'data-tip': '重做', 'data-act': 'build.redo', onclick: function () { self.redo(); }, disabled: !g.draft.redo.length }, ic('redo')),
       h('button', { class: 'btn sm ghost danger', 'data-tip': '放弃全部修改（不产生费用）', onclick: function () { self.discardDraft(); } }, '放弃'),
-      h('button', { class: 'btn sm primary', 'data-tip': can.ok ? '确认后立即建成并投入运营' : can.reason, 'data-key': can.ok ? 'Ctrl+Enter' : null, disabled: !can.ok, onclick: function () { self.confirmDraft(); } }, ic('hammer'), '确认建设')
+      h('button', { class: 'btn sm primary', 'data-tip': can.ok ? '确认后立即建成并投入运营' : can.reason, 'data-act': can.ok ? 'build.confirm' : null, disabled: !can.ok, onclick: function () { self.confirmDraft(); } }, ic('hammer'), '确认建设')
     ].filter(Boolean));
   };
   // 撤销 / 重做：按钮与快捷键共用；之后结束当前绘线，下一次点击重新选择起点
@@ -832,13 +1087,13 @@
     const R = this.R, net = g.net;
     for (const s of newSeg) {
       const ln = net.lines[s.line]; if (!ln || !net.segments[s.id]) continue;
-      try { R.addFx('trace', 0, 0, { pts: M.segGeom(net, net.segments[s.id], g.city).pts, color: ln.color }); } catch (e) { /* 几何不可用时跳过 */ }
+      try { R.addFx('trace', 0, 0, { pts: M.segGeom(net, net.segments[s.id], g.city).pts, color: AX.line(ln) }); } catch (e) { /* 几何不可用时跳过 */ }
     }
-    newSt.forEach(function (s, k) { const ln = M.stationLines(net, s.id).map(function (l) { return net.lines[l]; })[0]; R.addFx('burst', s.x, s.y, { color: ln ? ln.color : '#2f6fb6', delay: 0.25 + k * 0.08 }); });
+    newSt.forEach(function (s, k) { const ln = M.stationLines(net, s.id).map(function (l) { return net.lines[l]; })[0]; R.addFx('burst', s.x, s.y, { color: ln ? AX.line(ln) : '#2f6fb6', delay: 0.25 + k * 0.08 }); });
     if (newLines.length) {
       const L = newLines[0];
       const n = M.lineTopo(net, L.id).stations.length;
-      this.celebrate(L.name + ' 开通运营', n + ' 座车站 · 乘客正在规划新的出行路线', L.color);
+      this.celebrate(L.name + ' 开通运营', n + ' 座车站 · 乘客正在规划新的出行路线', AX.line(L));
     }
     this.tools.chain = null; this.tools.bends = [];
     this.hoverConflict = null;
@@ -899,7 +1154,7 @@
     if (fix.op === 'restoreStation') {
       const o = g.net.stations[fix.station];
       if (!o) return;
-      g.edit(function (n) { const s = n.stations[fix.station]; if (s) { s.x = o.x; s.y = o.y; s.type = o.type; } });
+      g.edit(function (n) { const s = n.stations[fix.station]; if (s) { s.x = o.x; s.y = o.y; s.type = o.type; if (o.lv) s.lv = Object.assign({}, o.lv); else delete s.lv; CM.Metro.normalizeLevels(n); } });
       this.toast('已撤回「' + o.name + '」的位置与建设方式修改', 'good');
       return;
     }
@@ -913,8 +1168,16 @@
   UI.prototype.renderDock = function () {
     const card = this.legendCard;
     if (card.contains(document.activeElement)) document.activeElement.blur();
-    for (const x of LAYERS) this.dockBtns[x.id].classList.toggle('on', this.layer === x.id);
+    for (const x of LAYERS) if (this.dockBtns[x.id]) this.dockBtns[x.id].classList.toggle('on', this.layer === x.id);
     const L = LAYERS.find((x) => x.id === this.layer);
+    // 「图层」按钮：开启图层时显示该图层的颜色与图标
+    const lb = this.layerBtn;
+    if (lb && lb._layer !== this.layer) {
+      lb._layer = this.layer; lb.innerHTML = '';
+      lb.append(ic(L ? L.icon : 'layers'), h('span', { class: 'lb' }, '图层'));
+      lb.classList.toggle('on', !!L); if (L) lb.style.setProperty('--lc', L.color); else lb.style.removeProperty('--lc');
+      lb.setAttribute('data-tip', L ? '图层：' + L.name + ' · 点击更换或关闭' : '图层');
+    }
     const hidden = !L || !this.g();
     card.inert = hidden; card.setAttribute('aria-hidden', hidden ? 'true' : 'false');
     if (hidden) { card.classList.add('hidden'); this.placeFeed(); return; }
@@ -927,24 +1190,99 @@
     this.placeFeed();
   };
   UI.prototype.setLayer = function (id) { if (id !== this.layer) snd('soft'); this.layer = id; this.R.layer = id; this.R.heatKey = ''; this.renderDock(); };
+  UI.prototype.layerPanelOpen = function () { return !!this.layerPanel && !this.layerPanel.classList.contains('hidden'); };
+  UI.prototype.toggleLayerPanel = function (open) {
+    const p = this.layerPanel, on = open == null ? !this.layerPanelOpen() : !!open;
+    if (on && (!this.g() || this.blocking())) return;
+    if (on === this.layerPanelOpen()) return;
+    if (!on && p.contains(document.activeElement)) this.layerBtn.focus();
+    p.classList.toggle('hidden', !on); p.inert = !on;
+    this.layerBtn.classList.toggle('open', on); this.layerBtn.setAttribute('aria-expanded', on ? 'true' : 'false');
+    if (!on) { this.dockBtns = {}; this._lpKey = null; return; }
+    snd('open');
+    this.closeTimeOptions();
+    this.renderLayerPanel();
+  };
+  UI.prototype.renderLayerPanel = function () {
+    const self = this, p = this.layerPanel;
+    const key = this.layer + '|' + !!(CM.Grid && CM.Grid.on());
+    if (key === this._lpKey) { this.placeLayerPanel(); return; }
+    this._lpKey = key;
+    p.innerHTML = '';
+    this.dockBtns = {};
+    let first = true;
+    for (const G of LAYER_GROUPS) {
+      if (!first) p.appendChild(h('i', { class: 'lp-sep' }));
+      first = false;
+      for (const L of LAYERS) {
+        if (L.group !== G[0] || L.metric) continue;   // 人口密度、道路拥堵、地铁覆盖随顶栏指标打开
+        const on = self.layer === L.id;
+        const b = h('button', { class: 'lp-btn' + (on ? ' on' : ''), 'data-tip': G[1] + ' · ' + L.name + ' · ' + L.desc + (on ? '（再次点击关闭）' : ''), 'aria-label': L.name, 'aria-pressed': on ? 'true' : 'false',
+          onclick: function () { self.setLayer(self.layer === L.id ? 'none' : L.id); self.toggleLayerPanel(false); } }, ic(L.icon));
+        b.style.setProperty('--lc', L.color);
+        self.dockBtns[L.id] = b; p.appendChild(b);
+      }
+    }
+    // 地图显示：经纬网格（建站与绘线时可吸附到交叉点）
+    if (CM.Grid) {
+      const gridOn = !!CM.Grid.on();
+      p.appendChild(h('i', { class: 'lp-sep' }));
+      p.appendChild(h('button', { class: 'lp-btn opt' + (gridOn ? ' on' : ''), 'data-act': 'view.grid', 'data-silent': '1', role: 'switch', 'aria-label': '经纬网格', 'aria-checked': gridOn ? 'true' : 'false',
+        'data-tip': '显示 · 经纬网格（' + (gridOn ? '已开启' : '已关闭') + '）· 建站与绘线时可吸附到交叉点', onclick: function () { self.toggleGrid(); self.renderLayerPanel(); } }, ic('graticule')));
+    }
+    this.placeLayerPanel();
+  };
+  UI.prototype.placeLayerPanel = function () {
+    const p = this.layerPanel;
+    // 在按钮旁展开，限制在顶栏与手机详情抽屉之间。
+    const z = CM.Settings.get('uiScale') || 1, r = this.layerBtn.getBoundingClientRect(), v = this.viewport();
+    const root = getComputedStyle(document.documentElement), compact = this.compact();
+    const lo = compact ? parseFloat(root.getPropertyValue('--mobile-hud-bottom')) || v.top + 8 : v.top + 8;
+    const hi = compact ? parseFloat(root.getPropertyValue('--mobile-side-bottom')) || v.bottom : v.bottom;
+    p.style.left = (U.clamp(r.right + 10, v.left + 8, v.right - p.offsetWidth * z - 8) / z) + 'px';
+    const hh = p.offsetHeight * z;
+    p.style.top = (U.clamp(r.top, lo, Math.max(lo, hi - hh - 8)) / z) + 'px';
+  };
+  UI.prototype.syncMetricLayer = function (key) {
+    const p = key && this.pills[key], want = p && p.layer ? p.layer : null, a = this._autoLayer;
+    if (a && a.layer !== want) { this._autoLayer = null; if (this.layer === a.layer) this.setLayer(a.prev); }
+    if (want && (!this._autoLayer || this._autoLayer.layer !== want)) {
+      this._autoLayer = { layer: want, prev: this.layer === want ? 'none' : this.layer };
+      if (this.layer !== want) this.setLayer(want);
+    }
+  };
+  // 依次切换分析图层（键位「依次切换分析图层」，Shift 反向）：关闭 → 第一个图层 → … → 最后一个 → 关闭
+  UI.prototype.cycleLayer = function (dir) {
+    const ids = ['none'].concat(LAYERS.map(function (L) { return L.id; }));
+    const k = Math.max(0, ids.indexOf(this.layer));
+    const next = ids[(k + (dir < 0 ? ids.length - 1 : 1)) % ids.length];
+    this.setLayer(next);
+    if (next !== 'none') { const L = LAYERS.find(function (x) { return x.id === next; }); if (L) this.toast('图层：' + L.name, 'info'); }
+  };
+  // 快速保存（键位「保存进度」）：立即保存到自动存档并提示
+  UI.prototype.quickSave = function () {
+    const self = this;
+    if (!this.g()) return;
+    this.doAutosave(true).then(function (r) { if (r && r.ok) self.toast('进度已保存', 'good'); else if (r && r.error) self.toast('未能保存：' + r.error, 'warn'); });
+  };
   // 图例：只保留读图所需的色标与一句说明
   UI.prototype.legend = function (id) {
     const self = this, R = this.R;
     const box = h('div', { class: 'legend' });
-    const grad = function (stops, a, b) { box.append(h('div', { class: 'bar', style: { background: 'linear-gradient(90deg,' + stops.join(',') + ')' } }), h('div', { class: 'row between tiny muted' }, h('span', null, a), h('span', null, b))); };
-    const li = function (col, text, kind) { box.appendChild(h('div', { class: 'li' }, h('span', { class: kind === 'line' ? 'swatch' : (kind === 'ring' ? 'dot ring' : 'dot'), style: kind === 'ring' ? { borderColor: col } : { background: col } }), text)); };
+    const grad = function (stops, a, b) { box.append(h('div', { class: 'bar', style: { background: 'linear-gradient(90deg,' + stops.map(AX.color).join(',') + ')' } }), h('div', { class: 'row between tiny muted' }, h('span', null, a), h('span', null, b))); };
+    const li = function (col, text, kind) { col = AX.color(col); box.appendChild(h('div', { class: 'li' }, h('span', { class: kind === 'line' ? 'swatch' : (kind === 'ring' ? 'dot ring' : 'dot'), style: kind === 'ring' ? { borderColor: col } : { background: col } }), text)); };
     const opts = function (key, list) {
       const ctl = h('div', { class: 'seg-ctl sm', style: { margin: '2px 0 8px' } });
       for (const o of list) ctl.appendChild(h('button', { class: R.layerOpt[key] === o[0] ? 'on' : '', 'data-silent': '1', onclick: function () { R.layerOpt[key] = o[0]; snd('soft'); self.renderDock(); } }, o[1]));
       box.appendChild(ctl);
     };
-    const CC = CM.Renderer.CONG_COLS;
+    const CC = AX.enabled() ? AX.statuses() : CM.Renderer.CONG_COLS;
     let note = '';
     switch (id) {
       case 'pop': grad(['#ffe296', '#f99e4c', '#de5434'], '0', '6 万人/km²'); note = '每个街区的常住人口密度（每月更新）。'; break;
       case 'jobs': li('#f0963c', '以住宅为主'); li('#9aa0b0', '职住混合'); li('#3468d6', '以就业岗位为主'); note = '颜色越深，人口与岗位越密集。'; break;
-      case 'cong': li(CC[0], '畅通', 'line'); li(CC[1], '缓行', 'line'); li(CC[2], '拥堵', 'line'); li(CC[3], '严重拥堵', 'line'); note = '主要道路（快速路与主干道）当前时刻的拥堵程度（流量 ÷ 通行能力），随早晚高峰实时变化，夜间与平峰多为畅通；线越粗道路等级越高。'; break;
-      case 'flow': opts('flow', [['all', '全部'], ['car', '汽车'], ['metro', '地铁']]); if (R.layerOpt.flow === 'all') { li('#80869a', '汽车出行', 'line'); li('#2166cc', '其中乘地铁（箭头中间的蓝色部分）', 'line'); } note = '每个片区当前时段最主要的出行方向（第二方向接近时也画出）：箭头从片区指向目的地，尖端标出目的地名称；两个片区互为主要方向时画成双向箭头。线越粗出行越多，新区域开放、修建地铁后会随之变化。'; break;
+      case 'cong': opts('cong', [['now', '当前时刻'], ['am', '工作日早高峰']]); li(CC[0], AX.enabled() ? '畅通 · 实线' : '畅通', 'line'); li(CC[1], AX.enabled() ? '缓行 · 长虚线' : '缓行', 'line'); li(CC[2], AX.enabled() ? '拥堵 · 点线' : '拥堵', 'line'); li(CC[3], AX.enabled() ? '严重拥堵 · 点划线' : '严重拥堵', 'line'); note = '颜色按实际行驶时间 ÷ 自由流时间：<1.15 畅通，1.15–1.35 缓行，1.35–1.60 拥堵，≥1.60 严重拥堵；显示较拥堵方向。全城平均与单条道路分别统计。'; break;
+      case 'flow': opts('flow', [['all', '全部'], ['car', CM.DATA.bg ? '非地铁' : '汽车'], ['metro', '地铁']]); if (R.layerOpt.flow === 'all') { li('#80869a', CM.DATA.bg ? '非地铁出行' : '汽车出行', 'line'); li('#2166cc', '其中乘地铁（箭头中间的蓝色部分）', 'line'); } note = '每个片区当前时段最主要的出行方向（第二方向接近时也画出）：箭头从片区指向目的地，尖端标出目的地名称；两个片区互为主要方向时画成双向箭头。线越粗出行越多，新区域开放、修建地铁后会随之变化。'; break;
       case 'cover': opts('cover', [['time', '步行时间'], ['station', '所属车站']]);
         if (R.layerOpt.cover === 'station') { li('rgba(20,162,82,0.5)', '每个颜色块为步行最近的车站（细线为分界）'); li('#d73027', '人口密集但无地铁'); }
         else { li('#1b7837', '步行 5 分钟内'); li('#5aae61', '步行 10 分钟内'); li('#acdc8c', '步行 15 分钟内'); li('#d73027', '人口密集但无地铁'); }
@@ -958,10 +1296,10 @@
         opts('facP', [['all', '设施类'], ['sc', '上学'], ['sh', '购物'], ['md', '医疗'], ['lz', '休闲'], ['hb', '枢纽'], ['hw', '通勤']]);
         opts('facDt', [['wd', '工作日'], ['we', '周末']]);
         const TR = CFG.trips;
-        if (R.layerOpt.facP === 'all') { for (const k of ['sc', 'sh', 'md', 'lz']) li(TR.color[k], TR.name[k] + '为主的片区'); }
-        else li(TR.color[R.layerOpt.facP], TR.name[R.layerOpt.facP] + '吸引（片区汇总）');
-        li('#7a8699', '圆点：重要设施（大小为日到访量，外环越绿乘地铁比例越高）', 'ring');
-        note = '片区颜色为普通设施（中小学、社区商业、诊所、街区公园等）按片区汇总的吸引出行；重要设施单独计算，点击圆点查看详情。设施位置与年份为史实参考，规模为估算，到访量为模拟结果（汽车 + 地铁出行，不含步行）。';
+        if (R.layerOpt.facP === 'all') { for (const k of ['sc', 'sh', 'md', 'lz']) li(AX.category(TR.keys.indexOf(k), TR.color[k]), TR.name[k] + '为主的片区'); }
+        else li(AX.category(TR.keys.indexOf(R.layerOpt.facP), TR.color[R.layerOpt.facP]), TR.name[R.layerOpt.facP] + '吸引（片区汇总）');
+        li('#7a8699', AX.enabled() ? '圆点大小为日到访量；外环由紫到蓝表示地铁比例提高，可点击查看数值' : '圆点：重要设施（大小为日到访量，外环越绿乘地铁比例越高）', 'ring');
+        note = (CM.DATA.bg ? "片区颜色为普通设施（中小学、社区商业、诊所、街区公园等）按片区汇总的吸引出行；重要设施单独计算，点击圆点查看详情。设施位置与年份为史实参考，规模为估算，到访量为模拟结果（道路、背景交通及地铁出行）。" : '片区颜色为普通设施（中小学、社区商业、诊所、街区公园等）按片区汇总的吸引出行；重要设施单独计算，点击圆点查看详情。设施位置与年份为史实参考，规模为估算，到访量为模拟结果（汽车 + 地铁出行，不含步行）。');
         break;
       }
       case 'gap': opts('gapDt', [['wd', '工作日'], ['we', '周末']]);
@@ -999,6 +1337,7 @@
     if (opts.replaceTop && top) this.stack[this.stack.length - 1] = { kind: kind, id: id };
     else if (opts.root) this.stack = [{ kind: kind, id: id }];
     else { this.stack.push({ kind: kind, id: id }); if (this.stack.length > 8) this.stack.shift(); }
+    if (opts.root) this.syncMetricLayer(kind === 'metric' ? id : null);
     snd('open');
     this.renderPage(true);
   };
@@ -1016,6 +1355,7 @@
     this.right.classList.add('closed');
     if (!silent && this.selection && this.selection.kind !== 'station') this.select(null, true);
     this.highlightLine = null;
+    this.syncMetricLayer(null);
     this.placeFeed();
   };
   UI.prototype.rerenderPage = function () { if (this.stack.length) this.renderPage(false); };
@@ -1040,14 +1380,28 @@
     try { page = this['page_' + top.kind](top.id); }
     catch (e) { console.error(e); page = { title: '详情', el: h('div', { class: 'callout bad' }, '无法显示：' + e.message) }; }
     if (!page) { this.back(); return; }
-    this.rTitle.textContent = page.title;
+    // 标题直接改名（v2.1 第二轮）：车站、线路详情点标题即可改名；线路的彩色徽标点一下改颜色。
+    // 正在改名时页面自动刷新不打断输入
+    if (!(this._titleEditKey === top.kind + '|' + top.id && this.rTitle.querySelector('input'))) {
+      this._titleEditKey = null;
+      this.rTitle.textContent = page.title;
+      this.rTitle.classList.toggle('editable', !!page.titleEdit);
+      this.rTitle.onclick = page.titleEdit ? this.titleEditor.bind(this, page.titleEdit) : null;
+      this.rTitle.setAttribute('data-tip', page.titleEdit ? '点击改名' : '');
+      if (page.titleEdit) this.rTitle.appendChild(ic('pencil', 14, 'p-title-ico'));
+    }
     const pi = top.kind === 'metric' ? (METRIC_ICON[top.id] || PAGE_ICON.metric) : (PAGE_ICON[top.kind] || ['info', 'b-slate']);
     this.rBadge.className = 'badge ' + pi[1];
     this.rBadge.innerHTML = ''; this.rBadge.appendChild(ic(pi[0]));
-    if (top.kind === 'line' && page.highlightLine) { const ln = (this.g().draft ? this.g().draft.net : this.g().net).lines[page.highlightLine]; if (ln) { this.rBadge.className = 'badge'; this.rBadge.style.background = ln.color; } }
+    if (top.kind === 'line' && page.highlightLine) { const ln = (this.g().draft ? this.g().draft.net : this.g().net).lines[page.highlightLine]; if (ln) { this.rBadge.className = 'badge'; this.rBadge.style.background = AX.line(ln); } }
     else this.rBadge.style.background = '';
     this.rBack.style.visibility = this.stack.length > 1 ? 'visible' : 'hidden';
-    this.rBody.innerHTML = '';
+    this.rBadge.onclick = page.badgeClick || null;
+    this.rBadge.classList.toggle('clickable', !!page.badgeClick);
+    this.rBadge.setAttribute('data-tip', page.badgeTip || '');
+    // 移除仍聚焦的输入框可能同步触发 change；旧页面的值不能覆盖刚更新的线路外观。
+    this._replacingPage = true;
+    try { this.rBody.innerHTML = ''; } finally { this._replacingPage = false; }
     if (anim) page.el.classList.add('page-enter');
     this.rBody.appendChild(page.el);
     this.rBody.scrollTop = scroll;
@@ -1057,6 +1411,35 @@
     this.right.classList.remove('closed');
     if (wasClosed) this.placeFeed();
     this.highlightLine = page.highlightLine || null;
+  };
+  // 详情标题就地改名：回车或失焦保存，Esc取消；非法输入保留编辑器并提示。
+  UI.prototype.titleEditor = function (spec) {
+    const self = this, t = this.rTitle;
+    if (t.querySelector('input')) return;
+    const top = this.stack[this.stack.length - 1]; if (!top) return;
+    const input = h('input', { type: 'text', class: 'p-title-in', value: spec.value, maxlength: spec.max || 16, 'aria-label': '名称' });
+    let done = false;
+    this._titleEditKey = top.kind + '|' + top.id;
+    const finish = function (save) {
+      if (done) return;
+      if (save) {
+        const v = input.value.trim();
+        if (!v) { self.toast('名称不能为空', 'bad'); input.focus(); return; }
+        if (v !== spec.value) { const r = spec.apply(v) || {}; if (r.error) { self.toast(r.error, 'bad'); input.focus(); return; } }
+      }
+      done = true; self._titleEditKey = null;
+      self.rerenderPage();
+    };
+    input.addEventListener('keydown', function (e) { if (e.isComposing || e.keyCode === 229) return; if (e.key === 'Enter') { e.preventDefault(); finish(true); } else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); } });
+    input.addEventListener('blur', function () { finish(true); });
+    t.textContent = ''; t.appendChild(input); input.focus(); input.select();
+  };
+  // 打开车站或线路详情的指定分页（概况 info / 建设 build）
+  UI.prototype.openObj = function (kind, id, tab) {
+    this._tab = this._tab || {}; this._tab[kind] = tab;
+    const top = this.stack[this.stack.length - 1];
+    if (top && top.kind === kind && top.id === id && !this.right.classList.contains('closed')) { this.renderPage(false); return; }
+    this.openPage(kind, id, { replaceTop: this.topIs(['station', 'line', 'road', 'zone', 'facility']) });
   };
   UI.prototype.sec = function (key, title, summary, bodyFn, defOpen, icon) {
     const open = this.open[key] !== undefined ? this.open[key] : !!defOpen;
@@ -1113,6 +1496,7 @@
   // ======================== 选择 ========================
   UI.prototype.select = function (sel, noPage) {
     this.selection = sel;
+    if (CM.Quick) CM.Quick.show(sel);   // 地图上的快捷操作条（选择工具下的车站、线路）
     if (!sel) { this.highlightLine = null; if (!noPage && this.stack.length && ['station', 'line', 'road', 'zone', 'facility'].indexOf(this.stack[this.stack.length - 1].kind) >= 0) this.back(); return; }
     if (noPage) return;
     const g = this.g();
@@ -1180,6 +1564,8 @@
       const box = h('div');
       for (const it of ev.items) box.appendChild(h('div', { class: 'chg small' }, h('span', null, it.label), h('span', { class: 'num' }, U.fmtMoney(it.amount))));
       if (!ev.items.length) box.appendChild(h('div', { class: 'note' }, '本次修改不产生费用（拆除与小范围调整免费）。'));
+      const nDem = self.R.demolitionBoxes().boxes.length;
+      if (nDem) box.appendChild(h('div', { class: 'callout warn', style: { marginTop: '6px' } }, '将拆除房屋 ' + nDem + ' 栋，地图上以红色标出。'));
       box.appendChild(h('div', { class: 'note', style: { marginTop: '6px' } }, g.econ.isFree() ? '自由建造：资金不限。' : '当前资金 ' + U.fmtMoney(g.econ.funds) + '。'));
       return box;
     }, false, 'coin'));
@@ -1251,10 +1637,16 @@
   };
 
   // ======================== 菜单与全屏界面 ========================
+  UI.prototype.closeMenu = function () {
+    if (this._menuOutside) { window.removeEventListener('pointerdown', this._menuOutside, true); this._menuOutside = null; }
+    if (this.dropdown) { this.dropdown.remove(); this.dropdown = null; }
+  };
   UI.prototype.showMenu = function (anchor) {
+    this.toggleLayerPanel(false); this.closeTimeOptions(); this.toggleMetricsMore(false);
+    if (this.tools) { this.tools.keys.clear(); this.tools.keyMods = {}; }
     const self = this;
-    if (this.dropdown) { this.dropdown.remove(); this.dropdown = null; return; }
-    const item = function (icon, label, fn, key) { return h('button', { onclick: function () { self.dropdown.remove(); self.dropdown = null; fn(); } }, ic(icon), h('span', { class: 'grow' }, label), key ? h('kbd', null, key) : null); };
+    if (this.dropdown) { this.closeMenu(); return; }
+    const item = function (icon, label, fn, key) { return h('button', { onclick: function () { self.closeMenu(); fn(); } }, ic(icon), h('span', { class: 'grow' }, label), key ? h('kbd', null, key) : null); };
     const narrowItem = function (icon, label, fn) { const b = item(icon, label, fn); b.classList.add('dd-narrow'); return b; };
     const g = this.g();
     const dd = h('div', { class: 'dropdown' },
@@ -1264,6 +1656,7 @@
       h('hr'),
       g && CM.DATA.briefing ? item('briefing', '开局简报', function () { self.showBriefing(); }) : null,
       g ? item('book', '城市纪事', function () { self.openStats('milestones'); }) : null,
+      g ? item('book', '新手指南', function () { self.openPage('guide', null, { root: true }); }) : null,
       item('help', '操作说明', function () { self.openPage('help', null, { root: true }); }),
       item('megaphone', '更新公告', function () { self.showNews(); }),
       // 窄屏（手机）顶栏收起了深浅模式与设置按钮，在菜单里提供
@@ -1275,18 +1668,17 @@
     this.dropdown = dd;
     // 矮窗口内保留菜单自身的滚动区域；窗口或界面缩放后重新跟随菜单按钮定位。
     dd._place = function () {
-      const r = anchor.getBoundingClientRect(), vw = window.innerWidth, vh = window.innerHeight;
-      const top = Math.max(8, Math.min(r.bottom + 8, vh / 2));
+      const r = anchor.getBoundingClientRect(), v = self.viewport();
+      const top = Math.max(v.top + 8, Math.min(r.bottom + 8, v.top + (v.bottom - v.top) / 2));
       dd.style.top = top + 'px';
-      dd.style.maxHeight = Math.max(0, vh - top - 8) + 'px';
-      const x = r.left < vw / 2 ? r.left : r.right - dd.offsetWidth;
-      dd.style.left = Math.max(8, Math.min(x, vw - dd.offsetWidth - 8)) + 'px';
+      dd.style.maxWidth = Math.max(0, v.right - v.left - 16) + 'px';
+      dd.style.maxHeight = Math.max(0, v.bottom - top - 8) + 'px';
+      const x = r.left < v.x + v.w / 2 ? r.left : r.right - dd.offsetWidth;
+      dd.style.left = Math.max(v.left + 8, Math.min(x, v.right - dd.offsetWidth - 8)) + 'px';
     };
     dd._place();
-    setTimeout(function () {
-      const close = function (e) { if (self.dropdown && !self.dropdown.contains(e.target)) { self.dropdown.remove(); self.dropdown = null; } window.removeEventListener('pointerdown', close, true); };
-      window.addEventListener('pointerdown', close, true);
-    }, 0);
+    this._menuOutside = function (e) { if (self.dropdown && !self.dropdown.contains(e.target) && !anchor.contains(e.target)) self.closeMenu(); };
+    window.addEventListener('pointerdown', this._menuOutside, true);
   };
 
   // ======================== 收藏与搜索 ========================
@@ -1369,16 +1761,24 @@
     this.fitBox(x0, y0, x1, y1, 24);
   };
   UI.prototype.openSearch = function () {
+    this.toggleLayerPanel(false); this.closeTimeOptions(); this.toggleMetricsMore(false);
     const g = this.g(); if (!g) return;
     if (this.searchEl) { this.closeSearch(); return; }
-    if (this.dropdown) { this.dropdown.remove(); this.dropdown = null; }
+    if (this.dropdown) this.closeMenu();
     const self = this, favs = g.favs, city = g.city, D = CM.DATA;
     favs.names = favs.names || {};
     const input = h('input', { type: 'search', placeholder: '搜索车站、线路、道路、区域或地名', 'aria-label': '搜索车站、线路、道路、区域或地名', autocomplete: 'off' });
     const list = h('div', { class: 'srch-list', role: 'listbox' });
-    const pop = h('div', { class: 'search-pop' }, h('div', { class: 'srch-in' }, ic('search'), input, h('kbd', null, 'Esc')), list);
-    const r = this.hbtns.search.getBoundingClientRect();
-    pop.style.top = (r.bottom + 8) + 'px'; pop.style.right = Math.max(8, window.innerWidth - r.right - 40) + 'px';
+    const pop = h('div', { class: 'search-pop' }, h('div', { class: 'srch-in' }, ic('search'), input, h('kbd', null, 'Esc'), h('button', { class: 'iconbtn', 'aria-label': '关闭搜索', onclick: function () { self.closeSearch(); } }, ic('close'))), list);
+    pop._place = function () {
+      const v = self.viewport(), r = self.hbtns.search.getBoundingClientRect();
+      // 键盘弹出后至少留出一行结果；高度不足时搜索框可上移。
+      const top = Math.max(v.top + 8, Math.min(r.bottom + 8, v.bottom - 140));
+      pop.style.top = top + 'px';
+      pop.style.maxHeight = Math.max(0, v.bottom - top - 8) + 'px';
+      pop.style.maxWidth = Math.max(0, v.right - v.left - 16) + 'px';
+      pop.style.left = Math.max(v.left + 8, Math.min(r.right - pop.offsetWidth + 40, v.right - pop.offsetWidth - 8)) + 'px';
+    };
     let items = [], cur = 0;
     // 地理条目（区域、城区、地标、道路、地名）：打开时生成一次
     const RANK = { lines: 0, stations: 1, region: 2, district: 2, landmark: 3, road: 4, place: 5 };
@@ -1402,12 +1802,12 @@
       const net = g.draft ? g.draft.net : g.net, out = [];
       for (const id in net.stations) {
         const s = net.stations[id], ls = M.stationLines(net, id).map(function (l) { return net.lines[l]; }).filter(Boolean);
-        out.push({ kind: 'stations', id: id, name: s.name, sub: ls.length ? ls.map(function (l) { return l.name; }).join('、') + (ls.length > 1 ? ' · 换乘站' : '') : '未接入线路', color: ls[0] ? ls[0].color : null, x: s.x, y: s.y, st: true });
+        out.push({ kind: 'stations', id: id, name: s.name, sub: ls.length ? ls.map(function (l) { return l.name; }).join('、') + (ls.length > 1 ? ' · 换乘站' : '') : '未接入线路', color: ls[0] ? AX.line(ls[0]) : null, x: s.x, y: s.y, st: true });
         if (favs.stations.indexOf(id) >= 0) favs.names[id] = s.name;
       }
       for (const id in net.lines) {
         const L = net.lines[id], tp = M.lineTopo(net, id);
-        out.push({ kind: 'lines', id: id, name: L.name, sub: M.TOPO_NAME[tp.topo] + ' · ' + tp.stations.length + ' 站', color: L.color, line: true, stations: tp.stations.map(function (sid) { return net.stations[sid]; }).filter(Boolean) });
+        out.push({ kind: 'lines', id: id, name: L.name, sub: M.TOPO_NAME[tp.topo] + ' · ' + tp.stations.length + ' 站', color: AX.line(L), line: true, stations: tp.stations.map(function (sid) { return net.stations[sid]; }).filter(Boolean) });
         if (favs.lines.indexOf(id) >= 0) favs.names[id] = L.name;
       }
       return out;
@@ -1445,8 +1845,9 @@
         if (lines.length) { list.appendChild(h('div', { class: 'srch-h' }, '全部线路')); lines.forEach(function (it) { items.push(it); list.appendChild(row(it, items.length - 1)); }); }
         return;
       }
-      const hits = all.concat(geo).filter(function (x) { return x.name.toLowerCase().indexOf(q) >= 0; });
-      const score = function (x) { const n = x.name.toLowerCase(); return (canFav(x) && self.isFav(x.kind, x.id) ? 0 : 1000) + (n === q ? 0 : n.indexOf(q) === 0 ? 100 : 200) + RANK[x.kind] * 10; };
+      const searchable = function (x) { return CM.I18n ? CM.I18n.search(x.name) : x.name.toLowerCase(); };
+      const hits = all.concat(geo).filter(function (x) { return searchable(x).indexOf(q) >= 0; });
+      const score = function (x) { const n = searchable(x); return (canFav(x) && self.isFav(x.kind, x.id) ? 0 : 1000) + (x.name.toLowerCase() === q ? 0 : n.indexOf(q) === 0 ? 100 : 200) + RANK[x.kind] * 10; };
       hits.sort(function (a, b) { return score(a) - score(b) || a.name.length - b.name.length; });
       if (!hits.length) { list.appendChild(h('div', { class: 'note', style: { padding: '8px 10px' } }, '没有名称包含「' + input.value.trim() + '」的车站、线路、道路、区域或地名。')); return; }
       hits.slice(0, 50).forEach(function (it) { items.push(it); list.appendChild(row(it, items.length - 1)); });
@@ -1459,23 +1860,75 @@
     });
     document.body.appendChild(pop);
     this.searchEl = pop;
+    pop._place();
+    if (this.tools) { this.tools.keys.clear(); this.tools.keyMods = {}; }
     render();
-    setTimeout(function () { input.focus(); }, 0);
+    setTimeout(function () { if (self.searchEl === pop) input.focus(); }, 0);
     this._searchClose = function (e) { if (self.searchEl && !self.searchEl.contains(e.target) && !self.hbtns.search.contains(e.target)) self.closeSearch(); };
-    setTimeout(function () { window.addEventListener('pointerdown', self._searchClose, true); }, 0);
+    const outside = this._searchClose;
+    setTimeout(function () { if (self.searchEl === pop && self._searchClose === outside) window.addEventListener('pointerdown', outside, true); }, 0);
   };
   UI.prototype.closeSearch = function () {
     if (this.searchEl) { this.searchEl.remove(); this.searchEl = null; }
     if (this._searchClose) { window.removeEventListener('pointerdown', this._searchClose, true); this._searchClose = null; }
   };
-  UI.prototype.openScreen = function (card, onEsc, cls) {
+  UI.prototype.openScreen = function (card, onEsc, cls, tr) {
+    this.toggleLayerPanel(false);
+    if (this.tools) { this.tools.keys.clear(); this.tools.keyMods = {}; }
+    this.closeMenu(); this.closeSearch(); this.closeLinePicker();
+    if (this._keyCap) this._keyCap();
+    this.toggleMetricsMore(false);
+    this.closeTimeOptions();
+    if (CM.Quick) CM.Quick.hide();
     if (this.tools) this.tools.cancelDrag();
-    this.screen.innerHTML = '';
-    this.screen.className = cls || '';
-    this.screen.appendChild(card);
+    // 载入背景（#stagebg）常驻在界面层里，切换界面时保留
+    const sc = this.screen, bg = this._stageBg, kids = Array.from(sc.childNodes).filter(function (n) { return n !== bg; });
+    const live = tr && sc.className.indexOf('hidden') < 0 && kids.length && !CM.Settings.reducedMotion();
+    if (live) {
+      const old = document.createElement('div'), cs = getComputedStyle(sc);
+      old.className = 'scr-out scr-' + tr; old.style.placeItems = cs.placeItems; old.setAttribute('aria-hidden', 'true');
+      for (const n of kids) { if (n.classList && n.classList.contains('scr-out')) n.remove(); else old.appendChild(n); }
+      sc.className = (cls || '') + ' scr-in-' + tr;
+      sc.appendChild(old); sc.appendChild(card);
+      clearTimeout(this._scrT);
+      this._scrT = setTimeout(function () { old.remove(); sc.classList.remove('scr-in-' + tr); }, 420);
+    } else {
+      for (const n of kids) n.remove();
+      sc.className = cls || '';
+      sc.appendChild(card);
+    }
+    if (!/\bld-screen\b/.test(cls || '')) { this._ld = null; this.stageBg(null); }
     this.screenEsc = onEsc || null;
   };
-  UI.prototype.closeScreen = function () { this.screen.className = 'hidden'; this.screenEsc = null; this.screenRefresh = null; };
+  UI.prototype.closeScreen = function () { if (this._keyCap) this._keyCap(); this._ld = null; this.screen.className = 'hidden'; this.screenEsc = null; this.screenRefresh = null; this.stageBg(null); };
+  // 载入背景（v2.2）：所选城市的地图画面铺满全屏（模糊、提亮），载入卡片浮在上面；from 为选择地图里地图画面的位置，
+  // 给出时由该处放大到全屏，否则直接淡入。src 为 null 时淡出
+  UI.prototype.stageBg = function (src, from) {
+    let bg = this._stageBg;
+    if (!src) { if (bg) bg.classList.remove('on'); return; }
+    if (!bg) bg = this._stageBg = h('div', { id: 'stagebg', 'aria-hidden': 'true' }, h('div', { class: 'sb-frame' }, h('img', { alt: '' })));
+    if (bg.parentNode !== this.screen) this.screen.insertBefore(bg, this.screen.firstChild);   // 在界面层最下方：盖住背景渐变，位于界面内容之下
+    const fr = bg.firstChild, img = fr.firstChild, vw = innerWidth, vh = innerHeight;
+    img.src = src;
+    fr.style.transition = 'none';
+    if (from && !CM.Settings.reducedMotion()) {
+      // 均匀缩放的全屏画面盖住原位置，再用裁切只露出原位置，随后两者同时过渡到全屏
+      const s = Math.max(from.width / vw, from.height / vh), tx = from.left + from.width / 2 - vw * s / 2, ty = from.top + from.height / 2 - vh * s / 2;
+      fr.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + s + ')';
+      const l = (from.left - tx) / s, t = (from.top - ty) / s, r = vw - l - from.width / s, b = vh - t - from.height / s;
+      fr.style.clipPath = 'inset(' + t + 'px ' + r + 'px ' + b + 'px ' + l + 'px round ' + (18 / s) + 'px)';
+      bg.classList.add('on', 'zoom');
+      this._zoomUntil = performance.now() + 560;   // 载入的重活在动效结束后开始（main.js runLoad）
+      void fr.offsetWidth;
+      fr.style.transition = '';
+      fr.style.transform = 'none'; fr.style.clipPath = 'inset(0 round 0)';
+    } else {
+      fr.style.transform = 'none'; fr.style.clipPath = 'none';
+      bg.classList.remove('zoom');
+      void fr.offsetWidth; fr.style.transition = '';
+      bg.classList.add('on');
+    }
+  };
   UI.prototype.cardHead = function (icon, badge, title) { return h('div', { class: 'card-head' }, h('span', { class: 'badge ' + badge }, ic(icon)), h('h2', null, title)); };
   UI.prototype.confirm = function (title, text, okLabel, onOk, danger, icon) {
     const self = this;
@@ -1488,9 +1941,6 @@
       h('div', { class: 'modal-actions' }, h('button', { class: 'btn', onclick: restore }, '取消'), h('button', { class: 'btn ' + (danger ? 'danger fill' : 'primary'), onclick: function () { restore(); onOk(); } }, okLabel)));
     this.openScreen(card, restore);
   };
-  UI.prototype.showLoading = function (text) {
-    this.openScreen(h('div', { class: 'card', style: { width: 'min(380px, calc(100vw - 32px))' } }, h('div', { class: 'loading' }, h('img', { class: 'logo-ink', src: 'img/logo-navy.png', alt: '' }), h('div', { class: 'muted' }, text))));
-  };
   // 开始界面、选择地图、开局简报与更新公告见 screens.js
   // 退出：网页无法强制关闭自己打开的标签页时，给出提示
   UI.prototype.quitGame = function () {
@@ -1502,10 +1952,13 @@
   };
   // ======================== 设置 ========================
   // 设置：单页，只保留常用项；控件就地更新（不整页重绘），主题与界面大小平滑过渡
-  UI.prototype.showSettings = function () {
+  UI.settingsExtra = { display: [], data: [] };
+  const SET_TABS = [['display', 'view2d', '画面'], ['audio', 'sound', '声音'], ['game', 'metro', '游戏'], ['keys', 'keyboard', '键位'], ['data', 'save', '存档'], ['about', 'info', '关于']];
+  UI.prototype.showSettings = function (tab) {
     const self = this, S = CM.Settings;
     const inGame = !!this.g();
-    const back = function () { if (inGame) self.closeScreen(); else self.showStart(); };
+    const back = function () { if (self._keyCap) self._keyCap(); if (inGame) self.closeScreen(); else self.showStart(); };
+    let cur = SET_TABS.some(function (t) { return t[0] === tab; }) ? tab : (this._setTab || 'display');
     const row = function (icon, title, ctl, desc) { return h('div', { class: 'set-row' }, h('span', { class: 'set-ico' }, ic(icon)), h('div', { class: 'grow' }, h('div', { class: 'set-t' }, title), desc ? h('div', { class: 'set-d' }, desc) : null), ctl); };
     const toggle = function (key, onChange) {
       const b = h('button', { class: 'switch' + (S.get(key) ? ' on' : ''), role: 'switch', 'aria-checked': S.get(key) ? 'true' : 'false', 'data-silent': '1', onclick: function () {
@@ -1537,23 +1990,199 @@
       volRows.push(r);
       return r;
     };
-    const body = h('div', { class: 'set-body single' },
-      row('expand', '界面大小', seg('uiScale', [[0.9, '小'], [1, '标准'], [1.15, '大']])),
-      row('label', '地图标注', seg('labels', [['all', '全部'], ['stations', '仅车站'], ['none', '关闭']])),
-      row('car', '车辆与行人', toggle('agents'), '关闭后交通模拟照常进行，只是不显示运动的车辆和行人'),
-      row('sound', '声音', toggle('sound', function () { volRows.forEach(function (r) { r.classList.toggle('off', !S.get('sound')); }); })),
-      volRow('volume', 'sound', '总音量'),
-      volRow('trainVol', 'train', '列车音效', '列车行驶、进出站与车门提示；跟随列车时更突出'),
-      volRow('ambVol', 'building', '城市环境音', '车流、人声、水面与鸟鸣，随镜头位置、城区和时段变化'),
-      row('save', '自动保存', toggle('autosave'), '暂停、每月结算与每次建设后自动保存'));
-    const card = h('div', { class: 'card settings' },
+    const group = function (title) { return h('div', { class: 'set-group' }, title); };
+    const extra = function (key) { return (UI.settingsExtra[key] || []).map(function (f) { try { return f(); } catch (e) { console.error(e); return null; } }).filter(Boolean); };
+    const pages = {
+      display: function () {
+        return [group('显示')].concat(extra('display'), [
+          row('label', '界面语言', seg('language', [['zh-CN', '简体中文'], ['zh-TW', '繁体中文'], ['en', 'English']]), '切换后立即生效，下次启动保留此选择'),
+          row('sun', '主题', seg('theme', [['light', '浅色', 'sun'], ['dark', '深色', 'moon'], ['auto', '跟随系统']], function () { self.renderThemeBtns(); })),
+          row('expand', '界面大小', seg('uiScale', [[0.9, '小'], [1, '标准'], [1.15, '大']])),
+          group('地图'),
+          row('label', '地图标注', seg('labels', [['all', '全部'], ['stations', '仅车站'], ['none', '关闭']])),
+          row('car', '车辆与行人', toggle('agents'), '关闭后交通模拟照常进行，只是不显示运动的车辆和行人'),
+          group('辅助功能'),
+          row('eyeOff', '色盲辅助模式', (function () { const b = toggle('colorBlind'); b.setAttribute('aria-label', '色盲辅助模式'); return b; })(), '增强线路配色与编号、图表线型和拥堵分级，原有线路颜色保留')]);
+      },
+      audio: function () {
+        volRows.length = 0;
+        return [group('声音'),
+          row('sound', '启用声音', toggle('sound', function () { volRows.forEach(function (r) { r.classList.toggle('off', !S.get('sound')); }); })),
+          volRow('volume', 'sound', '总音量', '界面音效与全部声音'),
+          volRow('trainVol', 'train', '列车音效', '列车行驶、进出站与车门提示；跟随列车时更突出'),
+          volRow('ambVol', 'building', '城市环境音', '车流、人声、水面与鸟鸣，随镜头位置、城区和时段变化')];
+      },
+      game: function () {
+        return [group('进度'),
+          row('save', '自动保存', toggle('autosave'), '暂停、每月结算与每次建设后自动保存'),
+          group('时间'),
+          row('clock', '停运时段快速掠过', toggle('nightFast'), '地铁停运的 00:00–06:00 按所选速度的 ' + CFG.time.nightFast + ' 倍推进，一天更快过去；结算与客流不受影响'),
+          row('hourglass', '高峰慢放', toggle('peakSlow'),'工作日早高峰（7–9 时）与晚高峰（17–19 时）自动按 1× 运行，高峰结束后恢复所选速度；也可在顶栏的更多倍速中' + (CM.Keys.hint('time.peakSlow') ? '（' + CM.Keys.hint('time.peakSlow') + '）' : '') + '切换'),
+          group('建设'),
+          row('graticule', '网格吸附', toggle('gridSnap'), '显示经纬网格' + (CM.Keys.hint('view.grid') ? '（' + CM.Keys.hint('view.grid') + '）' : '') + '时，新车站、线路与转弯点落在网格交叉点')];
+      },
+      // 键位（v2.1）：点击按键框后按下新按键或组合键；右键清除；冲突时从原操作上移除并提示
+      keys: function () {
+        const K = CM.Keys, out = [h('div', { class: 'set-note' }, '点击按键框，再按下新的按键或组合键（可带 Ctrl / Alt / Shift）；右键按键框可清除。Esc（游戏中暂停并打开菜单，弹窗内返回）与 F11（全屏）固定不变。')];
+        const rerender = function () { const top = body.scrollTop; body.replaceChildren.apply(body, pages.keys()); body.scrollTop = top; };
+        const capture = function (a, i, btn) {
+          if (self._keyCap) self._keyCap();
+          btn.classList.add('listening'); btn.textContent = '按下新按键…';
+          const end = function () { window.removeEventListener('keydown', onKey, true); document.removeEventListener('pointerdown', onDown, true); self._keyCap = null; };
+          const onDown = function (e) { if (!btn.contains(e.target)) { end(); rerender(); } };
+          const onKey = function (e) {
+            e.preventDefault(); e.stopImmediatePropagation();
+            if (e.code === 'Escape') { end(); rerender(); return; }
+            const combo = K.comboOf(e); if (!combo) return;   // 只按了修饰键：继续等待
+            const reserved = K.reserved(combo);
+            if (reserved) { self.toast(reserved, 'warn'); return; }
+            const owner = K.owner(combo, a.id);
+            if (owner) { K.set(owner.id, K.get(owner.id).filter(function (c) { return c !== combo; })); self.toast(K.label(combo) + ' 已从「' + owner.name + '」改到「' + a.name + '」', 'info'); }
+            const list = K.get(a.id); list[i] = combo;
+            K.set(a.id, list.filter(function (c, j) { return c && list.indexOf(c) === j; }));
+            end(); snd('good'); rerender();
+          };
+          self._keyCap = function () { end(); };
+          window.addEventListener('keydown', onKey, true);
+          document.addEventListener('pointerdown', onDown, true);
+        };
+        const keyRow = function (a) {
+          const cur = K.get(a.id);
+          const slot = function (i) {
+            const c = cur[i];
+            return h('button', { class: 'keycap' + (c ? '' : ' empty'), 'data-silent': '1', 'data-tip': c ? '点击修改，右键清除' : '点击设置按键',
+              onclick: function (e) { capture(a, i, e.currentTarget); },
+              oncontextmenu: function (e) { e.preventDefault(); if (!c) return; K.set(a.id, cur.filter(function (x, j) { return j !== i; })); snd('soft'); rerender(); } }, c ? K.label(c) : (i ? '＋' : '未设置'));
+          };
+          return h('div', { class: 'set-row key-row', 'data-action': a.id }, h('div', { class: 'grow set-t' }, a.name),
+            h('div', { class: 'key-slots' }, slot(0), slot(1)),
+            h('button', { class: 'iconbtn', 'data-tip': '恢复默认（' + (a.def.map(K.label).join(' / ') || '未设置') + '）', disabled: K.isDefault(a.id), onclick: function () { K.reset(a.id); snd('soft'); rerender(); } }, ic('undo')));
+        };
+        for (const gr of K.GROUPS) {
+          out.push(group(gr[1]));
+          for (const a of K.ACTIONS) if (a.group === gr[0]) out.push(keyRow(a));
+        }
+        out.push(h('div', { class: 'set-row' }, h('span', { class: 'grow' }), h('button', { class: 'btn sm ghost', onclick: function () { K.resetAll(); snd('soft'); rerender(); self.toast('键位已恢复默认', 'info'); } }, '全部恢复默认')));
+        return out;
+      },
+      data: function () {
+        return [group('存档'), h('div', { class: 'set-note' }, '进度保存在当前浏览器、当前网址的站点数据（' + CM.Save.backend() + '）中；更换环境前请导出备份。')].concat(extra('data'), [
+          row('folder', '存档管理', h('button', { class: 'btn sm', onclick: function () { self.showSaveManager(inGame); } }, '打开'), '查看、改名、导入或导出全部进度与存档')]);
+      },
+      about: function () {
+        const doc = function (title, file) {
+          return h('button', { class: 'btn sm', onclick: function () { self.showTextDoc(title, file, function () { self.showSettings('about'); }); } }, '查看');
+        };
+        const link = function (icon, title, label, href) {
+          const email = href.indexOf('mailto:') === 0;
+          return h('a', { class: 'set-row about-link', href: href, target: email ? null : '_blank', rel: email ? null : 'noopener noreferrer' },
+            h('span', { class: 'set-ico' }, ic(icon)),
+            h('div', { class: 'grow' }, h('div', { class: 'set-t' }, title), h('div', { class: 'set-d', 'data-no-i18n': true }, label)), ic(email ? 'mail' : 'external', 16));
+        };
+        const osm = h('a', { href: 'https://www.openstreetmap.org/copyright', target: '_blank', rel: 'noopener' }, 'openstreetmap.org/copyright');
+        return [h('div', { class: 'about-head' },
+            h('img', { class: 'logo-ink', src: 'img/logo-navy.png', alt: '' }),
+            h('div', null, h('div', { class: 'about-name' }, '城市与地铁'), h('div', { class: 'muted' }, '版本 v' + CFG.GAME_VERSION + ' · 网页版'))),
+          group('版权与许可'),
+          row('shield', '使用许可', doc('使用许可', 'LICENSE.txt'), '© 2026 VinsonFung，保留所有权利'),
+          row('book', '第三方声明', doc('第三方声明', 'THIRD_PARTY_NOTICES.txt'), '游戏使用的开源组件与数据的许可说明'),
+          row('globe', '地图数据', null, h('span', null, '© OpenStreetMap 贡献者，按 ODbL 1.0 授权（', osm, '）')),
+          group('版本'),
+          row('megaphone', '更新公告', h('button', { class: 'btn sm', onclick: function () { self.showNews(function () { self.showSettings('about'); }); } }, '查看'), '各版本的主要变化'),
+          link('github', '游戏 GitHub 仓库', 'VinsonFung/city-and-metro', 'https://github.com/VinsonFung/city-and-metro'),
+          group('联系作者'),
+          link('globe', '博客', 'vinsonblog.cn', 'https://vinsonblog.cn/'),
+          link('mail', '邮箱', 'hello@vinsonblog.cn', 'mailto:hello@vinsonblog.cn'),
+          link('youtube', 'YouTube', '@vinson_fung', 'https://youtube.com/@vinson_fung'),
+          link('socialX', 'X', '@vinson_fung', 'https://x.com/vinson_fung')];
+      },
+    };
+    const body = h('div', { class: 'set-body' });
+    const nav = h('div', { class: 'set-nav', role: 'tablist', 'aria-label': '设置分类' });
+    const tabs = {};
+    const show = function (id, silent) {
+      if (self._keyCap) self._keyCap();   // 切换分页时结束正在进行的按键录制
+      cur = id; self._setTab = id;
+      for (const k in tabs) { tabs[k].classList.toggle('on', k === id); tabs[k].setAttribute('aria-selected', k === id ? 'true' : 'false'); }
+      body.replaceChildren.apply(body, pages[id]());
+      body.scrollTop = 0;
+      if (!silent) snd('soft');
+    };
+    SET_TABS.forEach(function (t) {
+      tabs[t[0]] = h('button', { class: 'set-tab', role: 'tab', 'data-silent': '1', onclick: function () { if (cur !== t[0]) show(t[0]); } }, ic(t[1]), h('span', null, t[2]));
+      nav.appendChild(tabs[t[0]]);
+    });
+    const card = h('div', { class: 'card settings tabbed' },
       h('div', { class: 'card-head' }, h('span', { class: 'badge b-slate' }, ic('gear')), h('h2', null, '设置'), h('span', { class: 'grow' }), h('button', { class: 'iconbtn', 'data-tip': '关闭', 'data-key': 'Esc', onclick: back }, ic('close'))),
-      body,
+      h('div', { class: 'set-wrap' }, nav, body),
       h('div', { class: 'set-foot' },
-        h('span', { class: 'muted tiny grow' }, '城市与地铁 v' + CFG.GAME_VERSION + ' · 地图 © OpenStreetMap 贡献者'),
-        h('button', { class: 'btn sm ghost', onclick: function () { self.confirm('恢复默认设置？', '所有设置恢复为默认值，存档不受影响。', '恢复默认', function () { S.reset(); self.showSettings(); self.toast('已恢复默认设置', 'info'); }, true, 'gear'); } }, '恢复默认'),
+        h('span', { class: 'grow' }),
+        h('button', { class: 'btn sm ghost', onclick: function () { self.confirm('恢复默认设置？', '所有设置恢复为默认值，存档不受影响。', '恢复默认', function () { S.reset(); self.showSettings(cur); self.toast('已恢复默认设置', 'info'); }, true, 'gear'); } }, '恢复默认'),
         h('button', { class: 'btn primary sm', onclick: back }, '完成')));
+    show(cur, true);
     this.openScreen(card, back);
+  };
+  // 文本文档（使用许可、第三方声明）：在游戏内显示，不打开外部程序。
+  // v2.1：全文内嵌在 js/legal.js（直接打开 index.html 时 fetch 读不到本地文件），按文档排版：标题、分节、段落与链接
+  const CJK = /[⺀-鿿＀-￯　-〿]/;
+  function docBlocks(text) {
+    const lines = text.replace(/\r\n?/g, '\n').replace(/^﻿/, '').split('\n'), out = [];
+    let para = [];
+    const flush = function () { if (para.length) { out.push({ t: 'p', lines: para }); para = []; } };
+    for (let i = 0; i < lines.length; i++) {
+      const s = lines[i].trim();
+      if (!s) { flush(); continue; }
+      if (/^-{3,}$/.test(s)) continue;
+      if (/^-{3,}$/.test((lines[i + 1] || '').trim()) || /^\d+\.\s*\S/.test(s)) { flush(); out.push({ t: 'h', text: s }); continue; }
+      para.push(s);
+    }
+    flush();
+    return out;
+  }
+  function docInline(text) {
+    const frag = document.createDocumentFragment(), re = /https?:\/\/[^\s）)]+/g;
+    let k = 0, m;
+    while ((m = re.exec(text))) {
+      if (m.index > k) frag.appendChild(document.createTextNode(text.slice(k, m.index)));
+      frag.appendChild(h('a', { href: m[0], target: '_blank', rel: 'noopener' }, m[0]));
+      k = m.index + m[0].length;
+    }
+    if (k < text.length) frag.appendChild(document.createTextNode(text.slice(k)));
+    return frag;
+  }
+  function docRender(text) {
+    const box = h('div', { class: 'doc-body', 'data-no-i18n': '' }), blocks = docBlocks(text);
+    blocks.forEach(function (b, n) {
+      if (b.t === 'h') { box.appendChild(h('h3', null, b.text)); return; }
+      // 第一段为文档标题；「键: 值」形式的行逐行显示；其余按原文折行重新连成段落（中文之间不加空格）
+      if (n === 0) { box.appendChild(h('div', { class: 'doc-title' }, b.lines.map(function (l, i) { return h('div', { class: i ? 'muted' : 'strong' }, l); }))); return; }
+      if (b.lines.length > 1 && b.lines.every(function (l) { return /^[A-Za-z][\w ./-]*:\s/.test(l); })) {
+        box.appendChild(h('dl', { class: 'doc-kv' }, b.lines.map(function (l) { const i = l.indexOf(':'); return h('div', null, h('dt', null, l.slice(0, i)), h('dd', null, docInline(l.slice(i + 1).trim()))); })));
+        return;
+      }
+      let s = '';
+      for (const l of b.lines) s += !s ? l : (CJK.test(s.slice(-1)) && CJK.test(l[0]) ? '' : ' ') + l;
+      box.appendChild(h('p', null, docInline(s)));
+    });
+    return box;
+  }
+  UI.prototype.showTextDoc = function (title, file, onBack) {
+    const self = this;
+    const close = function () { if (onBack) onBack(); else self.closeScreen(); };
+    const wrap = h('div', { class: 'doc-text' });
+    const embedded = CM.LEGAL && CM.LEGAL[file];
+    if (embedded) wrap.appendChild(docRender(embedded));
+    else {
+      wrap.textContent = '正在读取…';
+      fetch(file, { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+        .then(function (t) { wrap.replaceChildren(docRender(t)); }).catch(function (e) { wrap.textContent = '无法读取 ' + file + '：' + (e && e.message || e); });
+    }
+    const card = h('div', { class: 'card doc' },
+      h('div', { class: 'card-head' }, h('span', { class: 'badge b-slate' }, ic('book')), h('h2', null, title), h('span', { class: 'grow' }),
+        h('button', { class: 'iconbtn', 'data-tip': '返回', 'data-key': 'Esc', onclick: close }, ic('close'))),
+      wrap,
+      h('div', { class: 'modal-actions' }, h('button', { class: 'btn primary sm', onclick: close }, '返回')));
+    this.openScreen(card, close);
   };
   // 开始游戏 → 选择地图：每张地图可开始新游戏（选择模式）、继续该地图最近的进度，或读取该地图的存档
   UI.prototype.showNewGame = function () { this.showMapSelect(); };
@@ -1571,7 +2200,7 @@
       if (!games.length) list.appendChild(h('div', { class: 'note' }, mapId ? '该地图暂无存档。' : '暂无存档。'));
       for (const gm of games) {
         const grp = h('div', { class: 'game-group', 'data-game-id': gm.gameId });
-        const title = h('span', { class: 'save-name-title' }, gm.name);
+        const title = h('span', { class: 'save-name-title', 'data-no-i18n': '' }, gm.name);
         const rename = h('button', { class: 'btn sm ghost save-name-rename', onclick: function () {
           if (editing.has(gm.gameId)) return;
           editing.add(gm.gameId); rename.disabled = true;
@@ -1629,7 +2258,7 @@
         } }, ic('pencil'), '重命名');
         grp.appendChild(h('div', { class: 'h save-name-heading' }, ic(gm.mode === 'free' ? 'sparkle' : 'trophy'), title, h('span', { class: 'tag' }, gm.mode === 'free' ? '自由建造' : '经营挑战'), mapId ? null : h('span', { class: 'tag info' }, (CM.MAPS[gm.map || 'gz'] || { name: gm.map }).name),
           h('div', { class: 'save-name-actions' }, rename,
-            h('button', { class: 'btn sm ghost danger', onclick: function () { self.confirm('删除整个进度？', '「' + gm.name + '」的全部 ' + gm.slots.length + ' 个存档将被永久删除。', '删除', function () { CM.Save.removeGame(gm.gameId); self.showSaveManager(inGame, mapId); }, true, 'trash'); } }, ic('trash'), '删除进度'))));
+            h('button', { class: 'btn sm ghost danger', onclick: function () { self.confirm('删除整个进度？', '「' + gm.name + '」的全部 ' + gm.slots.length + ' 个存档将被永久删除。', '删除', function () { try { CM.Save.removeGame(gm.gameId); self.showSaveManager(inGame, mapId); } catch (e) { self.toast('删除失败：' + e.message, 'bad'); } }, true, 'trash'); } }, ic('trash'), '删除进度'))));
         for (const sl of gm.slots) grp.appendChild(self.slotRow(sl, inGame));
         list.appendChild(grp);
       }
@@ -1638,7 +2267,7 @@
     this.screenRefresh = draw;
     const back = function () { if (inGame) self.closeScreen(); else if (mapId) self.showMapSelect(mapId); else self.showStart(); };
     const card = h('div', { class: 'card wide' }, this.cardHead('folder', 'b-blue', '读取存档' + (mapId && CM.MAPS[mapId] ? ' · ' + CM.MAPS[mapId].name : '')),
-      h('div', { class: 'note' }, '每个进度相互独立；自动存档在两个位置轮换写入，手动存档最多 ' + CFG.saves.maxManual + ' 个。导入的存档会作为新的存档加入，不会覆盖已有进度。'),
+      h('div', { class: 'note' }, '存档保存在当前浏览器、当前网址的站点数据中。每个进度相互独立；自动保存使用两个轮换槽位，手动存档最多 ' + CFG.saves.maxManual + ' 个。导入存档会新增槽位；同一进度已存在时创建独立副本。更换网址、浏览器或设备前请先导出备份。'),
       list, fileIn,
       h('div', { class: 'modal-actions' }, h('button', { class: 'btn', onclick: function () { fileIn.click(); } }, ic('import'), '导入存档文件'), h('button', { class: 'btn primary', onclick: back }, inGame ? '关闭' : '返回')));
     this.openScreen(card, back);
@@ -1660,12 +2289,20 @@
     rd.onerror = function () { self.toast('读取文件失败', 'bad'); };
     rd.readAsText(file);
   };
-  UI.prototype.loadSlot = function (slotId) {
+  UI.prototype.exportSlot = function (slotId) {
     const self = this;
-    this.showLoading('正在读取存档…');
-    CM.Save.load(slotId).then(function (data) { CM.loadGame(data); }, function (e) {
+    return CM.Save.exportSlot(slotId).then(function (r) {
+      self.toast(r && r.raw ? '已导出原始存档数据，可用于恢复检查；当前载入问题仍需处理' : '已导出存档', r && r.raw ? 'warn' : 'good');
+      return r;
+    }).catch(function (e) { self.toast('导出失败：' + e.message, 'bad'); return { error: e.message }; });
+  };
+  UI.prototype.loadSlot = function (slotId) {
+    const self = this, request = this._slotLoadRequest = {};
+    this.showLoading('正在读取存档…', 'load', CM.Save.slotInfo(slotId)?.map);
+    CM.Save.load(slotId).then(function (data) { if (self._slotLoadRequest === request) CM.loadGame(data); }, function (e) {
+      if (self._slotLoadRequest !== request) return; self._slotLoadRequest = null;
       snd('error');
-      self.openScreen(h('div', { class: 'card' }, self.cardHead('error', 'b-red', '无法载入'), self.callout('bad', 'error', e.message), h('div', { class: 'note' }, '原有存档与当前进度未受影响。'), h('div', { class: 'modal-actions' }, h('button', { class: 'btn primary', onclick: function () { if (self.g()) self.closeScreen(); else self.showStart(); } }, '确定'))));
+      self.openScreen(h('div', { class: 'card' }, self.cardHead('error', 'b-red', '无法载入'), self.callout('bad', 'error', e.message), h('div', { class: 'note' }, '原有存档与当前进度未受影响。可先导出原存档用于备份或恢复检查。'), h('div', { class: 'modal-actions' }, h('button', { class: 'btn', onclick: function () { self.exportSlot(slotId); } }, '导出原存档'), h('button', { class: 'btn primary', onclick: function () { if (self.g()) self.closeScreen(); else self.showStart(); } }, '确定'))));
     });
   };
   // 返回主菜单：先确认最新状态已成功保存；保存失败时保留当前游戏
@@ -1716,6 +2353,7 @@
   };
   // 自动保存；返回 Promise<{ok, error}>。force：返回菜单等场合，等待进行中的保存结束后再保存最新状态
   UI.prototype.doAutosave = function (force) {
+    if (CM.isLoading && CM.isLoading()) return Promise.resolve({ ok: false, error: '正在载入游戏，请稍后保存' });
     const g = this.g(); if (!g) return Promise.resolve({ ok: true });
     this.lastAuto = performance.now();
     const self = this;
@@ -1737,6 +2375,7 @@
     return this.saving;
   };
   UI.prototype.manualSave = function (slotId, label) {
+    if (CM.isLoading && CM.isLoading()) return Promise.resolve({ ok: false, error: '正在载入游戏，请稍后保存' });
     const g = this.g(); if (!g) return Promise.resolve();
     if (g.pending || g.jumping) { this.toast('正在进行月度结算，请稍候再保存', 'info'); return Promise.resolve({ ok: false, error: '正在结算' }); }
     const self = this, snap = this.saveSnap(g);
@@ -1876,4 +2515,44 @@
         h('button', { class: 'btn primary', onclick: function () { g.econ.mode = 'free'; g.mode = 'free'; g.econ.failed = null; g.logEvent({ tag: '经营', title: '转为自由建造模式继续', desc: '' }); self.closeScreen(); self.toast('已转为自由建造模式', 'info'); self.markUnsaved(); } }, ic('sparkle'), '转为自由建造继续')));
     this.openScreen(card, function () { self.closeScreen(); });
   };
+  UI.prototype.unfoldMetrics = function () {
+    if (!this.mFold) return;
+    this.toggleMetricsMore(false);
+    if (this.mMore.children.length) for (const k of METRIC_ORDER) { const el = this.pills[k].el; delete el.dataset.fold; this.mFold.parentNode.insertBefore(el, this.mFold); }
+    this.mFold.classList.add('off');
+  };
+
+  UI.prototype.toggleMetricsMore = function (open) {
+    const dd = this.mMore; if (!dd) return;
+    const on = open == null ? dd.classList.contains('off') && dd.children.length > 0 : !!open;
+    dd.classList.toggle('off', !on);
+    this.mFold.classList.toggle('open', on); this.mFold.setAttribute('aria-expanded', on ? 'true' : 'false');
+    if (!on) return;
+    this.closeTimeOptions();
+    const r = this.mFold.getBoundingClientRect();
+    dd.style.top = (r.bottom + 8) + 'px';
+    dd.style.left = Math.max(8, Math.min(r.right - dd.offsetWidth, window.innerWidth - dd.offsetWidth - 8)) + 'px';
+  };
+
+  UI.prototype.closeTimeOptions = function () {
+    if (this.timeOptions) for (const kind of Object.keys(this.timeOptions)) this.toggleTimeOptions(kind, false);
+  };
+
+  UI.prototype.toggleTimeOptions = function (kind, open, focus) {
+    const o = this.timeOptions && this.timeOptions[kind]; if (!o || !o.menu) return;
+    const on = open == null ? o.menu.classList.contains('off') : !!open;
+    if (on && (!this.g() || this.blocking())) return;
+    if (!on && o.menu.classList.contains('off')) return;
+    o.menu.classList.toggle('off', !on); o.menu.inert = !on; o.menu.setAttribute('aria-hidden', on ? 'false' : 'true');
+    o.button.classList.toggle('open', on); o.button.setAttribute('aria-expanded', on ? 'true' : 'false');
+    if (!on) { if (focus) o.button.focus(); return; }
+    for (const k of Object.keys(this.timeOptions)) if (k !== kind) this.toggleTimeOptions(k, false);
+    this.toggleMetricsMore(false);
+    if (this.tools) this.tools.keys.clear();
+    const r = o.button.getBoundingClientRect(), z = CM.Settings.get('uiScale') || 1, w = o.menu.offsetWidth * z, hh = o.menu.offsetHeight * z;
+    o.menu.style.left = (U.clamp(r.right - w, 8, Math.max(8, window.innerWidth - w - 8)) / z) + 'px';
+    o.menu.style.top = (U.clamp(r.bottom + 8, 8, Math.max(8, window.innerHeight - hh - 8)) / z) + 'px';
+    o.menu.querySelector('button').focus();
+  };
+
 })(window.CM);

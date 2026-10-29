@@ -7,35 +7,96 @@
   const ui = new CM.UI(R);
   const tools = new CM.Tools(R, ui);
   ui.tools = tools;
+  if (CM.Quick) CM.Quick.init(ui);
   CM.R = R; CM.ui = ui; CM.tools = tools;
   CM.Follow.init(ui);
   CM.agents = new CM.Agents();
   CM.game = null;
 
-  // 平滑切换：把当前画面复制到覆盖层上再淡出，新画面在下面重新绘制，避免地图与界面闪切
-  let fadeT = null;
-  function crossfade() {
-    if (CM.Settings.reducedMotion() || !R.frame || !canvas.width || !canvas.height) return;
-    const snap = document.createElement('canvas');
-    snap.width = canvas.width; snap.height = canvas.height; snap.className = 'map-snap';
-    try { snap.getContext('2d').drawImage(canvas, 0, 0); } catch (e) { return; }
-    canvas.insertAdjacentElement('afterend', snap);
-    setTimeout(function () { snap.style.opacity = '0'; }, 140);
-    setTimeout(function () { snap.remove(); }, 900);
+  // 平滑切换（v2.1）：把当前画面复制到覆盖层上，新画面在快照下面以放宽的预算一次画清（最多约 1.2 秒，
+  // 不再露出模糊的低分辨率块）；就绪后快照淡出，reveal（如界面换色）在同一帧开始，两者用同样的时长与缓动。
+  // 调用方在 crossfade 返回后再切换地图（主题、开始界面背景），快照取的是切换前的画面
+  let fadeT = null, waiting = null;
+  function applyReveal(reveal) {
+    if (!reveal) return;
     const root = document.documentElement;
     root.classList.add('theme-fade'); clearTimeout(fadeT);
-    fadeT = setTimeout(function () { root.classList.remove('theme-fade'); }, 700);
+    reveal();
+    fadeT = setTimeout(function () { root.classList.remove('theme-fade'); }, 650);
+  }
+  function crossfade(reveal) {
+    if (waiting) {   // 上一次切换还在快照下准备：沿用那张快照（画布上已是未画完的新画面），合并 reveal
+      const prev = waiting.reveal;
+      waiting.reveal = !reveal ? prev : (prev ? function () { prev(); reveal(); } : reveal);
+      waiting.t0 = performance.now(); waiting.f0 = R.frame; R.warm(1200);
+      return;
+    }
+    let snap = null;
+    if (!CM.Settings.reducedMotion() && R.frame && canvas.width && canvas.height) {
+      snap = document.createElement('canvas');
+      snap.width = canvas.width; snap.height = canvas.height; snap.className = 'map-snap';
+      try { snap.getContext('2d').drawImage(canvas, 0, 0); } catch (e) { snap = null; }
+    }
+    if (!snap) { if (reveal) reveal(); return; }
+    canvas.insertAdjacentElement('afterend', snap);
+    const job = waiting = { reveal: reveal, t0: performance.now(), f0: R.frame };
+    R.warm(1200);
+    const wait = function () {
+      const ready = !R.game || (R.frame > job.f0 + 1 && R.sharpReady());
+      if (!ready && performance.now() - job.t0 < 1200) { requestAnimationFrame(wait); return; }
+      waiting = null; R.warmUntil = 0;
+      applyReveal(job.reveal);
+      requestAnimationFrame(function () { snap.classList.add('out'); });
+      setTimeout(function () { snap.remove(); }, 800);
+    };
+    requestAnimationFrame(wait);
   }
   CM.crossfade = crossfade;
-  // 浅色 / 深色主题：界面（CSS 变量）与地图（渲染主题）同步切换；选择由「设置」保存
+  // 浅色 / 深色主题：界面（CSS 变量）与地图（渲染主题）同步切换；选择由「设置」保存。
+  // 地图先在旧画面快照下画好新主题，再与界面颜色一起过渡
+  let themeTransition = null, themeRequest = 0, lastThemePoint = null;
+  window.addEventListener('pointerdown', function (e) { lastThemePoint = { x: e.clientX, y: e.clientY, at: performance.now() }; }, true);
   CM.setTheme = function (name) {
     name = name === 'dark' ? 'dark' : 'light';
-    if (document.documentElement.dataset.theme !== name || R.themeName !== name) crossfade();
-    document.documentElement.dataset.theme = name;
-    const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', name === 'dark' ? '#111925' : '#eaf1f7');
-    if (R.themeName !== name) R.setTheme(name);
-    if (CM.Stats && CM.Stats.isOpen()) CM.Stats.redraw();
+    const reveal = function () {
+      document.documentElement.dataset.theme = name;
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute('content', name === 'dark' ? '#111925' : '#eaf1f7');
+      if (CM.Settings.get('colorBlind')) {
+        CM.Settings.apply('colorBlind');
+        ui._toKey = ''; ui.renderToolOpts(); ui.rerenderPage();
+        ui.renderDock();
+      }
+      if (CM.Stats && CM.Stats.isOpen()) CM.Stats.redraw();
+    };
+    const root = document.documentElement, request = ++themeRequest;
+    if (themeTransition) { try { themeTransition.skipTransition(); } catch (e) { /* 已完成 */ } }
+    if (root.dataset.theme === name && R.themeName === name) { reveal(); return; }
+    if (typeof document.startViewTransition === 'function' && !CM.Settings.reducedMotion() && R.frame > 0 && !document.hidden && !waiting) {
+      const p = lastThemePoint && performance.now() - lastThemePoint.at < 1500 ? lastThemePoint : { x: R.w - 40, y: 40 };
+      root.style.setProperty('--vt-x', p.x + 'px'); root.style.setProperty('--vt-y', p.y + 'px');
+      root.style.setProperty('--vt-r', (Math.ceil(Math.hypot(Math.max(p.x, R.w - p.x), Math.max(p.y, R.h - p.y))) + 2) + 'px');
+      root.classList.remove('theme-fade'); root.classList.add('vt-theme');
+      try {
+        const transition = themeTransition = document.startViewTransition(async function () {
+          if (request !== themeRequest) return;
+          if (R.themeName !== name) R.setTheme(name);
+          reveal(); R.warm(800);
+          const until = performance.now() + 800;
+          while (request === themeRequest && R.game && !R.sharpReady() && !document.hidden && performance.now() < until) {
+            await new Promise(function (resolve) { setTimeout(resolve, 0); });
+            if (request === themeRequest) R.render(0, ui);
+          }
+          if (request === themeRequest) R.warmUntil = 0;
+        });
+        const done = function () { if (themeTransition === transition) { themeTransition = null; root.classList.remove('vt-theme'); } };
+        transition.finished.then(done, done); transition.ready.catch(function () { /* 快速切换时可跳过 */ });
+        setTimeout(function () { if (themeTransition === transition) { try { transition.skipTransition(); } catch (e) {} done(); } }, 2200);
+        return;
+      } catch (e) { themeTransition = null; root.classList.remove('vt-theme'); }
+    }
+    if (R.themeName !== name) { crossfade(reveal); R.setTheme(name); }
+    else applyReveal(reveal);
   };
   CM.Settings.apply();
 
@@ -69,9 +130,15 @@
   }
   // 开始界面背景：镜头沿一条环形路线缓慢巡游几处城市地标（位置与缩放用 Catmull-Rom 平滑插值，速度约 0.3–0.5 格/秒，
   // 新进入画面的地图块少，保持流畅），同时列车在示意线路上运行、汽车在道路上行驶。菜单在左侧，焦点放在画面偏右
-  const TOUR = [[44, 39.5, 17.5], [48.6, 45, 19], [44.5, 50.5, 17.5], [31, 45.5, 17], [18.5, 45.5, 18.5], [22, 37.5, 18], [34, 37.5, 17], [47.5, 34.5, 18.5]];
+  const TOUR = [[44, 39.5, 17.5], [48.6, 45, 19], [44.5, 50.5, 17.5], [31, 45.5, 17], [18.5, 45.5, 18.5], [22, 37.5, 18], [34, 37.5, 17], [47.5, 34.5, 18.5]].map(p => [p[0] + (CM.MAPS.gz.extent.dx || 0), p[1] + (CM.MAPS.gz.extent.dy || 0), p[2]]);
   const TOUR_SEG = 24;   // 每段秒数
   function previewCamera(dt) {
+    // Hold the first camera until visible ground and buildings have been filled.
+    // Keep the existing per-frame rendering budget; subsequent views keep cruising.
+    if (preview && R.game === preview && !preview.ready) {
+      if (R.frame > (preview.firstFrame || 0) + 1 && R.sharpReady()) preview.ready = true;
+      else dt = 0;
+    }
     previewT += dt;
     const n = TOUR.length, u = (previewT / TOUR_SEG) % n, k = Math.floor(u), f = u - k;
     const P = function (i) { return TOUR[((i % n) + n) % n]; };
@@ -94,10 +161,17 @@
     if (CM.Soundscape) CM.Soundscape.reset();
     if (CM.Follow) CM.Follow.stop(true);
     if (CM.Tutorial) CM.Tutorial.detach();
+    if (CM.game && CM.game !== g && CM.game.model) CM.game.model.retired = true;   // 旧进度的交通求解不再占用工作线程
     CM.game = g;
     R.setGame(g);
+    canvas.classList.add('map-in');   // 快速进入游戏时，菜单背景任务可能尚未执行
     CM.agents.reset();
     tools.tool = 'select'; tools.chain = null; tools.bends = []; tools.lineChoice = 'new';
+    tools.newLineColor = null;
+    tools.drag = tools.ptr = tools.cursor = tools.hover = tools.hint = tools.snapPt = tools.mouse = tools.portalHover = null;
+    tools.lineLock = false; tools.keys.clear(); tools.keyMods = {};
+    if (tools.touches) tools.touches.clear(); tools.pinch = null;
+    ui.setTooltip(null); R.cv.style.cursor = '';
     ui.attachGame(g);
     ui.closeScreen();
     const mp = CM.curMap(), cam = mp.cam || { cx: CFG.W / 2, cy: CFG.H / 2, zoom: 18 };
@@ -109,11 +183,11 @@
     } else if (isNew) {
       ui.doAutosave();
       // 开局简报：这座城市当时的交通格局（东京为接管银座线）；关闭后打开任务面板
-      const tip = function () { ui.toast('游戏已暂停：先规划线路，再按空格或 ▶ 开始。', 'info'); ui.openPage('tasks', null, { root: true }); };
+      const tip = function () { ui.toast('游戏已暂停：先规划线路，再按' + (CM.Keys.hint('pause') ? ' ' + CM.Keys.hint('pause') + ' 或' : '') + ' ▶ 开始。', 'info'); ui.openPage('tasks', null, { root: true }); };
       if (CM.DATA.briefing && ui.showBriefing) ui.showBriefing(tip); else tip();
     } else {
       ui.markSaved(g, Date.now());
-      ui.toast('存档已载入（' + g.clock.y + '年' + g.clock.m + '月），按空格继续', 'good');
+      ui.toast('存档已载入（' + g.clock.y + '年' + g.clock.m + '月），' + (CM.Keys.hint('pause') ? '按 ' + CM.Keys.hint('pause') + ' 继续' : '点 ▶ 继续'), 'good');
     }
     // 旧存档升级（升级前的原存档已由 Save.load 另存为备份）：提示并保存升级后的进度
     if (!isNew && g.upgradeNote) {
@@ -124,25 +198,84 @@
     }
     ui.renderToolbar();
   }
+  // 驱动开局 / 读档生成器：等待工作线程时让出主线程，普通步骤按短时间片推进。
+  // 地图配置切换后暂停旧进度的模拟与绘制；失败时恢复旧地图、货币及进度。
+  CM.loadProgress = function (p, label) { ui.loadProgress(p, label); };
+  let loading = null;
+  CM.isLoading = function () { return loading !== null; };
+  function cancelLoad() {
+    const job = loading;
+    if (!job) return;
+    loading = null;
+    clearTimeout(job.timer);
+    if (CM.CarPool && CM.CarPool.onReq === job.resume) CM.CarPool.onReq = null;
+    if (job.gen) job.gen.return();
+  }
+  function runLoad(mapId, message, makeGen, isNew, what) {
+    if (loading) return;   // 包括尚未开始的延时任务，防止快速重复点击启动两次载入
+    const prev = CM.game;
+    const job = loading = { gen: null, timer: null, mapId: CM.mapId, prevRetired: prev && prev.model && prev.model.retired };
+    if (prev && prev.model) prev.model.retired = true;
+    if (CM.CarPool) CM.CarPool.onReq = null;
+    ui.showLoading(message, isNew ? (message.includes('推演') ? 'pre' : 'new') : 'load', mapId);
+    const end = function () {
+      clearTimeout(job.timer);
+      if (CM.CarPool && CM.CarPool.onReq === job.resume) CM.CarPool.onReq = null;
+      loading = null;
+    };
+    const step = function () {
+      if (loading !== job) return;
+      clearTimeout(job.timer);
+      try {
+        if (!job.gen) { CM.useMap(mapId); job.gen = makeGen(); }
+        const t0 = performance.now();
+        for (;;) {
+          const r = job.gen.next();
+          if (r.done) {
+            job.gen = null;
+            if (CM.CarPool && CM.CarPool.onReq === job.resume) CM.CarPool.onReq = null;
+            ui.finishLoading(function () { if (loading !== job) { if (r.value.model) r.value.model.retired = true; return; } end(); start(r.value, isNew); });
+            return;
+          }
+          if (r.value === CM.SIM_WAIT) {
+            if (CM.CarPool) CM.CarPool.onReq = job.resume;
+            job.timer = setTimeout(step, 100);   // 后台标签页或异常环境下仍可继续检查回退状态
+            return;
+          }
+          if (performance.now() - t0 >= 8) { job.timer = setTimeout(step, 0); return; }
+        }
+      } catch (e) {
+        if (job.gen) job.gen.return();
+        end();
+        CM.useMap(job.mapId || 'gz');
+        if (prev && CM.game === prev) {
+          if (prev.model) prev.model.retired = job.prevRetired;
+          if (CM.applyMoneyEra) CM.applyMoneyEra(prev.clock.y, prev.clock.m);
+        }
+        fail(e, what);
+      }
+    };
+    job.resume = function () { if (loading === job) { clearTimeout(job.timer); job.timer = setTimeout(step, 0); } };
+    job.timer = setTimeout(step, Math.max(60, (ui._zoomUntil || 0) - performance.now()));
+  }
   // opts.map：地图（默认广州）；opts.tutorial：新手教程
   CM.newGame = function (opts) {
+    ui._slotLoadRequest = null;
     if (CM.Soundscape) CM.Soundscape.reset();
     const mp = CM.MAPS[opts.map] || CM.MAPS.gz;
-    ui.showLoading('正在生成 ' + mp.cfg.START.y + ' 年的' + mp.data.city + '，并计算居民出行…');
-    setTimeout(function () {
-      try { CM.useMap(mp.id); start(CM.Game.create(opts), true); } catch (e) { CM.useMap(CM.game ? CM.game.mapId : 'gz'); fail(e, '创建新游戏'); }
-    }, 60);
+    runLoad(mp.id, opts.startYear > mp.cfg.START.y ? '从 ' + mp.cfg.START.y + ' 年推演到 ' + opts.startYear + ' 年的' + mp.data.city : '正在生成 ' + mp.cfg.START.y + ' 年的' + mp.data.city + '，并计算居民出行…', function () { return CM.Game.createGen(opts); }, true, '创建新游戏');
   };
   CM.loadGame = function (data) {
     if (CM.Soundscape) CM.Soundscape.reset();
-    ui.showLoading('正在载入存档并恢复城市与交通状态…');
-    setTimeout(function () {
-      try { CM.useMap((data.meta && data.meta.map) || 'gz'); start(CM.Game.restore(data), false); } catch (e) { CM.useMap(CM.game ? CM.game.mapId : 'gz'); fail(e, '载入存档'); }
-    }, 60);
+    runLoad((data.meta && data.meta.map) || 'gz', '正在载入存档并恢复城市与交通状态…', function () { return CM.Game.restoreGen(data); }, false, '载入存档');
   };
   CM.endGame = function () {
+    ui._slotLoadRequest = null;
+    cancelLoad();
+    if (CM.CarPool) CM.CarPool.onReq = null;
     if (CM.Soundscape) CM.Soundscape.reset();
     ui.clearCelebrations();
+    if (CM.game && CM.game.model) CM.game.model.retired = true;   // 返回主菜单：放弃旧进度尚未发出的交通计算
     CM.game = null;
     if (CM.Follow) CM.Follow.stop(true);
     if (CM.Tutorial) CM.Tutorial.detach();
@@ -162,6 +295,7 @@
     R.cv.style.cursor = '';
     if (!preview) preview = makePreview();
     R.setGame(preview);
+    preview.ready = false; preview.firstFrame = R.frame;
     R.fx = [];
     R.cam.t = 1; R.cam.under = R.cam.tu = 0; R.cam.fly = null; R.cam.anchor = null;
     previewCamera(0);
@@ -170,8 +304,11 @@
   let last = performance.now(), fpsAcc = 0, fpsN = 0;
   function frame(t) {
     const workStarted = performance.now();
+    R.frameWorkStart = workStarted;
     const dt = Math.min(0.1, Math.max(0, (t - last) / 1000));
     last = t;
+    // 新进度载入中（地图数据已切换到新城市）：暂停模拟与绘制，画面停在载入界面下的最后一帧
+    if (loading) { requestAnimationFrame(frame); return; }
     const g = CM.game;
     if (g) {
       try { g.update(dt); } catch (e) { console.error(e); }
@@ -191,7 +328,7 @@
     if (fpsAcc > 1) { R.stats.fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
     requestAnimationFrame(frame);
   }
-  window.addEventListener('beforeunload', function () { if (CM.game && !ui.isSaved()) ui.doAutosave(); });
+  window.addEventListener('beforeunload', function () { if (!loading && CM.game && !ui.isSaved()) ui.doAutosave(); });
   window.addEventListener('resize', function () { R.resize(); });
 
   R.resize();
@@ -201,8 +338,9 @@
   canvas.classList.add('map-intro');
   CM.Save.init().then(function () { ui.showStart(); }, function () { ui.showStart(); });
   setTimeout(function () {
+    if (loading) return;   // 当前配置已属于载入中的城市，不能用它生成广州菜单背景
     if (!preview) { try { preview = makePreview(); } catch (e) { console.error(e); } }
-    if (preview && !CM.game) R.setGame(preview);
+    if (preview && !CM.game) { R.setGame(preview); preview.ready = false; preview.firstFrame = R.frame; }
     requestAnimationFrame(function () { canvas.classList.add('map-in'); });
   }, 80);
 })(window.CM);

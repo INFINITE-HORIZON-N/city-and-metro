@@ -1,5 +1,5 @@
 'use strict';
-// 交通模拟：小区与重要设施的分目的出行需求（重力模型）→ 步行接驳与地铁路径 → 汽车/地铁方式选择（Logit）→ 道路分配与拥堵（BPR + MSA）
+// 交通模拟：小区与重要设施的分目的出行需求（重力模型）→ 步行接驳与地铁路径 → 汽车/地铁方式选择（Logit）→ 道路分配与拥堵（BPR + 成本线搜索）
 // 地铁运力按客流自动调整；所有计算分时段进行，并以时间切片方式运行，保证画面流畅。
 // v1.9：出行分为通勤、上学、购物、医疗、旅游休闲与交通枢纽接驳六类；重要设施作为独立的目的地节点（自有位置与步行接驳），
 // 普通设施按小区用地汇总；工作日与周末分别求解（两套各 4 个时段），实时交通按当天类型显示，日均指标按 5:2 加权。
@@ -8,24 +8,30 @@
   const NP = 4;
   const INF = 1e30;
   const PK = ['hw', 'sc', 'sh', 'md', 'lz', 'hb'], NPK = 6;
-  const HW = 0, SH = 2, LZ = 4, HB = 5;
+  const HW = 0, SH = 2, LZ = 4;
+  const skimKeys = new WeakMap(); let skimSerial = 0;
   const DT = ['wd', 'we'];
   // 地铁相关的统计量：夜间时段只运营到 24 时（按 0.9 折算）
   const METRO_KEYS = new Set(['metro', 'fare', 'metroPkm', 'metroTime', 'mHW', 'mSC', 'mSH', 'mMD', 'mLZ', 'mHB', 'indM']);
   const TKEY = ['tHW', 'tSC', 'tSH', 'tMD', 'tLZ', 'tHB'], MKEY = ['mHW', 'mSC', 'mSH', 'mMD', 'mLZ', 'mHB'];
   CM.TRIP_KEYS = PK;
 
-  // Keep the hot shortest-path loop outside the yielding orchestration. This is
-  // the same binary heap, relaxation order and numeric precision as before.
-  function roadTree(road, rd, time, origin, work, heap) {
-    const dist = work.dist, dkm = work.dkm, pred = work.pred, order = work.order;
-    const start = rd.start, node = rd.nodes, initial = rd.times, km = rd.km;
-    const outStart = road.outStart, outArc = road.outArc, arcTo = road.arcTo, arcKm = rd.arcKm;
-    dist.fill(INF); heap.clear();
-    // Each directed arc can relax once after its source is settled. Reserve the
-    // queue once, then keep its size local to avoid millions of property writes.
-    const keys = work.heapK || (work.heapK = new Array(road.nA + 4).fill(0.1));
-    const values = work.heapV || (work.heapV = new Array(road.nA + 4).fill(0));
+  // ---------------- 汽车分配：并行最短路（v2.1） ----------------
+  // 每个起点小区一棵道路最短路树：写出到各小区的汽车行程时间 / 里程（行程时间表的一行），并把该起点的汽车需求沿树回溯到路段。
+  // 起点按「本次需要计算的起点列表」固定分成 CAR_BLOCKS 块：每块的路段流量在块内按起点顺序累加，各块再按块顺序合计。
+  // 分块与工作线程数量无关，因此多线程与单线程（不支持 Worker、同步求解或工作线程出错时）结果逐位相同；
+  // 与 v2.0 的逐起点累加相比只有浮点舍入级别的差异，最短路、需求与分配规则不变。
+  // 下面三个函数会原样复制到工作线程中执行（不能引用外部变量，INF 在两边都定义为 1e30）
+  const CAR_BLOCKS = 32;
+  // 求解生成器在等待工作线程时让出的值：外层循环（实时求解、跳月、预测）见到它就不再空转，让工作线程的结果消息先进来
+  const WAIT = CM.SIM_WAIT = Object.freeze({ wait: true });
+  // 同时交错执行的时段数（v2.1）：一个时段等汽车分配时，主线程先算其他时段的地铁路径与方式选择
+  const PIPE_W = 2;
+  function carTree(G, time, origin, W) {
+    const dist = W.dist, dkm = W.dkm, pred = W.pred, order = W.order, keys = W.heapK, values = W.heapV;
+    const start = G.start, node = G.nodes, initial = G.times, km = G.km;
+    const outStart = G.outStart, outArc = G.outArc, arcTo = G.arcTo, arcKm = G.arcKm;
+    dist.fill(INF);
     let count = 0;
     for (let k = start[origin]; k < start[origin + 1]; k++) {
       const v = node[k], t = initial[k];
@@ -39,7 +45,6 @@
     let no = 0;
     while (count) {
       const u = values[0], du = keys[0], n = --count;
-      heap.lastKey = du;
       if (n > 0) {
         const key = keys[n], val = values[n];
         let i = 0;
@@ -65,35 +70,275 @@
     }
     return no;
   }
-
-  // 单个起点：最短路树、汽车行程时间（skim）与汽车流量回溯到路段（与此前在求解循环中内联的计算完全相同）；
-  // 返回本起点的行程时间是否与上次完全相同（chk 为 false 时不比较）
-  function carOrigin(cw, o, chk) {
-    const road = cw.road, rd = cw.rd, work = cw.work, Z = cw.Z, skT = cw.skT, skK = cw.skK, carDem = cw.carDem;
-    const dist = work.dist, dkm = work.dkm, pred = work.pred, order = work.order, accN = work.accN, aux = work.aux, arcFrom = road.arcFrom;
-    const connStart = rd.start, connNode = rd.nodes, connTime = rd.times, connKm = rd.km, zones = rd.zones;
-    const no = roadTree(road, rd, cw.time, o, work, cw.heap);
-    const row = o * Z;
-    let same = chk;
+  // 起点 o：行程时间与里程写入 outT / outK 的 off 起一行（不可达的小区不写，保留原值；工作线程的行预先填 NaN 表示「未写」），
+  // 流量累加到本块的 auxP；不可达条目保留原值。
+  function carOriginRow(G, time, o, dem, dOff, W, outT, outK, off, auxP) {
+    const dist = W.dist, dkm = W.dkm, pred = W.pred, order = W.order, accN = W.accN, arcFrom = G.arcFrom;
+    const connStart = G.start, connNode = G.nodes, connTime = G.times, connKm = G.km, zones = G.zones;
+    const no = carTree(G, time, o, W);
     for (let zi = 0; zi < zones.length; zi++) {
       const d = zones[zi];
       if (d === o) continue;
       let best = INF, bk = 0, bn = -1;
-      for (let k = connStart[d]; k < connStart[d + 1]; k++) { const node = connNode[k], v = dist[node] + connTime[k]; if (v < best) { best = v; bk = dkm[node] + connKm[k]; bn = node; } }
+      for (let k = connStart[d]; k < connStart[d + 1]; k++) { const nd = connNode[k], v = dist[nd] + connTime[k]; if (v < best) { best = v; bk = dkm[nd] + connKm[k]; bn = nd; } }
       if (bn < 0 || best >= INF) continue;
-      const oldT = same ? skT[row + d] : 0, oldK = same ? skK[row + d] : 0;
-      skT[row + d] = best; skK[row + d] = bk;
-      if (same && (oldT !== skT[row + d] || oldK !== skK[row + d])) same = false;
-      const dem = carDem[row + d];
-      if (dem > 0) accN[bn] += dem;
+      outT[off + d] = best; outK[off + d] = bk;
+      const x = dem[dOff + d];
+      if (x > 0) accN[bn] += x;
     }
     for (let q = no - 1; q >= 0; q--) {
       const n = order[q], a = accN[n];
-      if (a > 0) { const e = pred[n]; if (e >= 0) { aux[e] += a; accN[arcFrom[e]] += a; } accN[n] = 0; }
+      if (a > 0) { const e = pred[n]; if (e >= 0) { auxP[e] += a; accN[arcFrom[e]] += a; } accN[n] = 0; }
     }
-    return same;
   }
-
+  function carWork(G) {
+    return { dist: new Float64Array(G.nN), dkm: new Float32Array(G.nN), pred: new Int32Array(G.nN), order: new Int32Array(G.nN), accN: new Float64Array(G.nN), heapK: new Float64Array(G.nA + 4), heapV: new Int32Array(G.nA + 4) };
+  }
+  // 工作线程入口：收到道路图（每次路网变化一次）与计算块，逐起点计算并回传（缓冲区转移，不复制）
+  function carWorkerMain() {
+    let G = null, W = null, kernel = null;
+    onmessage = function (e) {
+      const m = e.data;
+      if (m.type === 'graph') { G = m.G; W = null;kernel=null;try{if(m.kernel)kernel=roadKernelWorker(m.kernel,G);}catch(e){/* JavaScript fallback. */}return; }
+      if (m.type !== 'block') return;
+      if (!G || G.id !== m.gid) { postMessage({ req: m.req, b: m.b, stale: true }); return; }
+      if(kernel){try{const r=kernel.solve(m);postMessage({req:m.req,b:m.b,...r,kernel:true},[r.rowsT.buffer,r.rowsK.buffer,r.aux.buffer]);return;}catch(e){kernel=null;}}
+      if(!W)W=carWork(G);
+      const Z = G.Z, n = m.origins.length, rowsT = new Float32Array(n * Z).fill(NaN), rowsK = new Float32Array(n * Z).fill(NaN), aux = new Float32Array(G.nA);
+      for (let i = 0; i < n; i++) carOriginRow(G, m.time, m.origins[i], m.dem, i * Z, W, rowsT, rowsK, i * Z, aux);
+      postMessage({ req: m.req, b: m.b, rowsT: rowsT, rowsK: rowsK, aux: aux }, [rowsT.buffer, rowsK.buffer, aux.buffer]);
+    };
+  }
+  // 道路图（随 roadData 一起缓存）：工作线程与主线程使用同一份紧凑数组
+  function carGraph(model) {
+    const rd = model.roadData, road = model.road;
+    if (rd.G) return rd.G;
+    rd.G = { id: ++CarPool.gseq, Z: model.Z, nN: road.nN, nA: road.nA, outStart: road.outStart, outArc: road.outArc, arcTo: road.arcTo, arcFrom: road.arcFrom,
+      start: rd.start, nodes: rd.nodes, times: rd.times, km: rd.km, zones: rd.zones, arcKm: rd.arcKm };
+    return rd.G;
+  }
+  // 工作线程池：页面内用 Blob 创建（桌面 CSP 已允许 blob: 工作线程）；无法创建或出错时整体退回主线程计算。
+  // 道路线程按可用逻辑核心分配，最多 24 个，为方式选择、界面与 GPU 驱动保留至少四分之一；分块数固定，线程数不改变结果。每个线程同时排队两块，
+  // 算完一块马上开始下一块，不必等主线程转发。onReq 在一次分配全部完成（或改为主线程计算）时调用，供跳月 / 跳年立即继续
+  function workerPlan() {
+    const nav = typeof navigator !== 'undefined' ? navigator : {};
+    const cores = Math.max(1, Number(nav.hardwareConcurrency) || 2), memory = Number(nav.deviceMemory) || 8;
+    const touch = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+    const cap = memory <= 2 ? 1 : memory <= 4 || touch ? 4 : 8;
+    const total = Math.max(1, Math.min(cap, cores - (cores >= 4 ? 2 : 1)));
+    const mode = total >= 6 ? 2 : total >= 3 ? 1 : 0;
+    return { road: total - mode, mode: mode };
+  }
+  const CAR_DEPTH = 2;
+  const CarPool = {
+    gseq: 0, rseq: 0, list: null, off: false, queue: [], reqs: new Map(), onReq: null,
+    size: function () { return workerPlan().road; },
+    ready: function () {
+      if (this.off) return false;
+      if (this.list) return true;
+      let url;
+      try {
+        if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined' || !URL.createObjectURL) throw new Error('Worker 不可用');
+        const kernel = CM.RoadKernel;
+        const src = '"use strict";\nconst INF = 1e30;\n' + (kernel ? kernel.worker.toString() : 'function roadKernelWorker(){return null;}') + '\n' + [carTree, carOriginRow, carWork, carWorkerMain].map(function (f) { return f.toString(); }).join('\n') + '\ncarWorkerMain();\n';
+        url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        const self = this; this.list = [];
+        for (let i = 0; i < this.size(); i++) {
+          const w = new Worker(url), slot = { w: w, n: 0, gid: 0 };
+          w.onmessage = function (e) { self.done(slot, e.data); };
+          w.onerror = function (e) { if (e && e.preventDefault) e.preventDefault(); self.fail('工作线程出错：' + ((e && e.message) || '未知错误')); };
+          w.onmessageerror = function () { self.fail('工作线程消息无法读取'); };
+          this.list.push(slot);
+        }
+        return true;
+      } catch (e) { this.fail(String(e && e.message || e)); return false; }
+      finally { if (url) URL.revokeObjectURL(url); }
+    },
+    fail: function (why) {
+      if (this.off) return;
+      this.off = true; this.why = why;
+      if (this.list) for (const s of this.list) { try { s.w.terminate(); } catch (e) { /* 已结束 */ } }
+      this.list = null;
+      for (const r of this.reqs.values()) r.failed = true;   // 未完成的块由主线程补算
+      this.reqs.clear(); this.queue = [];
+      if (typeof console !== 'undefined') console.warn('交通求解改为主线程计算：' + why);
+      this.notify();
+    },
+    notify: function () {
+      if (!this.onReq || this.notifying) return;
+      this.notifying = true;
+      const self = this;
+      // 创建工作线程失败时也会通知；在当前生成器让出后恢复，避免同步重入 gen.next()。
+      Promise.resolve().then(function () {
+        self.notifying = false;
+        if (self.onReq) { try { self.onReq(); } catch (e) { if (typeof console !== 'undefined') console.error(e); } }
+      });
+    },
+    // 提交一次分配：blocks 为 [{ origins, dem }]；alive() 为假时（求解已被放弃）尚未发出的块直接丢弃
+    submit: function (G, time, blocks, alive) {
+      const req = { id: ++this.rseq, G: G, time: Float32Array.from(time), res: new Array(blocks.length), remaining: 0, failed: false, alive: alive };
+      blocks.forEach(function (b, i) { if (b.origins.length) { req.remaining++; this.queue.push({ req: req, b: i, origins: b.origins, dem: b.dem }); } else req.res[i] = null; }, this);
+      if (req.remaining) this.reqs.set(req.id, req);
+      this.pump();
+      return req;
+    },
+    pump: function () {
+      if (!this.list) return;
+      // 先让每个线程都有一块，再补第二块（排队深度 CAR_DEPTH）
+      for (let depth = 1; depth <= CAR_DEPTH; depth++) for (const s of this.list) {
+        if (s.n >= depth) continue;
+        let t = null;
+        while (this.queue.length) {
+          const c = this.queue.shift();
+          if (c.req.alive()) { t = c; break; }
+          c.req.abandoned = true;
+          if (--c.req.remaining <= 0) this.reqs.delete(c.req.id);
+        }
+        if (!t) return;
+        try {
+          if (s.gid !== t.req.G.id) { const msg = { type: 'graph', G: t.req.G, kernel: CM.RoadKernel && CM.RoadKernel.module }; try { s.w.postMessage(msg); } catch (e) { msg.kernel = null; s.w.postMessage(msg); } s.gid = t.req.G.id; }
+          s.n++;
+          s.w.postMessage({ type: 'block', req: t.req.id, b: t.b, gid: t.req.G.id, time: t.req.time, origins: t.origins, dem: t.dem }, [t.dem.buffer]);
+        } catch (e) { this.fail('工作线程消息发送失败：' + (e && e.message || e)); return; }
+      }
+    },
+    done: function (slot, m) {
+      slot.n = Math.max(0, slot.n - 1);
+      const req = this.reqs.get(m.req);
+      let fin = false;
+      if (req) {
+        if (m.stale) req.failed = true;
+        else req.res[m.b] = { rowsT: m.rowsT, rowsK: m.rowsK, aux: m.aux };
+        if (--req.remaining <= 0) { this.reqs.delete(req.id); fin = true; }
+        else if (req.failed) fin = true;
+      }
+      this.pump();
+      if (fin) this.notify();
+    },
+  };
+  CM.CarPool = CarPool;
+  // 方式选择是大线网中最重的主线程任务。每次迭代仍按原起点、去返程与统计累加顺序
+  // 完整执行，只把计算搬到独立线程；不拆分求和，不降低精度。需求和接驳表按版本缓存，
+  // 变化的行程表与结果缓冲区往返转移并复用，避免每帧复制整份需求或保留旧城市。
+  const OD_OUT = ['carDem', 'hasCar', 'S', 'pT', 'pM', 'zTrips', 'zMetro', 'zAccess', 'desTot', 'desMetro',
+    'zDest', 'zDestM', 'fIn', 'fInM', 'fOut', 'fOutM', 'fP', 'DS', 'choices'];
+  const OD_FIXED = ['Z', 'NZ', 'B', 'odStart', 'odDest', 't0', 't1', 't2', 't3', 't4', 't5', 'hostZ', 'nx', 'ny', 'kmPerCell', 'blocks'];
+  const OD_INPUT = ['N', 'co', 'cr', 'facW', 'facWe', 'odOk', 'skT', 'skK', 'zJ', 'cpk', 'park', 'vot', 'carAccess',
+    'walkW', 'occ', 'theta', 'fareFlat', 'fareKm0', 'fareStep', 'fareInc', 'fareCap', 'bgShare', 'bgSpeed', 'bgWait', 'bgFare', 'accOk', 'gtS', 'tmS', 'kmS', 'perMin', 'capSh', 'capLz'];
+  function odWorkerMain() {
+    let basis = null, id = 0, work = {};
+    onmessage = function (e) {
+      const m = e.data;
+      if (m.type === 'basis') { basis = m.data; id = m.id; return; }
+      if (m.type === 'recycle') { work = m.data; return; }
+      if (m.type !== 'solve') return;
+      if (!basis || id !== m.id) { postMessage({ req: m.req, stale: true }); return; }
+      const K = Object.assign({}, basis, m.input), out = {}, transfer = [];
+      for (const spec of m.output) {
+        const key = spec[0];
+        if (!spec[1]) { K[key] = out[key] = null; continue; }
+        let a = work[key];
+        if (!a || a.constructor.name !== spec[1] || a.length !== spec[2]) a = new globalThis[spec[1]](spec[2]);
+        a.fill(key === 'choices' ? -2 : 0);
+        K[key] = out[key] = a; transfer.push(a.buffer);
+      }
+      K.cO = new Float64Array(6); K.cR = new Float64Array(6);
+      for (let i = 0; i < K.Z; i++) odOrigin(K, i);
+      for (const key in m.input) if (ArrayBuffer.isView(m.input[key])) transfer.push(m.input[key].buffer);
+      work = {};
+      postMessage({ req: m.req, out: out, input: m.input }, transfer);
+    };
+  }
+  const OdPool = {
+    list: null, off: false, seq: 0, keySeq: 0, queue: [],
+    ready: function () {
+      if (this.off || !workerPlan().mode) return false;
+      if (this.list) return true;
+      let url;
+      try {
+        const src = '"use strict";\nconst INF=1e30,HW=0,SH=2,LZ=4,NPK=6;\nconst U={dist:' + U.dist.toString() + '};\n' +
+          odOrigin.toString() + '\n' + odWorkerMain.toString() + '\nodWorkerMain();\n';
+        url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+        this.list = [];
+        const count = workerPlan().mode;
+        for (let i = 0; i < count; i++) {
+          const w = new Worker(url), slot = { w: w, key: 0, req: null, buffers: {} };
+          w.onmessage = e => this.done(slot, e.data);
+          w.onerror = e => { if (e && e.preventDefault) e.preventDefault(); this.fail((e && e.message) || '工作线程出错'); };
+          w.onmessageerror = () => this.fail('工作线程消息无法读取');
+          this.list.push(slot);
+        }
+        return true;
+      } catch (e) { this.fail(String(e && e.message || e)); return false; }
+      finally { if (url) URL.revokeObjectURL(url); }
+    },
+    fail: function (why) {
+      if (this.off) return;
+      this.off = true; this.why = why;
+      for (const s of this.list || []) { if (s.req) { s.req.failed = true; s.req.K = null; } s.w.terminate(); }
+      for (const r of this.queue) { r.failed = true; r.K = null; }
+      this.list = null; this.queue = [];
+      if (typeof console !== 'undefined') console.warn('方式选择改为主线程计算：' + why);
+      CarPool.notify();
+    },
+    submit: function (model, K, od, fn, alive) {
+      let version = model._odWorkerVersion;
+      if (!version || version.od !== od || version.fn !== fn || version.acc !== K.acc) {
+        version = model._odWorkerVersion = { id: ++this.keySeq, od: od, fn: fn, acc: K.acc };
+      }
+      const r = { id: ++this.seq, key: version.id, K: K, alive: alive, done: false, failed: false };
+      this.queue.push(r); this.pump(); return r;
+    },
+    pump: function () {
+      // 及时释放已取消、换图或过时的请求，不让排队的闭包长期持有旧模型。
+      this.queue = this.queue.filter(r => { if (r.alive()) return true; r.failed = true; r.done = true; r.K = null; return false; });
+      for (const s of this.list || []) {
+        if (s.req || !this.queue.length) continue;
+        const r = this.queue.shift(), K = r.K;
+        s.req = r;
+        try {
+          if (s.key !== r.key) {
+            const data = {}, transfer = [];
+            for (const key of OD_FIXED) {
+              const v = K[key]; data[key] = ArrayBuffer.isView(v) ? v.slice() : v;
+              if (ArrayBuffer.isView(data[key])) transfer.push(data[key].buffer);
+            }
+            data.acc = K.acc ? { zCov: K.acc.zCov, zl: K.acc.zl } : null;
+            s.w.postMessage({ type: 'basis', id: r.key, data: data }, transfer); s.key = r.key;
+          }
+          const input = {}, transfer = [];
+          for (const key of OD_INPUT) {
+            const v = K[key];
+            if (ArrayBuffer.isView(v)) {
+              let a = s.buffers[key];
+              if (!a || a.constructor !== v.constructor || a.length !== v.length) a = new v.constructor(v.length);
+              a.set(v); input[key] = a; transfer.push(a.buffer);
+            } else input[key] = v;
+          }
+          s.buffers = {};
+          const output = OD_OUT.map(key => [key, K[key] ? K[key].constructor.name : null, K[key] ? K[key].length : 0]);
+          s.w.postMessage({ type: 'solve', id: r.key, req: r.id, input: input, output: output }, transfer);
+        } catch (e) { this.fail(String(e && e.message || e)); return; }
+      }
+    },
+    done: function (s, m) {
+      const r = s.req;
+      if (!r || r.id !== m.req) { this.fail('方式选择请求不匹配'); return; }
+      try {
+        if (m.stale) r.failed = true;
+        else {
+          if (!r.alive()) r.failed = true;
+          else for (const key of OD_OUT) if (m.out[key]) r.K[key].set(m.out[key]);
+          s.buffers = m.input;
+          const transfer = OD_OUT.filter(key => m.out[key]).map(key => m.out[key].buffer);
+          s.w.postMessage({ type: 'recycle', data: m.out }, transfer);
+        }
+        r.done = true; r.K = null; s.req = null;
+        this.pump(); CarPool.notify();
+      } catch (e) { this.fail(String(e && e.message || e)); }
+    },
+  };
+  CM.OdPool = OdPool;
   // 单个起点的方式选择与统计：对起点 i 的每条需求记录，先算去程（i → j）再算返程（j → i）。
   // 汽车广义成本、最优接驳车站对（同一迭代内缓存胜出的组合）、Logit 地铁选择、新增购物 / 休闲出行（有上限），
   // 并按顺序累加全网统计（S、分目的 pT / pM）、小区与设施的吸引统计、期望线与汽车需求。
@@ -104,6 +349,8 @@
     const co = K.co, cr = K.cr, cO = K.cO, cR = K.cR, facW = K.facW, facWe = K.facWe, odOk = K.odOk;
     const hostZ = K.hostZ, nx = K.nx, ny = K.ny, skT = K.skT, skK = K.skK, kmPerCell = K.kmPerCell;
     const cpk = K.cpk, park = K.park, vot = K.vot, carAccess = K.carAccess, walkW = K.walkW, occ = K.occ, theta = K.theta, fareFlat = K.fareFlat;
+    const fareKm0 = K.fareKm0, fareStep = K.fareStep, fareInc = K.fareInc, fareCap = K.fareCap;
+    const bgShare = K.bgShare || 0, bgSpeed = K.bgSpeed, bgWait = K.bgWait, bgFare = K.bgFare;
     const acc = K.acc, accOk = K.accOk, zCov = acc ? acc.zCov : null, zl = acc ? acc.zl : null, choices = K.choices;
     const gtS = K.gtS, tmS = K.tmS, kmS = K.kmS, DS = K.DS, perMin = K.perMin, capSh = K.capSh, capLz = K.capLz;
     const carDem = K.carDem, hasCar = K.hasCar, S = K.S, pT = K.pT, pM = K.pM;
@@ -127,7 +374,13 @@
         let ct = skT[ho * Z + hd], ck = skK[ho * Z + hd];
         if (!(ct > 0) || ct >= INF) { const straight = U.dist(nx[o], ny[o], nx[d], ny[d]) * kmPerCell * 1.3; ct = straight / 16 * 60 + 3; ck = straight; }
         const carMoney = ck * cpk + park;
-        const gtCar = ct + carAccess + carMoney / vot * 60;
+        let gtCar = ct + carAccess + carMoney / vot * 60, roadF = 1, tBg = 0;
+        // 背景交通（v2.2）：非地铁出行中有 bgShare 比例乘坐电车、普通铁路、渡轮或步行，不占用道路；广义成本按比例混合
+        if (bgShare > 0) {
+          const dk = U.dist(nx[o], ny[o], nx[d], ny[d]) * kmPerCell * 1.25;
+          tBg = dk / bgSpeed * 60 + bgWait;
+          gtCar = (1 - bgShare) * gtCar + bgShare * (tBg + bgFare / vot * 60); roadF = 1 - bgShare;
+        }
         let mTime = 0, fare = 0, mKm = 0, bs = -1, bt = -1, q = 0, pMc = 0;
         let gtBest = gtCar, ind = 0, indSh = 0, indLz = 0;
         if (acc && (accOk || (o < Z && d < Z))) {
@@ -156,6 +409,7 @@
             if (bs >= 0) {
               mKm = kmS[bs * N + bt];
               fare = fareFlat;
+              if (fareInc > 0 && mKm > fareKm0) { fare += Math.ceil((mKm - fareKm0) / fareStep - 1e-9) * fareInc; if (fareCap > 0 && fare > fareCap) fare = fareCap; }
               const gtM = best + fare / vot * 60;
               pMc = 1 / (1 + Math.exp(theta * (gtM - gtCar)));
               q = fo * fd * pMc;
@@ -175,12 +429,12 @@
         const F = F0 + ind, metro = metroB + indM;
         if (metro > 0) DS[bs * N + bt] += metro;
         const car = F - metro;
-        if (car > 0) { carDem[ho * Z + hd] += car / occ; hasCar[ho] = 1; }
+        if (car > 0) { carDem[ho * Z + hd] += car / occ * roadF; hasCar[ho] = 1; }
         S[0] += F; S[1] += metro; S[2] += car;
-        const tCar = ct + carAccess * 0.5;
+        const tCar = bgShare > 0 ? (1 - bgShare) * (ct + carAccess * 0.5) + bgShare * tBg : ct + carAccess * 0.5;
         S[3] += car * tCar + metro * mTime;
         S[4] += car * tCar; S[5] += metro * mTime;
-        S[6] += metro * fare; S[7] += metro * mKm; S[8] += car * ck; S[9] += car / occ * ck;
+        S[6] += metro * fare; S[7] += metro * mKm; S[8] += car * ck; S[9] += car / occ * ck * roadF;
         const cw = comp[HW] / F0;
         if (cw > 0) { S[10] += comp[HW]; S[11] += ((F0 - metroB) * tCar + metroB * mTime) * cw; }
         for (let p = 0; p < NPK; p++) { const c = comp[p]; if (c) { pT[p] += c; pM[p] += c * q; } }
@@ -272,16 +526,22 @@
     if (P >= 20) {
       s.fill(0);
       let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
-      const xi = zCx[i], yi = zCy[i];
+      const xi = zCx[i], yi = zCy[i], corr = D.corr, RN = D.RN, zReg = D.zReg, cRow = corr ? zReg[i] * RN : 0;
+      // 距离衰减 exp(-d / L) 查表（v2.2 性能）：按距离等间隔的表线性插值，相对误差约 1e-6，结果与逐个求指数一致；超出表的距离仍逐个求指数
+      const X = D.lut, inv = X.inv, nT = X.n, T0 = X.t[0], T1 = X.t[1], T2 = X.t[2], T3 = X.t[3], T4 = X.t[4];
       for (let j = 0; j < Z; j++) {
         if (j === i || (zJobs[j] < 5 && zAsum[j] < 5)) { w0[j] = 0; w1[j] = 0; w2[j] = 0; w3[j] = 0; w4[j] = 0; continue; }
         const dx = xi - zCx[j], dy = yi - zCy[j], d = Math.sqrt(dx * dx + dy * dy) * kmPerCell;
-        let v;
-        v = A0[j] > 0 ? A0[j] * Math.exp(-d / L0) : 0; w0[j] = v; s0 += v;
-        v = A1[j] > 0 ? A1[j] * Math.exp(-d / L1) : 0; w1[j] = v; s1 += v;
-        v = A2[j] > 0 ? A2[j] * Math.exp(-d / L2) : 0; w2[j] = v; s2 += v;
-        v = A3[j] > 0 ? A3[j] * Math.exp(-d / L3) : 0; w3[j] = v; s3 += v;
-        v = A4[j] > 0 ? A4[j] * Math.exp(-d / L4) : 0; w4[j] = v; s4 += v;
+        let v, e0, e1, e2, e3, e4;
+        const u = d * inv, k = u | 0;
+        if (k < nT) { const f = u - k; e0 = T0[k] + (T0[k + 1] - T0[k]) * f; e1 = T1[k] + (T1[k + 1] - T1[k]) * f; e2 = T2[k] + (T2[k + 1] - T2[k]) * f; e3 = T3[k] + (T3[k + 1] - T3[k]) * f; e4 = T4[k] + (T4[k + 1] - T4[k]) * f; }
+        else { e0 = Math.exp(-d / L0); e1 = Math.exp(-d / L1); e2 = Math.exp(-d / L2); e3 = Math.exp(-d / L3); e4 = Math.exp(-d / L4); }
+        const cf = corr ? corr[cRow + zReg[j]] : 1;   // 历史阶段的区域间走廊（通勤、购物）
+        v = A0[j] > 0 ? A0[j] * e0 * cf : 0; w0[j] = v; s0 += v;
+        v = A1[j] > 0 ? A1[j] * e1 : 0; w1[j] = v; s1 += v;
+        v = A2[j] > 0 ? A2[j] * e2 * cf : 0; w2[j] = v; s2 += v;
+        v = A3[j] > 0 ? A3[j] * e3 : 0; w3[j] = v; s3 += v;
+        v = A4[j] > 0 ? A4[j] * e4 : 0; w4[j] = v; s4 += v;
       }
       s[0] = s0; s[1] = s1; s[2] = s2; s[3] = s3; s[4] = s4;
       for (let k = 0; k < F; k++) {
@@ -290,13 +550,10 @@
         for (let p = 1; p < 5; p++) { const v = fA[p][k] * e; wf[p][k] = v; s[p] += v; }
       }
       let nc = 0, nf = 0;
+      // 各目的的份额系数（rw / s）先算好，逐个去向只做乘法
+      const q0 = s[0] > 0 ? rw[0] / s[0] : 0, q1 = s[1] > 0 ? rw[1] / s[1] : 0, q2 = s[2] > 0 ? rw[2] / s[2] : 0, q3 = s[3] > 0 ? rw[3] / s[3] : 0, q4 = s[4] > 0 ? rw[4] / s[4] : 0;
       for (let j = 0; j < Z; j++) {
-        let sh = 0;
-        if (s[0] > 0) sh += rw[0] * w0[j] / s[0];
-        if (s[1] > 0) sh += rw[1] * w1[j] / s[1];
-        if (s[2] > 0) sh += rw[2] * w2[j] / s[2];
-        if (s[3] > 0) sh += rw[3] * w3[j] / s[3];
-        if (s[4] > 0) sh += rw[4] * w4[j] / s[4];
+        const sh = q0 * w0[j] + q1 * w1[j] + q2 * w2[j] + q3 * w3[j] + q4 * w4[j];
         if (sh > 0.0015) { scores[j] = sh; cand[nc++] = j; }
       }
       const cs = cand.subarray(0, nc);
@@ -344,7 +601,7 @@
   Model.dayType = function (y, m, d) { const w = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); return w === 0 || w === 6 ? 'we' : 'wd'; };
   Model.DT_NAME = { wd: '工作日', we: '周末', avg: '周平均' };
 
-  function Model(city) {
+  function Model(city, opts) {
     this.city = city;
     this.ZW = CFG.W / CFG.ZONE; this.ZH = CFG.H / CFG.ZONE; this.Z = this.ZW * this.ZH;
     this.BW = Math.ceil(this.ZW / 2); this.BH = Math.ceil(this.ZH / 2); this.B = this.BW * this.BH;
@@ -370,30 +627,31 @@
       this.zoneCells.push(Int32Array.from(arr));
     }
     this.zPop = new Float32Array(this.Z); this.zJobs = new Float32Array(this.Z); this.zAttr = new Float32Array(this.Z);
-    this.zA = new Float32Array(4 * this.Z); this.zHub = new Float32Array(this.Z);
+    this.zA = new Float32Array(4 * this.Z); this.zHub = new Float32Array(this.Z); this.zReg = new Int16Array(this.Z);
     this.zCx = new Float32Array(this.Z); this.zCy = new Float32Array(this.Z);
     this.road = city.car; this.roadVer = city.roadVersion;
     this.prepareRoad();
     this.arcZone = null; this.computeArcZones();
     this.fn = null;
-    this.buildZones(); this.buildDemand();
+    if(!opts||!opts.deferDemand){this.buildZones(); this.buildDemand();}
     this.net = null;
     this.ctxs = { wd: this.newCtx(NP, 'wd'), we: this.newCtx(NP, 'we') };
     this.live = this.ctxs.wd;
     this.gen = null; this.predJob = null;
     this.liveBuf = {}; this.predBuf = {};
-    this.cycles = 0; this.sinceChange = 0; this.version = 0;
+    this.cycles = 0; this.version = 0;
     this.daily = null;
   }
   CM.Model = Model;
 
-  Model.prototype.wake = function () { this.settled = false; this.quietCycles = 0; this.gen = null; };
-  Model.prototype.setYear = function (y) { if (this.year !== y) this.wake(); this.year = y; this.capF = U.interp(CFG.road.capGrowth, y); };
+  // epoch：求解流程被放弃（重新开始）时递增，工作线程队列中属于旧流程的计算块不再发出
+  Model.prototype.wake = function (cycles) { this.solveLimit = cycles || 2; this.settled = false; this.gen = null; this.epoch = (this.epoch || 0) + 1; };
+  Model.prototype.setYear = function (y) { if (this.year !== y) this.wake(1); this.year = y; this.capF = U.interp(CFG.road.capGrowth, y); };
   // 当天的日类型：实时画面（车流、客流、拥堵）与当天的票款使用对应的求解结果；两套结果都在后台保持收敛
   Model.prototype.setDayType = function (dt) {
     dt = dt === 'we' ? 'we' : 'wd';
     if (dt === this.dayType) return;
-    this.dayType = dt; this.live = this.ctxs[dt]; this.profile = this.profiles[dt]; this.pMean = this.pMeans[dt];
+    this.dayType = dt; this.live = this.resultsFor(dt); this.profile = this.profiles[dt]; this.pMean = this.pMeans[dt];
     this.dailyNow = dt === 'we' ? this.dailyWe : this.dailyWk;
     this.version++;
   };
@@ -407,29 +665,51 @@
       theta: c.theta, walkW: c.walkW, waitW: c.waitW, tpen: c.transferPen, opn: c.outTransferPen, carAccess: c.carAccess,
     };
   };
-  // 全网统一票价：与乘车里程无关，换乘不另收费
+  // 票价（v2.1 第二轮）：统一票价（flat）或按里程计费（dist：起步价 flat 含 km0 公里，之后每 step 公里加 inc，最高 cap，0 为不封顶）。
+  // 里程取所选进出站之间的地铁乘车距离，换乘不另收费；统一票价时 inc 为 0，与原来的计算逐位相同
   Model.prototype.fareFor = function () { return this.fare.flat; };
+  Model.fareParams = function (f) {
+    const d = f && f.mode === 'dist';
+    return { km0: d ? f.km0 : 0, step: d ? f.step : 1, inc: d ? f.inc : 0, cap: d ? f.cap : 0 };
+  };
+  Model.fareAt = function (f, km) {
+    let v = f.flat;
+    if (f.mode === 'dist' && f.inc > 0 && km > f.km0) { v += Math.ceil((km - f.km0) / f.step - 1e-9) * f.inc; if (f.cap > 0 && v > f.cap) v = f.cap; }
+    return v;
+  };
+  // 输入签名用的票价键：统一票价仍是数值本身（与旧版缓存、签名一致），按里程时为参数串
+  Model.fareKey = function (f) { return f.mode === 'dist' ? 'd' + [f.flat, f.km0, f.step, f.inc, f.cap].join(',') : f.flat; };
 
   // ---------------- 重要设施节点 ----------------
   // 运营中的重要设施作为独立的目的地节点（编号 Z + k）：位置、场地格与步行接驳单独计算；道路行程按所在小区计算
   Model.prototype.buildFacNodes = function () {
     const city = this.city, Z = this.Z, Fac = CM.Fac;
-    const all = Fac ? Fac.list() : [];
+    const all = Fac ? Fac.list(city) : [];
     const list = all.filter(function (f) { return Fac.active(f, this.year, city); }, this);
     const F = list.length, NZ = Z + F;
     const hostZ = new Int32Array(NZ), nx = new Float32Array(NZ), ny = new Float32Array(NZ);
     for (let z = 0; z < Z; z++) hostZ[z] = z;
-    const cells = [], cellFac = new Map(), excl = new Uint8Array(city.N), we = new Float32Array(F);
+    const cells = [], cellFac = new Map(), ringFac = new Map(), inner = new Float32Array(F), excl = new Uint8Array(city.N), we = new Float32Array(F);
     list.forEach(function (f, k) {
       const c0 = city.cellAt(f.x, f.y);
       hostZ[Z + k] = c0 >= 0 ? city.zoneOf(c0) : 0; nx[Z + k] = f.x; ny[Z + k] = f.y;
       const cs = Fac.siteCells(f, city); cells.push(Int32Array.from(cs));
       for (const c of cs) { let a = cellFac.get(c); if (!a) { a = []; cellFac.set(c, a); } a.push(k); if (f.lmK >= 0) excl[c] = 1; }
-      we[k] = f.T.we || 1;
+      // 出入口（v2.2 修正）：场地格及其外围一圈的陆地格。公园、宫苑、填海地等场地内部没有可步行的街道时，
+      // 车站只要能步行到达场地边缘即可服务整个设施（另计场内步行时间），不再因场内不可步行而永远无法接驳
+      const seen = new Set();
+      for (const c of cs) { const i = c % city.W, j = (c / city.W) | 0;
+        for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+          const ii = i + di, jj = j + dj; if (ii < 0 || jj < 0 || ii >= city.W || jj >= city.H) continue;
+          const cc = jj * city.W + ii; if (seen.has(cc) || city.landFrac[cc] < 0.3) continue; seen.add(cc);
+          let a = ringFac.get(cc); if (!a) { a = []; ringFac.set(cc, a); } a.push(k);
+        } }
+      inner[k] = Math.min(600, Math.sqrt(cs.length) * CFG.CELL_M * 0.4);   // 场内步行（米），大型公园与会展场馆约数分钟
+      we[k] = f.we || f.T.we || 1;   // 单个设施可覆盖周末倍数（如主题乐园，v2.2）
     });
     const key = list.map(function (f) { return f.id; }).join(',');
     if (this.fn && this.fn.key !== key) this.facDaily = null;
-    this.fn = { F: F, NZ: NZ, list: list, ids: list.map(function (f) { return f.id; }), key: key, hostZ: hostZ, nx: nx, ny: ny, cells: cells, cellFac: cellFac, excl: excl, we: we };
+    this.fn = { F: F, NZ: NZ, list: list, ids: list.map(function (f) { return f.id; }), key: key, hostZ: hostZ, nx: nx, ny: ny, cells: cells, cellFac: cellFac, ringFac: ringFac, inner: inner, excl: excl, we: we };
     return this.fn;
   };
   Model.prototype.facIndex = function (id) { return this.fn ? this.fn.ids.indexOf(id) : -1; };
@@ -442,7 +722,7 @@
     const fn = this.buildFacNodes(), excl = fn.excl;
     const A = this.zA, hub = this.zHub;
     for (let z = 0; z < Z; z++) {
-      let p = 0, j = 0, a = 0, sx = 0, sy = 0, sw = 0, aSc = 0, aSh = 0, aMd = 0, aLz = 0, h = 0;
+      let p = 0, j = 0, a = 0, sx = 0, sy = 0, sw = 0, aSc = 0, aSh = 0, aMd = 0, aLz = 0, h = 0, bw = -1, bc = this.zoneCells[z][0];
       for (const c of this.zoneCells[z]) {
         const pc = city.pop[c], jc = city.jobs[c];
         p += pc; j += jc;
@@ -456,9 +736,10 @@
           aLz += (city.isPark[c] || L === LU.PARK ? 400 * city.landFrac[c] : 0) + (L === LU.HILL ? 60 * city.landFrac[c] : 0) + (com ? jc * 0.25 : 0) + pc * 0.12 + (L === LU.LANDMARK ? 200 : 0);
         }
         const w = pc + jc;
+        if (w > bw) { bw = w; bc = c; }
         sx += w * ((c % CFG.W) + 0.5); sy += w * (((c / CFG.W) | 0) + 0.5); sw += w;
       }
-      this.zPop[z] = p; this.zJobs[z] = j; this.zAttr[z] = a;
+      this.zPop[z] = p; this.zJobs[z] = j; this.zAttr[z] = a; this.zReg[z] = city.region[bc];   // 小区所属片区：人口与岗位最多的格所在片区（历史阶段的出行走廊用）
       A[z] = aSc; A[Z + z] = aSh; A[2 * Z + z] = aMd; A[3 * Z + z] = aLz; hub[z] = h;
       const zi = z % this.ZW, zj = (z / this.ZW) | 0;
       this.zCx[z] = sw > 1 ? sx / sw : zi * CFG.ZONE + CFG.ZONE / 2;
@@ -493,8 +774,18 @@
   Model.prototype.buildDemandGen = function* () {
     const Z = this.Z, y = this.year, c = CFG.choice, T = CFG.trips, Fac = CM.Fac;
     const fn = this.fn, F = fn.F, NZ = fn.NZ;
-    const L1 = U.interp(c.distDecayHW, y), L2 = U.interp(c.distDecayHO, y);
+    // 历史发展阶段（v2.2，eras.js）：各目的出行强度、通勤与生活出行的距离、枢纽接驳与区域间走廊随年代平滑变化
+    const ED = CM.Eras && CM.Eras.enabled() ? CM.Eras.demand(y) : null;
+    const L1 = U.interp(c.distDecayHW, y) * (ED ? ED.decayHW : 1), L2 = U.interp(c.distDecayHO, y) * (ED ? ED.decayHO : 1);
     const rate = this.tripRates(y);
+    if (ED) for (let p = 0; p < 5; p++) rate[p] *= ED.rate[p];
+    // 走廊：片区对之间的去向倍数（对称），作用于通勤与购物；没有走廊时为 null，计算与旧版相同
+    let corr = null, RN = 0;
+    if (ED && ED.corr.length) {
+      const regs = this.city.regions, at = new Map(); regs.forEach(function (r, k) { at.set(r.id, k); });
+      RN = regs.length; corr = new Float32Array(RN * RN).fill(1);
+      for (const cr of ED.corr) { if (!at.has(cr.a) || !at.has(cr.b)) continue; const a = at.get(cr.a), b = at.get(cr.b); corr[a * RN + b] = cr.f; corr[b * RN + a] = cr.f; }
+    }
     const Ls = [L1, L2 * T.decay.sc, L2 * T.decay.sh, L2 * T.decay.md, L2 * T.decay.lz];
     const kmPerCell = CFG.CELL_M / 1000 * 1.2;
     // 各目的的小区吸引（工作 = 岗位）；重要设施按参考比例取得吸引量，并从所在小区扣除（地标类设施的场地已在 buildZones 中排除）
@@ -503,6 +794,10 @@
     for (let p = 1; p < 5; p++) for (let z = 0; z < Z; z++) { A[p][z] = this.zA[(p - 1) * Z + z]; sumA[p] += A[p][z]; }
     const fA = [null, new Float64Array(F), new Float64Array(F), new Float64Array(F), new Float64Array(F)];
     const fL = new Float64Array(F), hubs = [];
+    // 各目的的设施吸引合计不超过 trips.facCap（放大设施吸引后，避免设施占去该目的的大部分出行）
+    const fSum = [0, 0, 0, 0, 0], capK = [1, 1, 1, 1, 1], FCAP = T.facCap || 1;
+    for (let k = 0; k < F; k++) { const f = fn.list[k]; if (f.T.hub) continue; const s = Fac.share(f, y); for (let p = 1; p < 5; p++) fSum[p] += s * (f.p[PK[p]] || 0); }
+    for (let p = 1; p < 5; p++) if (fSum[p] > FCAP) capK[p] = FCAP / fSum[p];
     for (let k = 0; k < F; k++) {
       const f = fn.list[k];
       if (f.T.hub) { hubs.push(k); continue; }
@@ -510,14 +805,14 @@
       const s = Fac.share(f, y);
       for (let p = 1; p < 5; p++) {
         const fr = f.p[PK[p]] || 0; if (!fr) continue;
-        const a = s * fr * sumA[p];
+        const a = s * fr * capK[p] * sumA[p];
         fA[p][k] = a;
         if (f.lmK < 0) { const hz = fn.hostZ[Z + k]; A[p][hz] = Math.max(A[p][hz] * 0.3, A[p][hz] - a); }
       }
     }
     // 枢纽接驳：城市一端按人口与岗位（含商务、酒店）分布，距离衰减较弱
     const Lh = L1 * T.decay.hub, hubTours = hubs.map(function (k) {
-      const f = fn.list[k], out = new Float64Array(Z), tot = Fac.pax(f, y) / 2;
+      const f = fn.list[k], out = new Float64Array(Z), tot = Fac.pax(f, y) / 2 * (ED ? ED.hub : 1);
       let s = 0;
       for (let z = 0; z < Z; z++) {
         if (this.zHub[z] <= 0 || z === fn.hostZ[Z + k]) continue;
@@ -537,7 +832,10 @@
     let ob = this._odBufs[this._odFlip];
     const per = 240 + F + hubs.length;
     if (!ob || ob.cap < Z * 120) ob = this._odBufs[this._odFlip] = odBuffer(Z * 160);
-    const D = { Z: Z, F: F, A: A, Ls: Ls, fA: fA, fL: fL, rate: rate, rw: rate.map(function (r) { return r / rsum; }), zPop: this.zPop, zJobs: this.zJobs, zAsum: zAsum,
+    // 距离衰减表（见 demandOrigin）：覆盖整张地图的对角距离，步长 5 m
+    const LH = 0.005, nT = Math.ceil(Math.hypot(CFG.W, CFG.H) * kmPerCell / LH) + 1;
+    const lut = { inv: 1 / LH, n: nT, t: Ls.map(function (Lk) { const t = new Float64Array(nT + 1); for (let k = 0; k <= nT; k++) t[k] = Math.exp(-k * LH / Lk); return t; }) };
+    const D = { Z: Z, F: F, A: A, Ls: Ls, lut: lut, corr: corr, RN: RN, zReg: this.zReg, fA: fA, fL: fL, rate: rate, rw: rate.map(function (r) { return r / rsum; }), zPop: this.zPop, zJobs: this.zJobs, zAsum: zAsum,
       zCx: this.zCx, zCy: this.zCy, nx: fn.nx, ny: fn.ny, hostZ: fn.hostZ, kmPerCell: kmPerCell, hubs: hubs, hubTours: hubTours,
       w: [new Float64Array(Z), new Float64Array(Z), new Float64Array(Z), new Float64Array(Z), new Float64Array(Z)],
       wf: [null, new Float64Array(F), new Float64Array(F), new Float64Array(F), new Float64Array(F)],
@@ -558,6 +856,7 @@
   // 使其不会读到新旧混合的小区/需求/路网状态；计算结果与一次性执行相同。
   Model.prototype.refreshCityGen = function* (C) {
     this.refreshing = true;
+    this.cancelPredict();
     try {
       this.buildZones();
       yield* this.buildDemandGen();
@@ -594,6 +893,7 @@
   };
   Model.prototype.syncRoad = function () {
     this.wake();
+    this.results=null;
     const old = this.road, nw = this.city.car;
     // Preserve legacy state remapping even for identical graphs with duplicate link keys.
     if (old === nw && this.roadData.uniqueKeys) { this.roadVer = this.city.roadVersion; this.version++; return; }
@@ -627,6 +927,24 @@
   };
 
   // ---------------- 地铁网络与步行接驳 ----------------
+  // 建设提示只查询现有步行图，不运行客流预测，也不占用求解器的堆和工作数组。
+  Model.prototype.walkTransferPreview = function (from, stations) {
+    const city=this.city,walk=city.walk,limit=CFG.walk.transferMaxM,scale=CFG.CELL_M,rules=limit+':'+scale;
+    if(this._hintWalk!==walk||this._hintRules!==rules){this._hintWalk=walk;this._hintRules=rules;this._hintTrees=new Map();}
+    const c=city.cellAt(from.x,from.y);if(c<0||!walk)return [];
+    const targets=stations.filter(s=>s.id!==from.id&&U.dist(from.x,from.y,s.x,s.y)*scale<=limit+150);if(!targets.length)return [];
+    const key=from.x+':'+from.y;let tree=this._hintTrees.get(key);
+    const corners=c=>{const i=c%city.W,j=(c/city.W)|0,v=j*city.VW+i;return [v,v+1,v+city.VW,v+city.VW+1];};
+    if(!tree){const dist=new Map(),pred=new Map(),heap=new U.Heap(64);
+      for(const v of corners(c)){if(!walk.deg[v])continue;const d=U.dist(from.x,from.y,city.vx[v],city.vy[v])*scale;if(d<=limit&&d<(dist.get(v)??Infinity)){dist.set(v,d);pred.set(v,-1);heap.push(d,v);}}
+      while(heap.n){const u=heap.pop(),du=heap.lastKey;if(du>dist.get(u))continue;for(let e=walk.start[u];e<walk.start[u+1];e++){const v=walk.to[e],nd=du+walk.len[e];if(nd<=limit&&nd<(dist.get(v)??Infinity)){dist.set(v,nd);pred.set(v,u);heap.push(nd,v);}}}
+      tree={dist,pred};if(this._hintTrees.size>=64)this._hintTrees.delete(this._hintTrees.keys().next().value);this._hintTrees.set(key,tree);
+    }
+    const links=[];for(const s of targets){const c2=city.cellAt(s.x,s.y);if(c2<0)continue;let best=Infinity,end=-1;
+      for(const v of corners(c2)){const d=(tree.dist.get(v)??Infinity)+U.dist(s.x,s.y,city.vx[v],city.vy[v])*scale;if(d<best){best=d;end=v;}}
+      if(best>limit)continue;const path=[];let v=end,guard=0;while(v>=0&&guard++<city.V){path.push([city.vx[v],city.vy[v]]);v=tree.pred.get(v)??-1;}path.reverse();path.unshift([from.x,from.y]);path.push([s.x,s.y]);links.push({station:s.id,metres:best,path});
+    }return links;
+  };
   // 小区与重要设施节点的接驳表：可步行到达的车站（最多 4 个）、覆盖比例与平均步行时间
   Model.prototype.computeAccess = function (C) {
     const city = this.city, walk = city.walk, VW = city.VW, N = C.stations.length;
@@ -639,8 +957,8 @@
     const pred = this._wpred || (this._wpred = new Int32Array(city.V));
     const touched = [];
     const heap = this.heap;
-    const zMap = new Map(), fMap = new Map();
-    const cellFac = fn ? fn.cellFac : null;
+    const zMap = new Map(), fMap = new Map(), eMap = new Map();
+    const cellFac = fn ? fn.cellFac : null, ringFac = fn ? fn.ringFac : null;
     const trees = [], accessible = new Uint8Array(N), catchPop = new Float32Array(N), transfers = [];
     const limit = Math.max(maxM, xferM) + 200;
     const treeRules = maxM + ':' + xferM + ':' + CFG.CELL_M;
@@ -700,6 +1018,8 @@
           // 重要设施的场地格：按格计（设施本身可能没有居住人口）
           const fl = cellFac && cellFac.get(c);
           if (fl) for (const f of fl) { let m = fMap.get(f); if (!m) { m = new Map(); fMap.set(f, m); } const e = m.get(k) || [0, 0]; e[0] += 1; e[1] += cd; m.set(k, e); }
+          const rl = ringFac && ringFac.get(c);
+          if (rl) for (const f of rl) { let m = eMap.get(f); if (!m) { m = new Map(); eMap.set(f, m); } const d0 = m.get(k); if (d0 === undefined || cd < d0) m.set(k, cd); }
           const w = city.pop[c] + city.jobs[c];
           if (w <= 0) continue;
           if (cd <= 750) catchPop[k] += city.pop[c];
@@ -756,6 +1076,37 @@
         arr.sort(function (a, b) { return a.w - b.w; });
         zl[Z + k] = arr.slice(0, 4);
       }
+      // 按出入口（场地边缘）计：能步行到达边缘的车站服务全部到访者，步行时间 = 到边缘 + 场内步行
+      let em = eMap.get(k);
+      // 步行网络没有通到场地（填海地、无街道的园区）时：直线距离 × 1.35 的绕行系数，不跨越水面，且在步行上限的八成以内
+      if ((!em || !em.size) && !fn.list[k].ext) {
+        const f = fn.list[k];
+        for (let s = 0; s < N; s++) {
+          if (C.serviced && !C.serviced[s]) continue;
+          const st = C.stations[s], d = U.dist(st.x, st.y, f.x, f.y) * CFG.CELL_M * 1.35 - Math.sqrt(fn.cells[k].length) * CFG.CELL_M * 0.5;
+          if (d > maxM * 0.8) continue;
+          let wet = false;
+          for (let t = 0.1; t < 0.95 && !wet; t += 0.1) if (city.waterDistAt(st.x + (f.x - st.x) * t, st.y + (f.y - st.y) * t) < 0) wet = true;
+          if (wet) continue;
+          if (!em) { em = new Map(); eMap.set(k, em); }
+          em.set(s, Math.max(60, d));
+        }
+      }
+      if (em && em.size) {
+        const arr = [], inn = fn.inner[k];
+        em.forEach(function (d, s) { arr.push({ s: s, w: (d + inn) / mpm, share: 1 }); });
+        arr.sort(function (a, b) { return a.w - b.w; });
+        zl[Z + k] = arr.slice(0, 4); zCov[Z + k] = 1; zWalk[Z + k] = arr[0].w;
+      }
+    }
+    // 地图外设施的接驳口（v2.1）：在地图边缘接驳口建成并接入线路的车站，直接服务该设施的全部接驳出行（步行约 1 分钟）
+    if (fn && CM.Fac) for (let k = 0; k < F; k++) {
+      const f = fn.list[k]; if (!f.ext) continue;
+      for (let s = 0; s < N; s++) {
+        if ((C.serviced && !C.serviced[s]) || !CM.Fac.isPortalStation(C.stations[s], f)) continue;
+        zCov[Z + k] = 1; zWalk[Z + k] = 1; zl[Z + k] = [{ s: s, w: 1, share: 1 }];
+        break;
+      }
     }
     // 人口覆盖率
     let pc = 0, pt = 0;
@@ -779,8 +1130,10 @@
       const rt = C.routes[r], n = rt.stIdx.length;
       const be = new Int32Array(n);
       for (let k = 0; k < n; k++) {
-        be[k] = push(rt.stIdx[k], platBase[r] + k, 0, r, k, 0, rt.stIdx[k], 0, 0, 0);
-        push(platBase[r] + k, rt.stIdx[k], 1, r, k, 0, rt.stIdx[k], 0, 0, 0);
+        // 天地换乘车站的非主站台层：上下车各多走一段垂直通道（其余车站为 0，与原模型相同）
+        const lv = rt.lvPen && rt.lvPen[k] ? mc.levelXferMin : 0;
+        be[k] = push(rt.stIdx[k], platBase[r] + k, 0, r, k, 0, rt.stIdx[k], 0, lv, 0);
+        push(platBase[r] + k, rt.stIdx[k], 1, r, k, 0, rt.stIdx[k], 0, lv, 0);
       }
       const nLegs = rt.legSec.length;
       const re = new Int32Array(nLegs * 2);
@@ -860,46 +1213,57 @@
   };
   // 设置正式运营网络
   Model.prototype.setNetwork = function (C, keepState) {
-    this.wake();
+    this.wake(keepState ? 1 : 4);
     const oldNet = this.net;
     const net = this.buildMetro(C);
-    if (oldNet && (oldNet.N !== net.N || oldNet.nE !== net.nE || oldNet.nNodes !== net.nNodes)) { this.liveBuf = {}; this.predBuf = {}; }
+    if(!oldNet||oldNet.N!==net.N||oldNet.R!==net.R||oldNet.nE!==net.nE)this.results=null;
+    if (oldNet && (oldNet.N !== net.N || oldNet.nE !== net.nE || oldNet.nNodes !== net.nNodes)) { this.liveBuf = {}; this.predBuf = {}; this.pipeBufs = null; this.predBufs = null; }
     for (const dt of DT) for (let p = 0; p < this.ctxs[dt].per.length; p++) {
       const P = this.ctxs[dt].per[p], old = { freq: P.freq, load: P.load, crowd: P.crowd, stIn: P.stIn, stOut: P.stOut, stXfer: P.stXfer, stBoard: P.stBoard, stDelay: P.stDelay };
       this.initMetroPer(P, net, p, old, oldNet);
     }
     this.net = net;
+    this.live=this.resultsFor(this.dayType);
     this.gen = null;
     // 车站日客流（stDaily）按旧网络统计，到下一次 computeDaily 前与新网络的车站编号不对应
     if (!keepState || !this.stDaily || this.stDaily.inn.length !== net.N) this.dailyStale = true;
-    if (!keepState) this.sinceChange = 0;
     this.version++;
   };
 
   // ---------------- 单时段迭代 ----------------
   Model.prototype.metroSkim = function* (net, P, p, prm, store) {
     const N = net.N, nn = net.nNodes, nE = net.nE;
+    let key=skimKeys.get(net);if(key===undefined){key=++skimSerial;skimKeys.set(net,key);}
     let work = store.work;
-    if (!work || work.cost.length !== nE || work.dist.length !== nn) work = store.work = { cost: new Float32Array(nE), tAct: new Float32Array(nE), dist: new Float64Array(nn), dtm: new Float32Array(nn), dkm: new Float32Array(nn) };
+    if (!work || work.cost.length !== nE || work.dist.length !== nn) { store.valid=false; work = store.work = { cost: new Float32Array(nE), tAct: new Float32Array(nE), dist: new Float64Array(nn), dtm: new Float32Array(nn), dkm: new Float32Array(nn) }; }
     const cost = work.cost, tAct = work.tAct;
-    cost.fill(0); tAct.fill(0);
+    let same=store.valid&&store.skimKey===key&&store.transferPen===prm.tpen;store.valid=false;
     for (let e = 0; e < nE; e++) {
+      const before=cost[e],beforeT=tAct[e];cost[e]=0;tAct[e]=0;
       const ty = net.eType[e];
       if (ty === 0) {
         const f = Math.max(0.5, P.freq[net.eRoute[e]]);
         const w = 60 / (2 * f);
         cost[e] = prm.waitW * w + prm.tpen + P.stDelay[net.eSt[e]];
         tAct[e] = w + P.stDelay[net.eSt[e]] * 0.5;
+        if (net.eT0[e] > 0) { cost[e] += prm.walkW * net.eT0[e]; tAct[e] += net.eT0[e]; }   // 天地换乘的垂直通道
+      } else if (ty === 1) {
+        if (net.eT0[e] > 0) { cost[e] = prm.walkW * net.eT0[e]; tAct[e] = net.eT0[e]; }
       } else if (ty === 2) {
         cost[e] = net.eT0[e] * P.crowd[e]; tAct[e] = net.eT0[e];
       } else if (ty === 3) {
         cost[e] = prm.walkW * net.eT0[e] + prm.opn; tAct[e] = net.eT0[e];
       }
+      if(before!==cost[e]||beforeT!==tAct[e])same=false;
     }
+    if(same){store.valid=true;return;}
+    // 中途取消的生成器不能把只完成一部分的最短路当成有效缓存。
+    store.valid=false;
     for (let s = 0; s < N; s++) {
       metroTree(net, cost, tAct, s, work, store, this.heap, prm.tpen);
       if ((s & 3) === 3) yield;
     }
+    store.skimKey=key;store.transferPen=prm.tpen;store.valid=true;
   };
 
   Model.prototype.allocSkimStore = function (net, buf) {
@@ -915,6 +1279,10 @@
     opts = opts || {};
     const buf = opts.buf || this.liveBuf;
     const prm = this.params();
+    const signature=P.solveSignature;
+    if(!signature||signature.net!==net||signature.od!==this.od||signature.year!==this.year||signature.fare!==Model.fareKey(this.fare)||signature.road!==this.roadVer){
+      P.solveSignature={net,od:this.od,year:this.year,fare:Model.fareKey(this.fare),road:this.roadVer};P.solveSteps=0;P.quiet=0;P.stable=false;P.reviewLimit=0;
+    }
     const Z = this.Z, od = this.od, fn = this.fn, F = fn.F, NZ = fn.NZ;
     const hostZ = fn.hostZ, nx = fn.nx, ny = fn.ny, facWe = fn.we;
     const N = net ? net.N : 0;
@@ -927,7 +1295,6 @@
     this.allocStatArrays(P);
     let store = null;
     const hasMetro = net && net.R > 0;
-    let stable = P.iters > 0;
     if (hasMetro) { store = this.allocSkimStore(net, buf); yield* this.metroSkim(net, P, p, prm, store); store.D.fill(0); }
     // ---- 方式选择 ----
     if (!buf.carDem || buf.carDem.length !== Z * Z) buf.carDem = new Float32Array(Z * Z);
@@ -954,20 +1321,25 @@
     if (choices) choices.fill(-2);
     const t = od.t;
     // 方式选择的输入与统计数组（每次迭代一次性组装，见 odOrigin）
-    const S = new Float64Array(14);
+    const S = new Float64Array(14), fp = Model.fareParams(this.fare), bg = CM.Eras ? CM.Eras.bg(this.year) : null;
     const K = { Z: Z, NZ: NZ, N: N, B: this.B, odStart: od.start, odDest: od.dest, t0: t[0], t1: t[1], t2: t[2], t3: t[3], t4: t[4], t5: t[5],
       co: co, cr: cr, cO: new Float64Array(NPK), cR: new Float64Array(NPK), facW: facW, facWe: facWe, odOk: od.F === F && od.key === fn.key,
       hostZ: hostZ, nx: nx, ny: ny, skT: skT, skK: skK, kmPerCell: kmPerCell,
       cpk: prm.cpk, park: prm.park, vot: prm.vot, carAccess: prm.carAccess, walkW: prm.walkW, occ: prm.occ, theta: prm.theta, fareFlat: this.fareFor(0),
+      fareKm0: fp.km0, fareStep: fp.step, fareInc: fp.inc, fareCap: fp.cap,
+      bgShare: bg ? bg.share : 0, bgSpeed: bg ? bg.speed : 1, bgWait: bg ? bg.wait : 0, bgFare: bg ? bg.fare : 0,
       acc: acc, accOk: !!accOk, choices: choices, gtS: store ? store.gt : null, tmS: store ? store.tm : null, kmS: store ? store.km : null, DS: store ? store.D : null,
       perMin: IND.perMin, capSh: IND.cap.sh, capLz: IND.cap.lz,
       carDem: carDem, hasCar: hasCar, S: S, pT: pT, pM: pM, zTrips: P.zTrips, zMetro: P.zMetro, zAccess: P.zAccess, zJ: this.zJobs, blocks: blocks, desTot: P.desTot, desMetro: P.desMetro,
       zDest: P.zDest, zDestM: P.zDestM, fIn: P.fIn, fInM: P.fInM, fOut: P.fOut, fOutM: P.fOutM, fP: P.fP };
-    let cnt = 0;
-    for (let i = 0; i < Z; i++) {
-      odOrigin(K, i);
-      if ((++cnt & 7) === 0) yield;
+    let odDone = false;
+    if (!this.syncSolve && OdPool.ready()) {
+      const self = this, isPred = !!opts.pred || buf === this.predBuf, ep = isPred ? this.predEpoch : this.epoch;
+      const req = OdPool.submit(this, K, od, fn, function () { return !self.retired && (isPred ? self.predEpoch === ep : self.epoch === ep); });
+      while (!req.done && !req.failed) yield WAIT;
+      odDone = !req.failed;
     }
+    if (!odDone) for (let i = 0; i < Z; i++) { odOrigin(K, i); if ((i & 7) === 7) yield; }
     st.trips = S[0]; st.metro = S[1]; st.car = S[2]; st.timeSum = S[3]; st.carTime = S[4]; st.metroTime = S[5]; st.fare = S[6]; st.metroPkm = S[7]; st.carPkm = S[8]; st.vkt = S[9];
     st.commTrips = S[10]; st.commTime = S[11]; st.ind = S[12]; st.indM = S[13];
     for (let k = 0; k < NPK; k++) { st[TKEY[k]] = pT[k]; st[MKEY[k]] = pM[k]; }
@@ -983,7 +1355,7 @@
         if ((s & 7) === 7) yield;
       }
       const lam = opts.metroLam || 0.5;
-      for (let e = 0; e < nE; e++) { const old = P.load[e]; P.load[e] = old * (1 - lam) + load[e] * lam; if (old !== P.load[e]) stable = false; }
+      for (let e = 0; e < nE; e++) { const old = P.load[e]; P.load[e] = old * (1 - lam) + load[e] * lam; }
       const stBoard = work.stBoard, walkIn = work.walkIn;
       stBoard.fill(0); walkIn.fill(0);
       for (let e = 0; e < nE; e++) {
@@ -993,7 +1365,7 @@
       }
       const mc = CFG.metro;
       for (let s = 0; s < N; s++) {
-        const oldIn = P.stIn[s], oldOut = P.stOut[s], oldDelay = P.stDelay[s];
+
         P.stIn[s] = P.stIn[s] * (1 - lam) + stIn[s] * lam;
         P.stOut[s] = P.stOut[s] * (1 - lam) + stOut[s] * lam;
         P.stBoard[s] = stBoard[s];
@@ -1002,7 +1374,7 @@
         const ratio = (P.stIn[s] + P.stOut[s] + P.stXfer[s]) / cap;
         const dl = U.clamp((ratio - 0.8) * 10, 0, 12);
         P.stDelay[s] = P.stDelay[s] * 0.5 + dl * 0.5;
-        if (oldIn !== P.stIn[s] || oldOut !== P.stOut[s] || oldDelay !== P.stDelay[s]) stable = false;
+
       }
       // 自动配车：发车频率取「线路最低服务水平」（按站数、站距）与「最大断面客流所需」中的较大者
       for (let r = 0; r < net.R; r++) {
@@ -1011,7 +1383,7 @@
         for (let q = 0; q < re.length; q++) if (P.load[re[q]] > mx) mx = P.load[re[q]];
         const need = U.clamp(Math.max(mx / (rt.cap * mc.targetLF), Model.serviceFloor(rt, p)), 1, mc.fMax);
         const oldFreq = P.freq[r]; P.freq[r] = oldFreq * 0.55 + need * 0.45;
-        if (oldFreq !== P.freq[r]) stable = false;
+
         for (let q = 0; q < re.length; q++) {
           const e = re[q];
           const LF = P.load[e] / Math.max(1, P.freq[r] * rt.cap);
@@ -1019,106 +1391,223 @@
           if (LF > 0.6) cf = 1 + 0.25 * Math.min(1, (LF - 0.6) / 0.4);
           if (LF > 1) cf = 1.25 + 1.6 * (LF - 1);
           const oldCrowd = P.crowd[e]; P.crowd[e] = Math.min(3.5, oldCrowd * 0.5 + cf * 0.5);
-          if (oldCrowd !== P.crowd[e]) stable = false;
+
           if (LF > 1) st.crowdPkm += P.load[e] * net.eKm[e];
         }
       }
     }
-    // ---- 汽车分配 ----
-    const road = this.road, nN = road.nN, nA = road.nA;
+    // ---- 汽车分配（起点分块并行，见 carOriginRow；工作线程不可用或同步求解时在主线程逐起点计算，结果相同） ----
+    const road = this.road, nA = road.nA, G = carGraph(this);
     let work = buf.roadWork;
-    if (!work || work.aux.length !== nA || work.dist.length !== nN) work = buf.roadWork = { aux: new Float32Array(nA), dist: new Float64Array(nN), dkm: new Float32Array(nN), pred: new Int32Array(nN), order: new Int32Array(nN), accN: new Float64Array(nN) };
+    if (!work || work.G !== G) { work = buf.roadWork = carWork(G); work.G = G; work.aux = new Float32Array(nA); work.auxB = new Float32Array(nA); }
     const aux = work.aux;
     aux.fill(0); work.accN.fill(0);
-    const rd = this.roadData, connStart = rd.start;
-    const zPop = this.zPop, fullSkim = !!opts.fullSkim, iters = P.iters;
-    const cw = { road: road, rd: rd, time: P.arcTime, work: work, heap: this.heap, skT: skT, skK: skK, carDem: carDem, Z: Z };
+    const connStart = this.roadData.start;
+    const zPop = this.zPop, fullSkim = !!opts.fullSkim, iters = P.iters, time = P.arcTime;
+    const runList = [];
     for (let o = 0; o < Z; o++) {
-      const c0 = connStart[o], c1 = connStart[o + 1];
-      if (c0 === c1) continue;
+      if (connStart[o] === connStart[o + 1]) continue;
       if (!hasCar[o] && !(fullSkim && zPop[o] > 0) && iters > 0) continue;
-      if (!carOrigin(cw, o, stable)) stable = false;
-      if ((o & 1) === 1) yield;
+      runList.push(o);
     }
-    const lam = P.iters === 0 ? 1 : (opts.lam || CFG.road.msa);
+    const nRun = runList.length, bounds = [];
+    for (let b = 0; b <= CAR_BLOCKS; b++) bounds.push(Math.floor(b * nRun / CAR_BLOCKS));
+    let res = null;
+    if (nRun && !this.syncSolve && CarPool.ready()) {
+      const self = this, isPred = !!opts.pred || buf === this.predBuf, ep = isPred ? this.predEpoch : this.epoch, blocks = [];
+      for (let b = 0; b < CAR_BLOCKS; b++) {
+        const os = Int32Array.from(runList.slice(bounds[b], bounds[b + 1])), dem = new Float32Array(os.length * Z);
+        for (let i = 0; i < os.length; i++) dem.set(carDem.subarray(os[i] * Z, os[i] * Z + Z), i * Z);
+        blocks.push({ origins: os, dem: dem });
+      }
+      const req = CarPool.submit(G, time, blocks, function () { return !self.retired && (isPred ? self.predEpoch === ep : self.epoch === ep); });
+      while (req.remaining > 0 && !req.failed) yield WAIT;
+      res = req.res;
+    }
+    // 按块顺序合并：行程时间表逐行写回（不可达的保留原值），路段流量逐块相加；缺少的块（工作线程失败）在主线程补算
+    // 正、有限道路成本下，可达性只依赖拓扑。按道路版本缓存有限连续区间，以批量复制代替逐元素比较。
+    const rowSpans=this.roadData.rowSpans||(this.roadData.rowSpans=new Array(Z));
+    const merge = function (o, rT, rK) {
+      const row=o*Z;let spans=rowSpans[o];
+      if(!spans){spans=[];for(let d=0;d<Z;){if(rT[d]!==rT[d]){d++;continue;}const a=d;while(d<Z&&rT[d]===rT[d])d++;spans.push(a,d);}rowSpans[o]=spans;}
+      for(let i=0;i<spans.length;i+=2){const a=spans[i],b=spans[i+1];skT.set(rT.subarray(a,b),row+a);skK.set(rK.subarray(a,b),row+a);}
+    };
+    for (let b = 0; b < CAR_BLOCKS; b++) {
+      const i0 = bounds[b], i1 = bounds[b + 1];
+      if (i0 === i1) continue;
+      const r = res && res[b];
+      let auxB;
+      if (r) {
+        for (let i = i0; i < i1; i++) merge(runList[i], r.rowsT.subarray((i - i0) * Z, (i - i0 + 1) * Z), r.rowsK.subarray((i - i0) * Z, (i - i0 + 1) * Z));
+        auxB = r.aux;
+      } else {
+        auxB = work.auxB; auxB.fill(0);
+        for (let i = i0; i < i1; i++) {
+          const o = runList[i];
+          carOriginRow(G, time, o, carDem, o * Z, work, skT, skK, o * Z, auxB);
+          if ((i & 1) === 1) yield;
+        }
+      }
+      for (let a = 0; a < nA; a++) aux[a] += auxB[a];
+      yield; // 分块合并也遵守主线程时间切片，避免一次吞掉所有工作线程的结果。
+    }
     const A = CFG.road.bprA, capF = this.capF || 1;
+    // 弹性需求先按总量投影，再对实际 BPR 成本做线搜索。固定 0.4 混合会使近似等价道路反复抢走整股客流。
+    let demand=0;for(let k=0;k<carDem.length;k++)demand+=carDem[k];
+    const scale=P.demandTotal>1e-6?demand/P.demandTotal:1;
+    const travel=(a,v)=>{const x=v/(road.arcCap[a]*capF);return road.arcT0[a]*Math.min(8,1+A*x*x*x*x);};
+    let lam=1;
+    if(P.iters>0&&demand>0){
+      let line=buf.lineSearch;if(!line||line.base.length!==nA)line=buf.lineSearch={base:new Float64Array(nA),delta:new Float64Array(nA),active:new Int32Array(nA)};
+      let count=0;for(let a=0;a<nA;a++){const base=P.arcVol[a]*scale,delta=aux[a]-base;line.base[a]=base;line.delta[a]=delta;if(delta!==0||!(road.arcCap[a]*capF>0)||!Number.isFinite(road.arcT0[a]))line.active[count++]=a;}
+      const derivative=t=>{let v=0;for(let i=0;i<count;i++){const a=line.active[i],base=line.base[a],delta=line.delta[a];v+=delta*travel(a,base+delta*t);}return v;};
+      const first=derivative(0);
+      if(first>=0){
+        // 改变 OD 分布后的旧流场不一定可行，不能因成本方向为正就永久停在旧流量上。
+        let total=0;for(let a=0;a<nA;a++)total+=P.arcVol[a]*P.arcTime[a];
+        lam=first>Math.max(1,total)*.001?Math.min(.2,1/(P.solveSteps+1)):0;
+      }
+      else if(derivative(1)>0){let lo=0,hi=1;for(let k=0;k<20;k++){const mid=(lo+hi)/2;if(derivative(mid)>0)hi=mid;else lo=mid;}lam=(lo+hi)/2;}
+    }
+    let timeError=0,timeWeight=0,cost=0,gap=0;
+    const previousMetro=P.stats?P.stats.metro:0;
     for (let a = 0; a < nA; a++) {
       const oldVol = P.arcVol[a], oldTime = P.arcTime[a];
-      const v = oldVol * (1 - lam) + aux[a] * lam;
+      const v = oldVol * scale * (1 - lam) + aux[a] * lam;
       P.arcVol[a] = v;
       const x = v / (road.arcCap[a] * capF);
       P.arcTime[a] = road.arcT0[a] * Math.min(8, 1 + A * x * x * x * x);
-      if (oldVol !== P.arcVol[a] || oldTime !== P.arcTime[a]) stable = false;
+
       st.congNum += v * road.arcLen[a] * (P.arcTime[a] / road.arcT0[a]);
       st.congDen += v * road.arcLen[a];
+      if(Math.max(v,oldVol)>5){const w=Math.max(v,oldVol)*road.arcLen[a],e=(P.arcTime[a]-oldTime)/Math.max(road.arcT0[a],oldTime);timeError+=w*e*e;timeWeight+=w;}
+      cost+=oldVol*scale*oldTime;gap+=(oldVol*scale-aux[a])*oldTime;
     }
+    P.demandTotal=demand;P.solveSteps=(P.solveSteps||0)+1;
+    P.error={time:Math.sqrt(timeError/Math.max(1,timeWeight)),gap:Math.abs(gap)/Math.max(1,cost),metro:Math.abs(st.metro-previousMetro)/Math.max(100,st.metro),demand:Math.abs(scale-1)};
+    const e=P.error,good=P.solveSteps>=6&&e.time<.015&&e.gap<.005&&e.metro<.003&&e.demand<.002;
+    P.quiet=good?(P.quiet||0)+1:0;
     P.iters++;
     // 统计平滑（显示更平稳）
     if (P.stats && !opts.noSmooth) {
       const o = P.stats;
       for (const k in st) if (o[k] !== undefined) st[k] = o[k] * 0.4 + st[k] * 0.6;
     }
-    if (stable && P.stats) for (const k in st) if (st[k] !== P.stats[k]) { stable = false; break; }
     P.stats = st;
     P.facKey = fn.key;   // 数组下标只属于本次迭代使用的设施表，不能按新的设施顺序解读。
-    P.stable = stable;
+    P.stable=P.quiet>=3;
   };
 
-  // ---------------- 实时求解循环 ----------------
-  // 工作日与周末两套结果都保持收敛：先算当天的日类型，再算另一类；两套都到达精确不动点后停止
-  Model.prototype.liveLoop = function* () {
+  // ---------------- 时段流水线（v2.1） ----------------
+  // 同一轮里各时段（工作日 / 周末 × 4）的迭代互不依赖：每个时段只读写自己的状态与独占的缓冲区，共享的城市、需求与路网只读。
+  // 有工作线程时最多 PIPE_W 个时段交错执行，结果与逐个执行逐位相同；同步求解或没有工作线程时逐个执行（只用一套缓冲区）。
+  // start(job, buf) 返回该任务的生成器，onDone(job, 返回值) 在任务完成时调用（按完成顺序）。所有任务都在等工作线程时让出 WAIT
+  Model.prototype.pipeline = function* (jobs, start, onDone, pred) {
+    if(!jobs.length)return;
+    const width = this.syncSolve || !CarPool.ready() ? 1 : Math.min(PIPE_W, jobs.length);
+    const bufs = pred ? (this.predBufs || (this.predBufs = [this.predBuf])) : (this.pipeBufs || (this.pipeBufs = [this.liveBuf]));
+    const act = [], free = [];
+    for (let s = width - 1; s >= 0; s--) free.push(s);
+    let next = 0;
     for (;;) {
-      const order = this.dayType === 'we' ? ['we', 'wd'] : ['wd', 'we'];
-      for (const dt of order) {
-        const ctx = this.ctxs[dt];
-        for (let p = 0; p < NP; p++) {
-          yield* this.iterate(this.net, ctx.per[p], p, { fullSkim: this.sinceChange < 1 });
-          this.computeDaily();
-        }
+      while (act.length < width && next < jobs.length) {
+        const slot = free.pop(), buf = bufs[slot] || (bufs[slot] = {});
+        act.push({ job: jobs[next], slot: slot, gen: start(jobs[next], buf) });
+        next++;
       }
-      this.cycles++; this.sinceChange++;
-      const allStable = DT.every(function (dt) { return this.ctxs[dt].per.every(function (P) { return P.stable; }); }, this);
-      this.quietCycles = allStable ? (this.quietCycles || 0) + 1 : 0;
-      // Stop only at an exact floating-point fixed point, after two complete
-      // unchanged cycles. Explicit solves and all input changes still run fully.
-      if (this.quietCycles >= 2) {
-        this.settled = true;
-        this.settledAt = { year: this.year, fare: this.fare.flat, city: this.city.version, road: this.city.roadVersion, net: this.net, od: this.od };
-        yield;
+      if (!act.length) return;
+      let waiting = 0;
+      for (let i = 0; i < act.length; i++) {
+        const a = act[i], r = a.gen.next();
+        if (r.done) { act.splice(i--, 1); free.push(a.slot); if (onDone) onDone(a.job, r.value); }
+        else if (r.value === WAIT) waiting++;
+        else yield; // 一次只推进一个时段的计算片段，避免 PIPE_W 倍的预算超支。
       }
+      if (act.length || next < jobs.length) yield act.length && waiting === act.length ? WAIT : undefined;
+    }
+  };
+
+  // Lightweight updates: fixed, deterministic round budgets. Strict stability remains
+  // a separate property for threshold-sensitive tasks; it never blocks ordinary months.
+  Model.prototype.periodCurrent=function(P){const s=P.solveSignature;return !!s&&s.net===this.net&&s.od===this.od&&s.year===this.year&&s.fare===Model.fareKey(this.fare)&&s.road===this.roadVer;};
+  Model.prototype.periodUsable=function(P){return this.periodCurrent(P)&&P.solveSteps>=1&&!!P.stats&&P.facKey===this.fn.key;};
+  Model.prototype.needsWork=function(P,limit){return !this.periodCurrent(P)||(!P.stable&&(P.solveSteps||0)<limit);};
+  Model.prototype.trafficReady=function(){return !this.refreshing&&!this.solving&&!!this.results&&DT.every(dt=>this.ctxs[dt].per.every(P=>this.periodUsable(P)));};
+  Model.prototype.basisPeriods=function(basis){
+    const days=basis==='wdAM'||basis==='wdPeak'||basis==='wd'?['wd']:basis==='we'?['we']:DT;
+    return days.flatMap(dt=>this.ctxs[dt].per.filter((P,p)=>basis!=='wdAM'||p===0));
+  };
+  Model.prototype.trafficVerified=function(basis){return this.trafficReady()&&this.basisPeriods(basis).every(P=>P.stable);};
+  Model.prototype.reviewComplete=function(basis){return this.trafficReady()&&this.basisPeriods(basis).every(P=>P.stable||(P.reviewLimit===12&&P.solveSteps>=12));};
+  Model.prototype.requestReview=function(basis){
+    let queued=false;for(const P of this.basisPeriods(basis))if(!P.stable&&P.reviewLimit!==12){P.reviewLimit=12;queued=true;}
+    if(queued)this.wake(this.solveLimit||2);return queued;
+  };
+  Model.prototype.hasReviewWork=function(){return DT.some(dt=>this.ctxs[dt].per.some(P=>P.reviewLimit&&this.needsWork(P,P.reviewLimit)));};
+  Model.prototype.finishTraffic=function(){
+    this.computeDaily();this.gen=null;this.settled=true;
+    this.settledAt={year:this.year,fare:Model.fareKey(this.fare),city:this.city.version,road:this.city.roadVersion,net:this.net,od:this.od};
+  };
+  Model.prototype.liveLoop = function* () {
+    const self=this;
+    for(;;){
+      const order=this.dayType==='we'?['we','wd']:['wd','we'],jobs=[];
+      for(const dt of order)for(let p=0;p<NP;p++){const P=this.ctxs[dt].per[p],limit=Math.max(this.solveLimit||2,this.periodCurrent(P)?P.reviewLimit||0:0);if(this.needsWork(P,limit))jobs.push([dt,p]);}
+      if(!jobs.length){this.finishTraffic();return;}
+      yield* this.pipeline(jobs,(j,buf)=>self.iterate(self.net,self.ctxs[j[0]].per[j[1]],j[1],{fullSkim:!self.periodCurrent(self.ctxs[j[0]].per[j[1]]),noSmooth:true,buf}));
+      this.cycles++;this.computeDaily();if(this.reviewObserver)this.reviewObserver();yield;
     }
   };
   Model.prototype.step = function (budget) {
-    if (this.refreshing) return;
+    if (this.refreshing || this.solving) return;
     const t0 = performance.now();
     if (this.predJob) {
       const pj = this.predJob;
-      while (performance.now() - t0 < budget * 2.2) {
+      while (performance.now() - t0 < budget * 1.2) {
         const r = pj.gen.next();
         if (r.done) { this.predJob = null; pj.done(r.value); break; }
+        if (r.value === WAIT) break;
       }
       return;
     }
     if (this.settled) {
       const at = this.settledAt;
-      if (at.year === this.year && at.fare === this.fare.flat && at.city === this.city.version && at.road === this.city.roadVersion && at.net === this.net && at.od === this.od) return;
+      if (at.year === this.year && at.fare === Model.fareKey(this.fare) && at.city === this.city.version && at.road === this.city.roadVersion && at.net === this.net && at.od === this.od) return;
       this.wake();
     }
     if (!this.gen) this.gen = this.liveLoop();
-    while (!this.settled && performance.now() - t0 < budget) this.gen.next();
+    while (!this.settled && performance.now() - t0 < budget) { if (this.gen.next().value === WAIT) break; }
   };
-  // 快速收敛（读档、跳月等场合），同步执行；dts 为要求解的日类型（默认工作日与周末）
   Model.prototype.solveNow = function (cycles, dts) {
-    const g = this.solveGen(cycles, dts);
-    for (let r = g.next(); !r.done; r = g.next()) { /* run */ }
+    const g = this.solveGen(cycles, dts);this.syncSolve=true;
+    try { for(let r=g.next();!r.done;r=g.next()){ /* Drain synchronously; workers are disabled here. */ } }finally{this.syncSolve=false;}
   };
-  Model.prototype.solveGen = function* (cycles, dts) {
-    this.wake();
-    dts = dts || DT;
-    for (let c = 0; c < cycles; c++) for (const dt of dts) for (let p = 0; p < NP; p++) { yield* this.iterate(this.net, this.ctxs[dt].per[p], p, { fullSkim: c === 0 }); }
-    this.computeDaily();
-    this.gen = null;
+  Model.prototype.solveGen=function* (cycles,dts){
+    cycles=Math.max(1,Math.min(12,cycles||2));this.wake(cycles);dts=dts||DT;
+    const self=this;this.solving=(this.solving||0)+1;
+    try{
+      for(let c=0;c<cycles;c++){
+        const jobs=[];for(const dt of dts)for(let p=0;p<NP;p++)if(this.needsWork(this.ctxs[dt].per[p],cycles))jobs.push([dt,p]);
+        if(!jobs.length)break;
+        yield* this.pipeline(jobs,(j,buf)=>self.iterate(self.net,self.ctxs[j[0]].per[j[1]],j[1],{fullSkim:c===0,buf,noSmooth:true}));
+        this.cycles++;
+        if(this.onSolveProgress)this.onSolveProgress((c+1)/cycles);   // 载入界面的进度（每完成一轮）
+      }
+      if(DT.every(dt=>this.ctxs[dt].per.every(P=>this.periodUsable(P))))this.finishTraffic();else{this.computeDaily();this.gen=null;}
+    }finally{this.solving--;}
   };
+  Model.prototype.solveReviewsGen=function*(){
+    const self=this;this.solving=(this.solving||0)+1;
+    try{
+      for(let c=0;c<12;c++){
+        const jobs=[];for(const dt of DT)for(let p=0;p<NP;p++){const P=this.ctxs[dt].per[p];if(P.reviewLimit&&this.needsWork(P,P.reviewLimit))jobs.push([dt,p]);}
+        if(!jobs.length)break;
+        yield* this.pipeline(jobs,(j,buf)=>self.iterate(self.net,self.ctxs[j[0]].per[j[1]],j[1],{buf,noSmooth:true}));this.cycles++;if(this.reviewObserver){this.computeDaily();this.reviewObserver();}
+      }
+      this.finishTraffic();
+    }finally{this.solving--;}
+  };
+  Model.prototype.resultsFor=function(dt){return this.results&&this.results[dt==='we'?'we':'wd']||this.ctxs[dt==='we'?'we':'wd'];};
 
   // ---------------- 汇总指标 ----------------
   Model.prototype.aggregate = function (perList, net) {
@@ -1215,6 +1704,9 @@
     let mx = 0; for (let z = 0; z < this.Z; z++) if (za[z] > mx) mx = za[z];
     this.zoneAccessNorm = new Float32Array(this.Z);
     if (mx > 0) for (let z = 0; z < this.Z; z++) this.zoneAccessNorm[z] = Math.sqrt(za[z] / mx);
+    const copy=P=>{const o={};for(const k of ['arcVol','arcTime','freq','load','stIn','stOut','stXfer','stDelay','stBoard','zTrips','zMetro','desTot','desMetro'])if(P[k])o[k]=P[k].slice();o.stats=P.stats;o.stable=P.stable;return o;};
+    this.results={wd:{per:this.ctxs.wd.per.map(copy)},we:{per:this.ctxs.we.per.map(copy)}};
+    this.live=this.resultsFor(this.dayType);
     this.version++;
   };
   // 设施启停期间只提供与当前设施表对应且四时段均已完成的数据。
@@ -1257,7 +1749,7 @@
     return { p0: p0, w0: w0, s0: prof / this.pMean[p0], p1: p1, w1: w1, s1: prof / this.pMean[p1], svc: (m >= 360 || m < 5) ? 1 : 0, prof: prof };
   };
   Model.prototype.arcVolAt = function (a, W) {
-    const P0 = this.live.per[W.p0], P1 = this.live.per[W.p1];
+    const live=this.resultsFor(this.dayType),P0=live.per[W.p0],P1=live.per[W.p1];
     return P0.arcVol[a] * W.w0 * W.s0 + P1.arcVol[a] * W.w1 * W.s1;
   };
   Model.prototype.arcRatioAt = function (a, W) {
@@ -1299,40 +1791,70 @@
     return (P0.load[e] * W.w0 * W.s0 + P1.load[e] * W.w1 * W.s1) * W.svc;
   };
 
+  // 任务、开通效果和图层共用同一批已发布结果。
+  Model.prototype.zoneTraffic=function(z){
+    const P=this.resultsFor('wd').per[0],trips=P.zTrips[z]||0,metro=P.zMetro[z]||0;
+    return{trips,metro,car:Math.max(0,trips-metro),carShare:trips>0?1-metro/trips:1};
+  };
+  Model.prototype.zoneOpportunity=function(z){
+    const net=this.net,acc=net&&net.acc,od=this.od;if(!acc||!od||!this.trafficReady())return 0;
+    // 只承诺现有可步行接入且已连通的地铁网络能服务的那部分需求，不把过境车流全算成本地可替代出行。
+    if(!this._opportunity||this._opportunity.net!==net){
+      const roots=Array.from({length:net.N},(_,i)=>i),find=i=>{while(roots[i]!==i)i=roots[i];return i;};
+      for(const r of net.C.routes)for(const st of r.stIdx)roots[find(st)]=find(r.stIdx[0]);
+      for(const tr of acc.transfers)roots[find(tr.a)]=find(tr.b);
+      this._opportunity={net,roots:roots.map(find)};
+    }
+    const lo=acc.zl[z];if(!lo)return 0;const connected=new Set(lo.map(a=>this._opportunity.roots[a.s]));let eligible=0;
+    for(let k=od.start[z];k<od.start[z+1];k++){
+      const d=od.dest[k],ld=acc.zl[d];if(!ld||!ld.some(a=>connected.has(this._opportunity.roots[a.s])))continue;
+      let flow=0;for(let p=0;p<NPK;p++)flow+=(od.t[p][k]||0)*CFG.trips.split.wd[PK[p]].o[0]/this.pHours[0];
+      eligible+=flow*(acc.zCov[z]||0)*(acc.zCov[d]||0);
+    }
+    return Math.max(0,eligible-this.zoneTraffic(z).metro);
+  };
+  Model.congestionLevel=function(r){return r<1.15?0:r<1.35?1:r<1.6?2:3;};
+  Model.congestionNames=['畅通','缓行','拥堵','严重拥堵'];
+
   // ---------------- 建设前预测 ----------------
   // 基于同一城市状态与票价，比较当前网络与草案网络（均从当前运行状态热启动，迭代次数相同）；工作日与周末分别计算
-  Model.prototype.predict = function (draftC, affectedLineIds, done) {
+  Model.prototype.predict = function (draftC, affectedLineIds, done, comparisonC) {
     const self = this;
     const gen = (function* () {
       const result = { conditions: { year: self.year, fare: Object.assign({}, self.fare) }, progress: 0 };
       self.predState = result;
-      const baseNet = self.net, draftNet = self.buildMetro(draftC);
+      const baseNet = comparisonC?self.buildMetro(comparisonC):self.net, draftNet = self.buildMetro(draftC);
       yield;
-      const runFor = function* (net, dt, prog) {
-        const per = [];
-        for (let p = 0; p < NP; p++) {
-          const L = self.ctxs[dt].per[p];
-          const P = {
-            arcVol: Float32Array.from(L.arcVol), arcTime: Float32Array.from(L.arcTime), skimT: Float32Array.from(L.skimT), skimK: Float32Array.from(L.skimK),
-            desTot: new Float32Array(self.B * self.B), desMetro: new Float32Array(self.B * self.B), zTrips: new Float32Array(self.Z), zMetro: new Float32Array(self.Z), zAccess: new Float32Array(self.Z),
-            stats: null, iters: Math.max(1, L.iters), dt: dt,
-          };
-          self.allocStatArrays(P);
-          self.initMetroPer(P, net, p, L, self.net);
-          const its = p === 3 ? 1 : 2;
-          for (let it = 0; it < its; it++) {
-            yield* self.iterate(net, P, p, { noSmooth: true, metroLam: it === 0 ? 0.7 : 0.6, buf: self.predBuf });
-            result.progress = prog + (p * 2 + it + 1) / 32;
-          }
-          // 仅保留结果所需
-          per.push({ stats: P.stats, freq: P.freq, load: P.load, stIn: P.stIn, stOut: P.stOut, stXfer: P.stXfer, arcVol: p === 0 ? P.arcVol : null, arcTime: p === 0 ? P.arcTime : null,
-            fIn: P.fIn, fInM: P.fInM, fOut: P.fOut, fOutM: P.fOutM, fP: P.fP, zDest: P.zDest, zDestM: P.zDestM, zTrips: P.zTrips, zMetro: P.zMetro });
+      // 一个时段的预测（各时段互不依赖，交给时段流水线交错执行；进度按完成的迭代次数计）
+      const ITS = [6, 4, 6, 3], nets = { base: baseNet, draft: draftNet }, out = { base: { wd: [], we: [] }, draft: { wd: [], we: [] } };
+      let itDone = 0;
+      const runOne = function* (job, buf) {
+        const net = nets[job[0]], dt = job[1], p = job[2];
+        const L = self.ctxs[dt].per[p];
+        const P = {
+          arcVol: Float32Array.from(L.arcVol), arcTime: Float32Array.from(L.arcTime), skimT: Float32Array.from(L.skimT), skimK: Float32Array.from(L.skimK),
+          desTot: new Float32Array(self.B * self.B), desMetro: new Float32Array(self.B * self.B), zTrips: new Float32Array(self.Z), zMetro: new Float32Array(self.Z), zAccess: new Float32Array(self.Z),
+          stats: null, demandTotal:L.demandTotal, iters: Math.max(1, L.iters), dt: dt,
+        };
+        self.allocStatArrays(P);
+        self.initMetroPer(P, net, p, L, self.net);
+        for (let it = 0; it < ITS[p]; it++) {
+          yield* self.iterate(net, P, p, { noSmooth: true, metroLam: it === 0 ? 0.7 : 0.6, buf: buf, pred: true });
+          result.progress = ++itDone / itTotal;
+          if(P.stable){itDone+=ITS[p]-it-1;result.progress=itDone/itTotal;break;}
         }
-        return per;
+        // 仅保留结果所需
+        return { stable:P.stable, stats: P.stats, freq: P.freq, load: P.load, stIn: P.stIn, stOut: P.stOut, stXfer: P.stXfer, arcVol: p === 0 ? P.arcVol : null, arcTime: p === 0 ? P.arcTime : null,
+          fIn: P.fIn, fInM: P.fInM, fOut: P.fOut, fOutM: P.fOutM, fP: P.fP, zDest: P.zDest, zDestM: P.zDestM, zTrips: P.zTrips, zMetro: P.zMetro };
       };
+      const jobs = [];
+      for (const k of baseNet ? ['base', 'draft'] : ['draft']) for (const dt of DT) for (let p = 0; p < NP; p++) jobs.push([k, dt, p]);
+      const itTotal = jobs.reduce(function (s, j) { return s + ITS[j[2]]; }, 0);
       result.progress = 0;
-      const base = baseNet ? { wd: yield* runFor(baseNet, 'wd', 0), we: yield* runFor(baseNet, 'we', 0.25) } : null;
-      const draft = { wd: yield* runFor(draftNet, 'wd', 0.5), we: yield* runFor(draftNet, 'we', 0.75) };
+      yield* self.pipeline(jobs, runOne, function (j, per) { out[j[0]][j[1]][j[2]] = per; }, true);
+      result.stable=Object.values(out).every(group=>DT.every(dt=>group[dt].every(P=>P.stable)));
+      const base = baseNet ? out.base : null;
+      const draft = out.draft;
       const empty = function () { return self.aggregate([0, 1, 2, 3].map(function () { return null; }), null); };
       const B = base ? { wd: self.aggregate(base.wd, baseNet), we: self.aggregate(base.we, baseNet) } : { wd: empty(), we: empty() };
       const Dr = { wd: self.aggregate(draft.wd, draftNet), we: self.aggregate(draft.we, draftNet) };
@@ -1390,7 +1912,7 @@
           for (let d = 0; d < 2; d++) {
             const a = 2 * L.id + d;
             const e = byName.get(L.name) || { n0: 0, n1: 0, d0: 0, d1: 0, vkt0: 0 };
-            const x0 = v0[a] / self.cap(a), x1 = v1[a] / self.cap(a);
+            const x0 = base.wd[0].arcTime[a] / road.arcT0[a], x1 = draft.wd[0].arcTime[a] / road.arcT0[a];
             e.n0 += v0[a] * L.lenM * x0; e.d0 += v0[a] * L.lenM; e.n1 += v1[a] * L.lenM * x1; e.d1 += v1[a] * L.lenM; e.vkt0 += v0[a] * L.lenM;
             byName.set(L.name, e);
           }
@@ -1402,7 +1924,7 @@
           roads.push({ name: self.city.roadNames[nid], vc0: vc0, vc1: vc1, delta: vc1 - vc0, w: e.vkt0 });
         });
         roads.sort(function (a, b) { return a.delta - b.delta; });
-        result.roads = roads.filter(function (r) { return Math.abs(r.delta) > 0.004; }).slice(0, 5);
+        result.roads = roads.filter(function (r) { return r.delta < -0.004; }).slice(0, 5);
         result.roadsWorse = roads.filter(function (r) { return r.delta > 0.004; }).sort(function (a, b) { return b.delta - a.delta; }).slice(0, 3);
       } else { result.roads = []; result.roadsWorse = []; }
       // 有效性
@@ -1417,8 +1939,9 @@
       result.progress = 1;
       return result;
     })();
+    this.predEpoch = (this.predEpoch || 0) + 1;   // 新的预测开始：之前预测尚未发出的计算块作废
     this.predJob = { gen: gen, done: done };
     return gen;
   };
-  Model.prototype.cancelPredict = function () { this.predJob = null; };
+  Model.prototype.cancelPredict = function () { this.predJob = null; this.predEpoch = (this.predEpoch || 0) + 1; };
 })(window.CM);

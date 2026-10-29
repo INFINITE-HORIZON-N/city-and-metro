@@ -23,8 +23,9 @@
     boom: { trade: 0.4, fin: 0.3, prop: 0.3 },
     open: { trade: 0.8, ind: 0.2 },
     local: { tour: 0.6, trade: 0.4 },
+    war: { ind: 0.4, trade: 0.3, tour: 0.3 },
   };
-  const KIND_NAME = { oil: '能源冲击', fin: '金融冲击', trade: '外贸冲击', gfc: '全球金融危机', epi: '公共卫生事件', quake: '自然灾害', policy: '政策调控', boom: '景气上升', open: '对外开放', local: '本地冲击' };
+  const KIND_NAME = { oil: '能源冲击', fin: '金融冲击', trade: '外贸冲击', gfc: '全球金融危机', epi: '公共卫生事件', quake: '自然灾害', policy: '政策调控', boom: '景气上升', open: '对外开放', local: '本地冲击', war: '战争' };
   // lv：相对趋势的 GDP 水平变化（发生当年起逐年，参考暴露度 0.5 时的幅度），正值为利好；keep：最后一项长期保持
   const LIB = {
     korea1950: { kind: 'boom', scope: '国际', title: '朝鲜战争「特需景气」', desc: '军需订单带动工业生产与出口，战后复兴加速。', lv: [0.015, 0.035, 0.02, 0.005, 0] },
@@ -265,6 +266,23 @@
     st.cur.last = s;
     return true;
   };
+  // 地图范围扩展（旧存档迁移）：统计范围变大，按「全图岗位 ÷ 原范围岗位」比例 r 调整口径——历年记录与本年已采样部分按新范围折算，
+  // 就业基准同比放大，使实际增长、财力系数与交通效率在扩展前后连续；每岗位产出、已发生事件、周期与资金债务均不变
+  Macro.rebaseArea = function (g, r) {
+    const st = g.macro; if (!st || !(r > 0) || !isFinite(r) || Math.abs(r - 1) < 1e-9) return false;
+    for (const rec of st.rec) for (const k of ['real', 'nom', 'jobs', 'pop', 'rev', 'baseRev']) if (typeof rec[k] === 'number') rec[k] *= r;
+    if (st.cur) { st.cur.jobs *= r; st.cur.pop *= r; }
+    st.jobsA *= r;
+    // 交通效率基准：按扩展前最后一次采样与扩展后采样之差平移（同交通模型升级），避免新增范围尚无地铁覆盖导致效率骤降
+    const old = st.cur && st.cur.last, s = teSample(g), b = st.te0;
+    if (old && s && b) {
+      st.te0 = { acc: b.acc + (s.acc - old.acc), comm: old.comm > 0 ? b.comm * s.comm / old.comm : b.comm, cong: old.cong > 0 ? b.cong * s.cong / old.cong : b.cong, share: b.share + (s.share - old.share) };
+      st.cur.last = s;
+    }
+    st.area = (st.area || []).concat([{ at: [g.clock.y, g.clock.m], r: r }]);
+    st.gv = (st.gv || 0) + 1;
+    return true;
+  };
   Macro.serialize = function (st) {
     if (!st) return null;
     const o = {}; for (const k in st) if (k[0] !== '_') o[k] = st[k];
@@ -376,10 +394,23 @@
     const f = clamp(0.4 * pf + 0.6 * r.fRaw, 0.7, 1.3);
     st.fisc = { y: Y, f: f, fRaw: r.fRaw, rev: r.rev, from: r.y };
   }
+  // 预期地方财政收入（按当年价格，不含经济周期与冲击；未来年份按长期涨幅）
+  function expRev(st, c, Y) {
+    const jobsBase = st.jobsA * jobsCurve(Y + 0.5) / Math.max(1, jobsCurve(st.tA));
+    return st.K * jobsBase * prodIdx(c, Y) * priceIdx(st, c, Y) * U.interp(c.revRatio, Y);
+  }
   function syncEcon(g) {
     const st = g.macro; if (!st || !g.econ) return;
     g.econ.fisc = st.fisc ? { y: st.fisc.y, f: st.fisc.f } : null;
     g.econ.quoteFn = function (kind, y, term) { return Macro.quote(g, kind, y, term); };
+    // 模拟增长期的地铁资金基数（v2.1 第二轮）：历史末年之后按预期地方财政收入的增长放大（economy.grantQuota），
+    // 保持地铁资金在城市财政中的占比，不再只按固定表缓慢增长
+    const c = Macro.config();
+    if (c && st.K > 0 && st.jobsA > 0) {
+      const he = c.histEnd, cache = {};
+      const at = function (Y) { const k = Y + '|' + st.gv; return cache[k] != null ? cache[k] : (cache[k] = expRev(st, c, Y)); };
+      g.econ.revIdx = { he: he, f: function (t) { const Y = Math.floor(t), fr = t - Y, r0 = at(he); return r0 > 0 ? (at(Y) * (1 - fr) + at(Y + 1) * fr) / r0 : 1; } };
+    } else g.econ.revIdx = null;
   }
   Macro.sync = syncEcon;
 
@@ -492,7 +523,6 @@
     };
   };
   Macro.kindName = function (k) { return KIND_NAME[k] || '经济事件'; };
-  Macro.eventLevelText = function (f, ev, Y) { return lvAt(f, ev, Y); };
   // 参考：全国 / 地区的实际增速（公开统计的近似值），与地图范围的游戏数据分开展示
   Macro.refAt = function (c, Y) {
     const R = c && c.ref; if (!R) return null;

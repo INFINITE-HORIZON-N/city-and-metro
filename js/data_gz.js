@@ -6,9 +6,12 @@
   // 以真实地名定位（OSM 地名表），找不到时用备用坐标
   const PL = {};
   for (const p of (CM.GEO && CM.GEO.places) || []) PL[p[0]] = p;
-  const at = function (name, fx, fy, dx, dy) { const p = PL[name]; return { x: (p ? p[1] : fx) + (dx || 0), y: (p ? p[2] : fy) + (dy || 0) }; };
-  const anchor = function (label, place, r, fx, fy) { return Object.assign({ name: label, r: r }, at(place, fx, fy)); };
   const GP = (CM.GEO && CM.GEO.proj) || { lon0: 113.2, lat0: 23.215, kx: 409.6, ky: 443 };
+  // 本文件中直接写出的格坐标（地标、模拟规划道路、少数锚点与备用坐标）以扩大前的格网（北界 23.215°N）为准；
+  // v2.1 地图向北扩大 16 格，载入时统一加上 OY（地理数据未扩大时为 0）
+  const OY = Math.round((GP.lat0 - 23.215) * GP.ky);
+  const at = function (name, fx, fy, dx, dy) { const p = PL[name]; return { x: (p ? p[1] : fx) + (dx || 0), y: (p ? p[2] : fy + OY) + (dy || 0) }; };
+  const anchor = function (label, place, r, fx, fy) { return Object.assign({ name: label, r: r }, at(place, fx, fy)); };
   const ll = function (lat, lon) { return [+((lon - GP.lon0) * GP.kx).toFixed(2), +((GP.lat0 - lat) * GP.ky).toFixed(2)]; };
   const pa = function (name, fx, fy) { const p = at(name, fx, fy); return [p.x, p.y]; };
 
@@ -19,6 +22,50 @@
     city: '广州',
     // 发展阶段：[截止年份（不含）, 名称]；史料截止年份（CFG.growth.histEnd）前的最后阶段为 stageLast
     stages: [[1997, '起步期（无地铁时代）'], [2005, '扩张期'], [2011, '亚运建设期']], stageLast: '网络化时期',
+    // 历史发展阶段（v2.2，eras.js）：summary 中「史实」为可查证的史实，「估算」为模型设定的发展倾向；grow 为片区人口 / 就业增长权重倍数（只改变增长去向，
+    // 不改变人口与岗位总量），relocate 为每月疏解比例，corridors 为片区间通勤与购物去向倍数，demand 为出行强度与距离倍数，goals 为阶段目标（本城任务）
+    eras: (function () {
+      const pt = function (name, lat, lon, r) { const p = ll(lat, lon); return { name: name, x: p[0], y: p[1], r: r || 3 }; };
+      const OLD = pt('老城（公园前）', 23.1296, 113.2648), THW = pt('天河（体育西路）', 23.1350, 113.3210), ZJ = pt('珠江新城（花城大道）', 23.1190, 113.3240),
+        HZG = pt('海珠广场', 23.1190, 113.2700), JNX = pt('江南西', 23.1010, 113.2710), PY = pt('番禺（市桥）', 22.9440, 113.3560, 4), DS = pt('大石', 23.0040, 113.3080),
+        PZ = pt('琶洲', 23.1030, 113.3640), KXC = pt('科学城', 23.1660, 113.4420, 5), GZS = pt('广州南站', 22.9890, 113.2690);
+      return [
+        { id: 'gz-e1', from: 1990, name: '起步期（无地铁时代）', tag: '史实',
+          summary: '史实：城市集中在越秀、荔湾、东山与海珠北部，1987 年六运会带动天河体育中心一带成为新区；出行以公交与自行车为主，尚无地铁。估算：就业开始向天河西扩散，老城人口增长放缓。',
+          grow: { pop: { oldcity: 0.8, tianhe_w: 1.6, haizhu_n: 1.2, sanyuanli: 1.2, fangcun: 1.1 }, jobs: { oldcity: 1.0, tianhe_w: 1.8, huangpu: 1.3, kaifaqu: 1.4 } },
+          demand: { decayHW: 0.9 }, corridors: [{ a: 'oldcity', b: 'tianhe_w', f: 1.15 }],
+          goals: [{ id: 'gz-g1', type: 'connect', months: 48, reward: 40000, title: '老城与天河', desc: '新区在天河体育中心一带形成，老城到天河的公交十分拥挤。用地铁连接公园前与体育西路一带。', anchors: [OLD, THW] }] },
+        { id: 'gz-e2', from: 1997, name: '扩张期', tag: '史实',
+          summary: '史实：珠江新城 1993 年起规划开发，广州东站 1996 年建成，2000 年番禺撤市设区。估算：岗位继续向天河集中，海珠中南部、天河东与天河北成为主要的新增居住地，跨江通勤增加。',
+          grow: { pop: { haizhu_s: 1.4, tianhe_e: 1.4, tianhe_n: 1.3, oldcity: 0.7 }, jobs: { tianhe_w: 1.8, cbd: 1.6, tianhe_e: 1.3, oldcity: 0.8 } },
+          relocate: { jobs: { oldcity: 0.0006 } },
+          corridors: [{ a: 'oldcity', b: 'tianhe_w', f: 1.2 }, { a: 'haizhu_n', b: 'oldcity', f: 1.12 }, { a: 'haizhu_s', b: 'tianhe_w', f: 1.12 }],
+          goals: [{ id: 'gz-g2', type: 'connect', months: 48, reward: 40000, title: '跨江通勤', desc: '海珠的居民每天过江到老城与天河上班。用地铁连接海珠广场、江南西与公园前一带。', anchors: [HZG, JNX, OLD] }] },
+        { id: 'gz-e3', from: 2005, name: '亚运建设期', tag: '史实',
+          summary: '史实：2004 年新白云机场启用、大学城投入使用，2010 年 1 月广州南站启用、11 月举办亚运会，珠江新城中轴线成形。估算：中央商务区快速成长，番禺北部成为大型居住区，老城开始疏解。',
+          grow: { pop: { panyu_n: 1.6, panyu_e: 1.3, haizhu_s: 1.3, baiyun_n: 1.3, tonghe: 1.2, oldcity: 0.6 }, jobs: { cbd: 2.4, tianhe_w: 1.4, pazhou: 1.6, unicity: 1.5, luogang: 1.5, oldcity: 0.8 } },
+          relocate: { jobs: { oldcity: 0.001 }, pop: { oldcity: 0.0005 } },
+          demand: { sc: 1.08, decayHW: 1.1, hub: 1.1 },
+          corridors: [{ a: 'cbd', b: 'panyu_n', f: 1.25 }, { a: 'cbd', b: 'oldcity', f: 1.2 }, { a: 'unicity', b: 'tianhe_w', f: 1.2 }],
+          goals: [{ id: 'gz-g3', type: 'connect', months: 48, reward: 45000, title: '新旧中心联系', desc: '珠江新城成为新的中央商务区，与老城之间的商务往来频繁。用地铁连接公园前与珠江新城。', anchors: [OLD, ZJ] },
+            { id: 'gz-g4', type: 'connect', months: 48, reward: 45000, title: '番禺北上通勤', desc: '番禺北部的大型社区每天有大量居民到天河上班。用地铁连接市桥、大石与珠江新城。', anchors: [PY, DS, ZJ] }] },
+        { id: 'gz-e4', from: 2011, name: '网络化时期', tag: '史实',
+          summary: '史实：亚运会后广州南站与高铁带动番禺发展，琶洲会展片区与科学城持续成长。估算：就业从珠江新城向琶洲、科学城等副中心扩散，外围居住区的长距离通勤增加。',
+          grow: { pop: { panyu_n: 1.4, baiyun_n: 1.3, longdong: 1.2, tianhe_ne: 1.2, huangpu: 1.2, oldcity: 0.6 }, jobs: { cbd: 1.6, pazhou: 2.0, luogang: 1.8, panyu_n: 1.3, oldcity: 0.8 } },
+          relocate: { jobs: { oldcity: 0.0008 } },
+          demand: { sh: 1.05, lz: 1.08, decayHW: 1.15 },
+          corridors: [{ a: 'cbd', b: 'panyu_n', f: 1.3 }, { a: 'pazhou', b: 'cbd', f: 1.2 }, { a: 'luogang', b: 'tianhe_w', f: 1.2 }, { a: 'oldcity', b: 'baiyun_n', f: 1.1 }],
+          goals: [{ id: 'gz-g5', type: 'connect', months: 48, reward: 45000, title: '琶洲与珠江新城', desc: '琶洲成为会展与互联网企业聚集地，与珠江新城之间通勤频繁。用地铁连接琶洲与珠江新城。', anchors: [PZ, ZJ] },
+            { id: 'gz-g6', type: 'connect', months: 48, reward: 50000, title: '科学城通勤', desc: '科学城的岗位快速增长，但距离中心较远。用地铁连接科学城与天河。', anchors: [KXC, THW] },
+            { id: 'gz-g7', type: 'connect', months: 36, reward: 40000, title: '南站枢纽接驳', desc: '高铁旅客从广州南站进入市区。用地铁连接广州南站与珠江新城。', anchors: [GZS, ZJ] }] },
+        { id: 'gz-e5', from: 2021, name: '模拟未来', tag: '模拟',
+          summary: '模拟：此后的发展按模型推演，不代表真实历史。估算：就业继续向科学城、番禺与琶洲等副中心扩散，老城保持稳定。',
+          grow: { pop: { panyu_e: 1.4, foshan: 1.3, baiyun_w: 1.2, oldcity: 0.7 }, jobs: { luogang: 1.5, panyu_n: 1.4, pazhou: 1.3, cbd: 1.2, oldcity: 0.7 } },
+          relocate: { jobs: { oldcity: 0.0005 } },
+          demand: { lz: 1.1, decayHW: 1.15 },
+          corridors: [{ a: 'cbd', b: 'luogang', f: 1.2 }, { a: 'panyu_n', b: 'cbd', f: 1.3 }] },
+      ];
+    })(),
     // 开局简报：开局时这座城市的交通格局（新开存档时显示）
     briefing: {
       lead: '1990 年的广州还没有地铁。城市集中在珠江北岸的老城与刚刚起步的天河，公交与自行车是主要的出行方式，过江依靠几座大桥和轮渡。',
@@ -33,39 +80,40 @@
       ['', '', '本游戏仅模拟汽车与地铁等已约定内容，不包含完整现实交通系统，模拟结果不得作为真实广州交通规划预测。'],
     ],
     taskNote: '历史参考任务参考广州地铁的实际发展时间，但不要求按真实线路走向建设，只需满足目标描述。',
-    airport: { name: '旧白云机场', closeYear: 2004 },
+    // 旧白云机场（v2.2 补齐）：机场路与白云大道南之间、三元里以北到黄石路一带；3380 m 跑道按北偏东走向近似（OSM 已无旧机场数据，位置为近似）
+    airport: { name: '旧白云机场', closeYear: 2004, buildable: 'underground', runway: [ll(23.1680, 113.2610), ll(23.1975, 113.2735)] },
 
     // 区域：按街道（OSM 行政区界）组合；district 为街道缺失时按所属区归入。open 为参考开放年份（null 表示不开放建设）
     regions: [
-      { id: 'bys', name: '白云山风景区', geo: { reserve: '白云山风景名胜区' }, open: null, scenic: true },
-      { id: 'hls', name: '火炉山森林公园', geo: { park: '火炉山森林公园' }, open: null, scenic: true },
-      { id: 'airport', name: '旧白云机场（白云新城）', streets: ['云城街道'], open: 2004, plan: 'newtown', pop: 5.5e6, note: '2004 年新白云机场启用后旧机场关闭（史实）' },
+      { id: 'bys', name: '白云山风景区', geo: { reserve: '白云山风景名胜区' }, open: null, scenic: true, relief: 380 },   // relief：三维山体的最高高度（米），0 为平地
+      { id: 'hls', name: '火炉山森林公园', geo: { park: '火炉山森林公园' }, open: null, scenic: true, relief: 320 },
+      { id: 'airport', name: '旧白云机场（白云新城）', poly: [[[23.2040, 113.2555], [23.2040, 113.2790], [23.1985, 113.2805], [23.1813, 113.2730], [23.1727, 113.2690], [23.1640, 113.2662], [23.1640, 113.2575], [23.1700, 113.2550], [23.1890, 113.2553]].map(function (p) { return ll(p[0], p[1]); })], streets: ['云城街道'], open: 2004, plan: 'newtown', pop: 6.35e6, note: '2004 年新白云机场启用后旧机场关闭（史实）；机场运营期间范围内也可以地下设站与地下穿越（v2.2）' },
       { id: 'oldcity', name: '老城区（越秀·荔湾·东山）', streets: OLD_YUEXIU.concat(OLD_LIWAN), district: ['越秀区'], open: 1990, plan: 'oldmix' },
-      { id: 'cbd', name: '珠江新城', streets: ['冼村街道', '猎德街道'], open: 1993, plan: 'cbd', pop: 3.3e6, note: '1993 年起规划开发（史实）' },
+      { id: 'cbd', name: '珠江新城', streets: ['冼村街道', '猎德街道'], open: 1993, plan: 'cbd', pop: 3.7e6, note: '1993 年起规划开发（史实）' },
       { id: 'tianhe_w', name: '天河西（体育中心·石牌·沙河）', streets: ['天河南街道', '林和街道', '石牌街道', '沙河街道'], open: 1990, plan: 'mix' },
       { id: 'sanyuanli', name: '白云南（三元里·新市）', streets: ['三元里街道', '棠景街道', '新市街道', '景泰街道', '同德街道'], open: 1990, plan: 'res' },
       { id: 'fangcun', name: '芳村', streets: ['石围塘街道', '东漖街道', '茶滘街道', '海龙街道', '中南街道', '东沙街道', '白鹤洞街道', '冲口街道', '花地街道'], district: ['荔湾区'], open: 1990, plan: 'resind' },
       { id: 'haizhu_n', name: '海珠北（河南）', streets: ['南华西街道', '海幢街道', '滨江街道', '素社街道', '江南中街道', '沙园街道', '龙凤街道', '昌岗街道', '新港街道', '南石头街道', '凤阳街道', '江海街道', '赤岗街道'], open: 1990, plan: 'res' },
-      { id: 'huangpu', name: '黄埔（鱼珠·大沙地）', streets: ['黄埔街道', '鱼珠街道', '红山街道', '文冲街道', '大沙街道', '穗东街道'], district: ['黄埔区'], open: 1990, plan: 'port' },
-      { id: 'changzhou', name: '长洲岛', streets: ['长洲街道'], open: 1990, plan: 'res' },
-      { id: 'kaifaqu', name: '广州开发区（西区）', streets: ['夏港街道', '云埔街道'], open: 1990, plan: 'ind' },
-      { id: 'tianhe_e', name: '天河东（员村·车陂·东圃）', streets: ['员村街道', '天园街道', '车陂街道', '前进街道', '黄村街道'], district: ['天河区'], open: 1993, plan: 'mix', pop: 3.3e6 },
-      { id: 'haizhu_s', name: '海珠中南部', streets: ['瑞宝街道', '南洲街道', '华洲街道'], district: ['海珠区'], open: 1995, plan: 'res', pop: 3.4e6 },
-      { id: 'tianhe_n', name: '天河北（沙东·五山·长兴）', streets: ['兴华街道', '沙东街道', '五山街道', '长兴街道'], open: 1995, plan: 'res', pop: 3.4e6 },
-      { id: 'baiyun_n', name: '白云北（黄石·永平·嘉禾）', streets: ['黄石街道', '永平街道', '松洲街道', '鹤龙街道', '嘉禾街道'], district: ['白云区'], open: 2000, plan: 'res', pop: 4.0e6 },
-      { id: 'baiyun_w', name: '白云西（石井·金沙）', streets: ['石井街道', '金沙街道', '石门街道', '白云湖街道'], open: 2000, plan: 'resind', pop: 4.0e6 },
-      { id: 'tonghe', name: '同和·京溪', streets: ['同和街道', '京溪街道'], open: 2000, plan: 'res', pop: 4.1e6 },
-      { id: 'panyu_n', name: '番禺北（洛溪·大石）', streets: ['洛浦街道', '大石街道', '钟村街道', '石壁街道', '南村镇'], district: ['番禺区'], open: 2000, plan: 'res', pop: 4.0e6, note: '2000 年番禺撤市设区（史实）' },
-      { id: 'pazhou', name: '琶洲', streets: ['琶洲街道'], open: 2003, plan: 'expo', pop: 4.9e6, note: '2003 年琶洲会展中心启用（史实）' },
-      { id: 'guanzhou', name: '官洲·生物岛', streets: ['官洲街道'], open: 2003, plan: 'mix', pop: 4.8e6 },
-      { id: 'longdong', name: '龙洞·元岗', streets: ['龙洞街道', '元岗街道'], open: 2003, plan: 'res', pop: 4.8e6 },
-      { id: 'tianhe_ne', name: '天河东北（棠下·珠村·新塘）', streets: ['棠下街道', '凤凰街道', '新塘街道', '珠吉街道'], open: 2003, plan: 'mix', pop: 4.8e6 },
-      { id: 'unicity', name: '广州大学城（小谷围岛）', streets: ['小谷围街道'], open: 2004, plan: 'campus', pop: 5.4e6, note: '2004 年大学城启用（史实）' },
-      { id: 'luogang', name: '萝岗·科学城', streets: ['联和街道', '萝岗街道', '长岭街道'], open: 2005, plan: 'ind', pop: 5.2e6 },
-      { id: 'foshan', name: '佛山（南海·顺德）', streets: ['大沥镇', '桂城街道', '里水镇', '陈村镇'], district: ['南海区', '顺德区'], open: 2010, plan: 'res', pop: 6.0e6, note: '2010 年广佛线开通，广佛同城（史实）' },
-      { id: 'panyu_e', name: '番禺东（新造·化龙）', streets: ['新造镇', '化龙镇', '石楼镇', '石碁镇'], open: 2010, plan: 'res', pop: 6.0e6 },
+      { id: 'huangpu', name: '黄埔（鱼珠·大沙地）', streets: ['黄埔街道', '鱼珠街道', '红山街道', '文冲街道', '大沙街道', '穗东街道'], district: ['黄埔区'], open: 1995, plan: 'port' },
+      { id: 'changzhou', name: '长洲岛', streets: ['长洲街道'], open: 1995, plan: 'res' },
+      { id: 'kaifaqu', name: '广州开发区（西区）', streets: ['夏港街道', '云埔街道'], open: 1995, plan: 'ind' },
+      { id: 'tianhe_e', name: '天河东（员村·车陂·东圃）', streets: ['员村街道', '天园街道', '车陂街道', '前进街道', '黄村街道'], district: ['天河区'], open: 1993, plan: 'mix', pop: 3.7e6 },
+      { id: 'haizhu_s', name: '海珠中南部', streets: ['瑞宝街道', '南洲街道', '华洲街道'], district: ['海珠区'], open: 1995, plan: 'res', pop: 3.85e6 },
+      { id: 'tianhe_n', name: '天河北（沙东·五山·长兴）', streets: ['兴华街道', '沙东街道', '五山街道', '长兴街道'], open: 1995, plan: 'res', pop: 3.85e6 },
+      { id: 'baiyun_n', name: '白云北（黄石·永平·嘉禾）', streets: ['黄石街道', '永平街道', '松洲街道', '鹤龙街道', '嘉禾街道'], district: ['白云区'], open: 2000, plan: 'res', pop: 4.55e6 },
+      { id: 'baiyun_w', name: '白云西（石井·金沙）', streets: ['石井街道', '金沙街道', '石门街道', '白云湖街道'], open: 2000, plan: 'resind', pop: 4.55e6 },
+      { id: 'tonghe', name: '同和·京溪', streets: ['同和街道', '京溪街道'], open: 2000, plan: 'res', pop: 4.7e6 },
+      { id: 'panyu_n', name: '番禺（洛溪·大石·市桥）', streets: ['洛浦街道', '大石街道', '钟村街道', '石壁街道', '南村镇'], district: ['番禺区'], open: 2000, plan: 'res', pop: 4.55e6, note: '2000 年番禺撤市设区（史实）' },
+      { id: 'pazhou', name: '琶洲', streets: ['琶洲街道'], open: 2003, plan: 'expo', pop: 5.65e6, note: '2003 年琶洲会展中心启用（史实）' },
+      { id: 'guanzhou', name: '官洲·生物岛', streets: ['官洲街道'], open: 2003, plan: 'mix', pop: 5.5e6 },
+      { id: 'longdong', name: '龙洞·元岗', streets: ['龙洞街道', '元岗街道'], open: 2003, plan: 'res', pop: 5.5e6 },
+      { id: 'tianhe_ne', name: '天河东北（棠下·珠村·新塘）', streets: ['棠下街道', '凤凰街道', '新塘街道', '珠吉街道'], open: 2003, plan: 'mix', pop: 5.5e6 },
+      { id: 'unicity', name: '广州大学城（小谷围岛）', streets: ['小谷围街道'], open: 2004, plan: 'campus', pop: 6.25e6, note: '2004 年大学城启用（史实）' },
+      { id: 'luogang', name: '萝岗·科学城', streets: ['联和街道', '萝岗街道', '长岭街道'], open: 2005, plan: 'ind', pop: 6e6 },
+      { id: 'foshan', name: '佛山（南海·顺德）', streets: ['大沥镇', '桂城街道', '里水镇', '陈村镇'], district: ['南海区', '顺德区'], open: 2010, plan: 'res', pop: 7.05e6, note: '2010 年广佛线开通，广佛同城（史实）' },
+      { id: 'panyu_e', name: '番禺东（新造·化龙）', streets: ['新造镇', '化龙镇', '石楼镇', '石碁镇'], open: 2010, plan: 'res', pop: 7.05e6 },
     ],
-    defaultRegion: { id: 'outer', name: '外围地区', open: 2015, plan: 'res', pop: 7.0e6 },
+    defaultRegion: { id: 'outer', name: '外围地区', open: 2015, plan: 'res', pop: 8.3e6 },
 
     plans: {
       oldmix: { RES: 0.5, MIX: 0.35, COM: 0.1, INST: 0.05 },
@@ -93,11 +141,15 @@
       Object.assign(at('三元里', 22.3, 23.8), { pop: 12000, jobs: 5000, r: 2.0 }),
       Object.assign(at('芳村', 13.2, 51.6), { pop: 12000, jobs: 9000, r: 2.2 }),
       Object.assign(at('鱼珠', 92.9, 49.7, 4, -1), { pop: 9000, jobs: 11000, r: 2.4 }),
-      { x: 110.6, y: 51.0, pop: 3000, jobs: 9000, r: 2.4 },
+      { x: 110.6, y: 51.0 + OY, pop: 3000, jobs: 9000, r: 2.4 },
       Object.assign(at('员村', 64.8, 43.1), { pop: 6000, jobs: 9000, r: 1.5 }),
-      { x: 38.3, y: 27.6, pop: 9000, jobs: 4000, r: 1.5 },
+      { x: 38.3, y: 27.6 + OY, pop: 9000, jobs: 4000, r: 1.5 },
       Object.assign(at('中大', 36.0, 53.3), { pop: 9000, jobs: 7000, r: 1.2 }),
       Object.assign(at('长洲', 91.5, 60.5), { pop: 3000, jobs: 1500, r: 1.0 }),
+      // v2.1 扩大范围：番禺县城市桥、钟村与白云北部嘉禾一带（1990 年估算）
+      Object.assign((function () { const p = ll(22.945, 113.365); return { x: p[0], y: p[1] }; })(), { pop: 16000, jobs: 9000, r: 1.4 }),   // 市桥
+      Object.assign((function () { const p = ll(22.990, 113.310); return { x: p[0], y: p[1] }; })(), { pop: 5000, jobs: 3000, r: 1.4 }),    // 钟村、大石南
+      Object.assign((function () { const p = ll(23.240, 113.285); return { x: p[0], y: p[1] }; })(), { pop: 4000, jobs: 2500, r: 1.6 }),    // 嘉禾、均禾
     ],
     rural: { pop: 700, jobs: 120 },
 
@@ -160,15 +212,20 @@
       { id: 'gdmus', name: '广东省博物馆', x: 49.73, y: 43.23, w: 147, d: 147, year: 2010, kind: 'box' },
       { id: 'gzlib', name: '广州图书馆', x: 49.40, y: 42.58, w: 145, d: 87, year: 2013, kind: 'library' },
       { id: 'ctf', name: '周大福金融中心', x: 49.40, y: 41.99, w: 78, d: 70, year: 2016, kind: 'skyscraper', h: 530, style: 'east' },
+      // v2.1 扩大范围新增（坐标按扩大前的格网写出，载入时与上面的地标一起加 OY）
+      Object.assign((function () { const p = ll(22.9886, 113.2694); return { x: p[0], y: p[1] - OY }; })(), { id: 'gznz', name: '广州南站', w: 700, d: 460, rot: 90, year: 2010, kind: 'rail' }),
     ],
 
     // 重要设施（v1.9，见 facility.js）：位置按真实地理（近似）、启用/停用年份为史实参考；规模均为估算——
     // 枢纽 pax 为市内接驳出行（汽车 + 地铁，到达与离开合计，万人次/日），其他 w 为占全市同类出行吸引的比例。
-    // 地图范围外的设施（广州南站、新白云机场、长隆等）不模拟。
+    // 长隆等地图范围外的设施不模拟；新白云机场在地图北缘设接驳点。
     facilities: [
       { id: 'gz_rail', n: '广州火车站', t: 'rail', lm: 'gzzhan', pax: [[1974, 4], [1990, 7], [1996, 9], [2005, 11], [2010, 12], [2016, 9], [2030, 8]] },
       { id: 'gz_east', n: '广州东站', t: 'rail', lm: 'gzdz', pax: [[1996, 2.5], [2000, 4], [2008, 6], [2015, 7], [2030, 7]] },
       { id: 'gz_air', n: '旧白云机场', t: 'air', at: ll(23.182, 113.266), y1: [2004, 8], pax: [[1990, 1.3], [1995, 2.5], [2000, 2.8], [2003, 3.6], [2004, 4]], note: '2004 年 8 月新白云机场（地图范围外）启用，旧机场关闭。' },
+      // 地图外的重要枢纽：在地图边缘最靠近的位置设接驳点（规模只计从地图范围出发、到达的接驳出行，估算）
+      { id: 'gz_newair', n: '新白云机场（北向接驳）', t: 'air', ext: ['N', 15],at: ll(23.245, 113.300), y0: [2004, 8], pax: [[2004.6, 3], [2010, 5], [2019, 8], [2030, 9]], note: '新白云机场在地图北缘以北约 15 km。此处为机场高速与机场方向轨道交通出图的接驳点，2004 年 8 月机场启用后产生往返机场的出行。' },
+      { id: 'gz_south', n: '广州南站', t: 'rail', lm: 'gznz', y0: [2010, 1], pax: [[2010, 3], [2012, 6], [2015, 9], [2019, 12], [2030, 14]], note: '2009 年底武广高铁开通，2010 年 1 月广州南站启用；之后广深港、贵广、南广高铁相继接入。' },
       { id: 'gz_sysu', n: '中山大学（南校区）', t: 'uni', lm: 'sysu', w: 0.025 },
       { id: 'gz_scut', n: '华南理工大学', t: 'uni', lm: 'scut', w: 0.018 },
       { id: 'gz_jnu', n: '暨南大学', t: 'uni', lm: 'jnu', w: 0.015 },
@@ -221,16 +278,18 @@
     // 城市发展事件（tag：史实 / 估算 / 模拟）
     events: [
       { y: 1990, m: 1, tag: '史实', title: '1990 年的广州', desc: '城市集中在越秀、荔湾、东山及海珠北部，尚无地铁。' },
-      { y: 1993, m: 1, tag: '史实', title: '珠江新城开始开发', desc: '天河南部规划新的中央商务区。' },
+      { y: 1993, m: 1, tag: '史实', title: '珠江新城开始开发', desc: '天河南部规划新的中央商务区。', fx: { grow: { region: 'cbd', jobs: 1.5, years: 6 } } },
       { y: 1993, m: 6, tag: '史实', title: '珠江隧道通车', desc: '黄沙与芳村之间增加越江通道。' },
       { y: 1996, m: 1, tag: '史实', title: '广州东站建成', desc: '天河北部形成新的铁路枢纽。' },
       { y: 1997, m: 1, tag: '史实', title: '广园快速路通车；中信广场落成', desc: '城北东西向快速通道建成，天河北出现当时华南最高的建筑。' },
       { y: 1999, m: 1, tag: '史实', title: '华南快速干线通车', desc: '城市东部南北向快速通道建成。' },
-      { y: 2000, m: 1, tag: '史实', title: '番禺撤市设区；内环路通车', desc: '城市向南拓展。' },
-      { y: 2003, m: 1, tag: '史实', title: '琶洲会展中心启用', desc: '海珠东部形成会展片区。' },
-      { y: 2004, m: 8, tag: '史实', title: '新白云机场启用，旧机场关闭', desc: '旧机场地块转为白云新城；大学城同年启用。' },
-      { y: 2010, m: 11, tag: '史实', title: '广州亚运会；广州塔、西塔与广州大剧院落成', desc: '珠江新城中轴线成形，城市进入大型赛事与新地标时期。' },
+      { y: 2000, m: 1, tag: '史实', title: '番禺撤市设区；内环路通车', desc: '城市向南拓展。', fx: { grow: { region: 'panyu_n', pop: 1.4, years: 5 } } },
+      { y: 2003, m: 1, tag: '史实', title: '琶洲会展中心启用', desc: '海珠东部形成会展片区。', fx: { grow: { region: 'pazhou', jobs: 1.5, years: 5 } } },
+      { y: 2004, m: 8, tag: '史实', title: '新白云机场启用，旧机场关闭', desc: '旧机场地块转为白云新城；大学城同年启用。', fx: { grow: { region: 'unicity', pop: 1.6, jobs: 1.3, years: 4 } } },
+      { y: 2010, m: 11, tag: '史实', title: '广州亚运会；广州塔、西塔与广州大剧院落成', desc: '珠江新城中轴线成形，城市进入大型赛事与新地标时期。', fx: { demand: { lz: 1.25, hub: 1.15, months: 1 }, sat: { v: 2, months: 6 } } },
       { y: 2021, m: 1, tag: '模拟', title: '进入模拟发展阶段', desc: '此后人口、道路和区域变化按模拟规则推演，不代表真实历史。' },
+      // v2.2 新增（追加在末尾，保持已有事件的序号与存档一致）
+      { y: 2010, m: 1, tag: '史实', title: '广州南站启用', desc: '武广高铁的广州终点站在番禺北部启用，带动周边居住与商务开发。', fx: { grow: { region: 'panyu_n', pop: 1.2, jobs: 1.3, years: 6 } } },
     ],
 
     // 历史参考任务（锚点按真实地名定位）
@@ -245,7 +304,7 @@
         id: 'h2', appear: [1995, 1], deadline: [2003, 12], type: 'connect', reward: 200000,
         title: '参考 2 号线（2002–2003 年开通）',
         desc: '建设连接广州火车站、老城中心与海珠的南北向越江线路。',
-        anchors: [{ name: '广州火车站一带', x: 21.0, y: 28.6, r: 4 }, anchor('海珠广场一带', '海珠广场', 4, 24.7, 43.2), anchor('海珠（江南西—昌岗一带）', '江南西', 5, 28.1, 51.0)],
+        anchors: [{ name: '广州火车站一带', x: 21.0, y: 28.6 + OY, r: 4 }, anchor('海珠广场一带', '海珠广场', 4, 24.7, 43.2), anchor('海珠（江南西—昌岗一带）', '江南西', 5, 28.1, 51.0)],
       },
       {
         id: 'h3', appear: [1998, 1], deadline: [2006, 12], type: 'connect', reward: 250000,
@@ -268,13 +327,13 @@
         id: 'h6', appear: [2005, 1], deadline: [2010, 12], type: 'connect', reward: 250000,
         title: '参考 5 号线（2009 年开通）',
         desc: '连接广州火车站、珠江新城与黄埔的东西向骨干线路。',
-        anchors: [{ name: '广州火车站一带', x: 21.0, y: 28.6, r: 4 }, anchor('珠江新城', '珠江新城', 4, 48.9, 40.5), anchor('黄埔（鱼珠—大沙地一带）', '大沙地', 8, 98.6, 48.3)],
+        anchors: [{ name: '广州火车站一带', x: 21.0, y: 28.6 + OY, r: 4 }, anchor('珠江新城', '珠江新城', 4, 48.9, 40.5), anchor('黄埔（鱼珠—大沙地一带）', '大沙地', 8, 98.6, 48.3)],
       },
       {
         id: 'h7', appear: [2008, 1], deadline: [2010, 12], type: 'connect', reward: 100000,
         title: '广州塔通地铁（2010 年）',
         desc: '广州塔落成前后，在其 600 m 范围内设站并接入地铁网络。',
-        anchors: [{ name: '广州塔', x: 48.80, y: 46.95, r: 2.4 }],
+        anchors: [{ name: '广州塔', x: 48.80, y: 46.95 + OY, r: 2.4 }],
       },
     ],
 
@@ -285,14 +344,19 @@
   };
   // 地名：OSM 地铁站、火车站与街区名（车站命名参考）
   CM.DATA.places = ((CM.GEO && CM.GEO.places) || []).map(function (p) { return [p[0], p[1], p[2], p[3]]; });
+  // 直接写出格坐标的地标与模拟规划道路：换算到扩大后的格网（见 OY）
+  if (OY) {
+    for (const lm of CM.DATA.landmarks) lm.y += OY;
+    for (const sr of CM.DATA.simRoads) sr.p = sr.p.map(function (q) { return [q[0], q[1] + OY]; });
+  }
 
   // 城市经济（macro.js）：地图范围 GDP、生产率趋势、价格、地方财政、产业结构与历史经济事件。
-  // gdp0 为开局年地图范围 GDP（万元，估算：1990 年广州全市 GDP 约 320 亿元，地图覆盖其主要城区，约 240 亿元）；
+  // gdp0 为开局年地图范围 GDP（万元，估算：1990 年广州全市 GDP 约 320 亿元，地图覆盖其主要城区与番禺北部，约 276 亿元）；
   // prod 为扣除就业增长后的劳动生产率实际增速（模型校准值）；revRatio 为地方财政可支配收入占 GDP 比重（估算）；
   // struct 为外贸、金融、工业、旅游消费、房地产的暴露程度（0–1，决定各类事件的影响强弱）。
   CM.CFG.macro = {
     area: '地图范围（老城区、天河、海珠、白云南部、芳村与黄埔等）', region: '中国内地',
-    gdp0: 2400000, revRatio: [[1990, 0.2], [1994, 0.15], [2003, 0.17], [2010, 0.2], [2020, 0.18], [2040, 0.17]], revElastic: 1.5,
+    gdp0: 2620000, revRatio: [[1990, 0.2], [1994, 0.15], [2003, 0.17], [2010, 0.2], [2020, 0.18], [2040, 0.17]], revElastic: 1.5,
     prod: [[1990, 0.03], [1991, 0.09], [1993, 0.11], [1997, 0.09], [2000, 0.085], [2005, 0.09], [2008, 0.08], [2011, 0.07], [2015, 0.055], [2019, 0.045], [2025, 0.035], [2035, 0.022], [2050, 0.015], [2080, 0.012]],
     infl: 'cn', longRun: { infl: 0.02 }, histEnd: 2020, ref: 'cn',
     struct: { trade: 0.65, fin: 0.3, ind: 0.55, tour: 0.45, prop: 0.45 },
@@ -301,12 +365,12 @@
       { id: 'tight1993', y: 1993, m: 6 },
       { id: 'asia1997', y: 1997, m: 7, scale: 0.5, desc: '周边国家与地区货币大幅贬值，广州的出口与外资增速放缓；人民币汇率保持稳定，冲击小于东南亚与香港。' },
       { id: 'wto2001', y: 2001, m: 12 },
-      { id: 'sars2003', y: 2003, m: 2, desc: '疫情最早在广东出现，春季的旅游、餐饮与商贸活动明显减少，疫情结束后较快恢复。' },
+      { id: 'sars2003', y: 2003, m: 2, desc: '疫情最早在广东出现，春季的旅游、餐饮与商贸活动明显减少，疫情结束后较快恢复。', fx: { demand: { sh: 0.85, lz: 0.75, hub: 0.7, months: 3, fade: 0.25 } } },
       { id: 'gfc2008', y: 2008, m: 9, scale: 0.8 },
       { id: 'stim2008', y: 2008, m: 11 },
       { id: 'cnstock2015', y: 2015, m: 6 },
       { id: 'trade2018', y: 2018, m: 7 },
-      { id: 'covid2020', y: 2020, m: 1 },
+      { id: 'covid2020', y: 2020, m: 1, fx: { demand: { sc: 0.7, sh: 0.8, lz: 0.6, hub: 0.5, months: 3, fade: 1 } } },
     ],
   };
 })(window.CM);

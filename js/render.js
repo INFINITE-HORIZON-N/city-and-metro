@@ -1,6 +1,7 @@
 'use strict';
 // 渲染：相机（平移/缩放/视图过渡）、地面与等距建筑分块缓存、分析图层、地铁网络、动态对象、标注
 (function (CM) {
+  const AX = CM.Accessibility;
   const U = CM.U, CFG = CM.CFG, D = CM.DATA, LU = CM.LU;
   const ISO = [0.70710678, -0.70710678, 0.35355339, 0.35355339];
   const HSF = 0.82;                          // 高度屏幕系数
@@ -77,7 +78,7 @@
     this.ground = new Map(); this.iso = new Map(); this.cachePx = 0;
     this.overview = null; this.overviewStale = true; this.overviewAt = 0;
     this.frame = 0; this.time = 0;
-    this.layer = 'none'; this.layerOpt = { flow: 'all', station: 'all', stView: 'flow', stDt: 'avg', cover: 'time', facP: 'all', facDt: 'wd', gapDt: 'wd' };
+    this.layer = 'none'; this.layerOpt = { cong: 'now', flow: 'all', station: 'all', stView: 'flow', stDt: 'avg', cover: 'time', facP: 'all', facDt: 'wd', gapDt: 'wd', devK: 'pop', devB: 'era' };
     this.heat = null; this.heatKey = '';
     this.bFade = 0; this.roadVer = -1;
     this.labelsOn = true;
@@ -89,6 +90,7 @@
     this.fx = [];
     this.detail = { tier: 0, ema: 8, busy: 0, calm: 0 };
     this.textWidths = new Map();
+    this.labelSprites = new Map(); this.labelSpritePx = 0;
     this.roadLabelGeom = new WeakMap();
     this.segScreens = new WeakMap();
     this.segDecos = new WeakMap();
@@ -98,11 +100,18 @@
   CM.Renderer = Renderer;
 
   Renderer.prototype.noteFrameTime = function (ms) { this.lastFrameMs = ms; };
+  Renderer.prototype.cacheLimit = function () {
+    const memory = Number(navigator.deviceMemory) || 8;
+    const touch = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+    return Math.min(CFG.perf.cacheMaxPx, memory <= 2 ? 8e6 : memory <= 4 || touch ? 12e6 : CFG.perf.cacheMaxPx);
+  };
   Renderer.prototype.adaptDetail = function (dt) {
     const d = this.detail, elapsed = Math.min(0.1, dt || 1 / 60);
-    const work = this.lastFrameMs == null ? (this.lastRenderMs || 0) : this.lastFrameMs;
-    const missedFrame = dt > 1 / 45 ? dt * 1000 : 0;
-    const cost = Math.min(100, Math.max(work, missedFrame, this.cachePx > CFG.perf.cacheMaxPx ? 20 : 0));
+    // 地图块绘制时间不计入：它有自己的预算，补块时降低细节只会换来更多重绘
+    const q = this.lastQueueMs || 0;
+    const work = Math.max(0, (this.lastFrameMs == null ? (this.lastRenderMs || 0) : this.lastFrameMs) - q);
+    const missedFrame = dt > 1 / 45 ? Math.max(0, dt * 1000 - q) : 0;
+    const cost = Math.min(100, Math.max(work, missedFrame, this.cachePx > this.cacheLimit() ? 20 : 0));
     d.ema += (cost - d.ema) * 0.12;
     d.busy = d.ema > 18 ? d.busy + elapsed : Math.max(0, d.busy - elapsed * 2);
     d.calm = d.ema < 12 ? d.calm + elapsed : 0;
@@ -115,10 +124,32 @@
     let width = this.textWidths.get(key);
     if (width === undefined) {
       width = ctx.measureText(text).width;
-      if (this.textWidths.size >= 2048) this.textWidths.clear();
+      if (this.textWidths.size >= 4096) this.textWidths.delete(this.textWidths.keys().next().value);
       this.textWidths.set(key, width);
-    }
+    } else { this.textWidths.delete(key); this.textWidths.set(key, width); }
     return width;
+  };
+  // 相机移动时只重排标注，字形与描边按原生像素密度复用；避免每帧重新栅格化全部站名。
+  // 缓存有独立上限，主题、字体和显示密度都参与键值，换图时也不会无限积累。
+  Renderer.prototype.labelSprite = function (ctx, text, font, fill) {
+    const dpr = this.dpr, key = [dpr, font, fill, TH.halo, document.fonts ? document.fonts.status : '', text].join('|');
+    let hit = this.labelSprites.get(key);
+    if (hit) { this.labelSprites.delete(key); this.labelSprites.set(key, hit); return hit; }
+    ctx.font = font; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    const m = ctx.measureText(text), left = Math.floor(Math.min(0, -m.actualBoundingBoxLeft) - 3),
+      right = Math.ceil(Math.max(m.width, m.actualBoundingBoxRight) + 3),
+      top = Math.floor(-m.actualBoundingBoxAscent - 3), bottom = Math.ceil(m.actualBoundingBoxDescent + 3);
+    const cv = makeCanvas(Math.max(1, Math.ceil((right - left) * dpr)), Math.max(1, Math.ceil((bottom - top) * dpr)));
+    const x = cv.getContext('2d'); x.setTransform(dpr, 0, 0, dpr, -left * dpr, -top * dpr);
+    x.font = font; x.textAlign = 'left'; x.textBaseline = 'middle'; x.lineWidth = 3.2; x.lineJoin = 'round';
+    x.strokeStyle = TH.halo; x.strokeText(text, 0, 0); x.fillStyle = fill; x.fillText(text, 0, 0);
+    hit = { cv: cv, left: left, top: top, width: m.width, px: cv.width * cv.height };
+    this.labelSprites.set(key, hit); this.labelSpritePx += hit.px;
+    while (this.labelSpritePx > Math.min(4e6, this.cacheLimit() / 8) || this.labelSprites.size > 2048) {
+      const k = this.labelSprites.keys().next().value, old = this.labelSprites.get(k);
+      this.labelSprites.delete(k); this.labelSpritePx -= old.px; old.cv.width = old.cv.height = 1;
+    }
+    return hit;
   };
   Renderer.prototype.featurePath = function (feature, polygon) {
     let p = this.geoPaths.get(feature);
@@ -126,13 +157,17 @@
     return p;
   };
   Renderer.prototype.clearImages = function () {
-    this.cancelIsoJob();
+    this.cancelIsoJob(); this.cancelGroundJob();
     for (const cache of [this.ground, this.iso]) { for (const e of cache.values()) e.cv.width = e.cv.height = 1; cache.clear(); }
     this.cachePx = 0;
   };
   Renderer.prototype.cancelIsoJob = function () {
     const job = this.isoJob;
     if (job) { if (job.cv) job.cv.width = job.cv.height = 1; job.gen.return(); this.isoJob = null; }
+  };
+  Renderer.prototype.cancelGroundJob = function () {
+    const job = this.groundJob;
+    if (job) { job.gen.return(); if (job.cv) job.cv.width = job.cv.height = 1; this.groundJob = null; }
   };
   // Hold the displayed raster level until the replacement viewport is ready. Buildings at
   // different levels use different chunk grids, so switching immediately would hide them.
@@ -186,6 +221,45 @@
     this.stats.rasterLevel = this.displayedLevel;
     return this.displayedLevel;
   };
+  // 空闲预绘（v2.1）：画面内的块都已就绪时，预先绘制下一档更清晰的级别（覆盖视野中部，放大时直接切换）、
+  // 当前级别的视野外一圈（平移）与更粗一档（缩小），让缩放与移动时不再先看到模糊的低分辨率块。
+  // 已在缓存中的目标块标为最近使用，避免被淘汰后又重绘
+  Renderer.prototype.prefetch = function (queue, lvl, b, buildings) {
+    if (!lvl) return;
+    const k = LEVELS.indexOf(lvl), cam = this.cam, vw = b.x1 - b.x0, vh = b.y1 - b.y0, keep = this.frame - 1, cap = this.cacheLimit();
+    const plan = [], todo = [];
+    if (k + 1 < LEVELS.length) plan.push([LEVELS[k + 1], -0.2, 100]);   // 视野中部约 1/3 面积（放大一档后的画面）
+    plan.push([lvl, 0.3, 200]);
+    if (k > 0) plan.push([LEVELS[k - 1], 0.8, 300]);
+    for (const p of plan) {
+      const L = p[0], x0 = b.x0 - vw * p[1], x1 = b.x1 + vw * p[1], y0 = b.y0 - vh * p[1], y1 = b.y1 + vh * p[1];
+      const C = CHUNK_PX / L;
+      for (let cj = Math.max(0, Math.floor(y0 / C)); cj <= Math.min(Math.ceil(CFG.H / C) - 1, Math.floor(y1 / C)); cj++) {
+        for (let ci = Math.max(0, Math.floor(x0 / C)); ci <= Math.min(Math.ceil(CFG.W / C) - 1, Math.floor(x1 / C)); ci++) {
+          const key = L + ':' + ci + ':' + cj, e = this.ground.get(key);
+          if (e) e.used = Math.max(e.used, keep);
+          if (!e || e.stale) todo.push({ kind: 'g', key: key, lvl: L, ci: ci, cj: cj, d: p[2] + Math.abs((ci + 0.5) * C - cam.cx) + Math.abs((cj + 0.5) * C - cam.cy) });
+        }
+      }
+      if (!buildings) continue;
+      const S = this.isoChunkGeom(L);
+      for (let cj = Math.max(0, Math.floor(y0 / S) - 1); cj <= Math.min(Math.ceil(CFG.H / S) - 1, Math.floor(y1 / S) + 1); cj++) {
+        for (let ci = Math.max(0, Math.floor(x0 / S) - 1); ci <= Math.min(Math.ceil(CFG.W / S) - 1, Math.floor(x1 / S) + 1); ci++) {
+          const key = 'i' + L + ':' + ci + ':' + cj, e = this.iso.get(key);
+          if (e) e.used = Math.max(e.used, keep);
+          if (!e || e.stale) todo.push({ kind: 'i', key: key, lvl: L, ci: ci, cj: cj, C: S, d: p[2] + 0.5 + Math.abs((ci + 0.5) * S - cam.cx) + Math.abs((cj + 0.5) * S - cam.cy) });
+        }
+      }
+    }
+    if (!todo.length) return;
+    // 缓存偏满：先淘汰既不在画面内、也不是这次预绘目标的旧块，腾出空间后再预绘（移动到新区域后仍能继续）
+    if (this.cachePx > cap * 0.75) this.evict(cap * 0.6, keep);
+    if (this.cachePx > cap * 0.75) return;
+    for (const q of todo) queue.push(q);
+  };
+  // 主题切换等需要「一次画清」时：在 ms 毫秒内放宽每帧的绘制预算，画面内的块补齐即结束
+  Renderer.prototype.warm = function (ms) { this.warmUntil = performance.now() + (ms || 1500); };
+  Renderer.prototype.sharpReady = function () { return this.frame > 0 && this.stats.pendingVisible === 0; };
   Renderer.prototype.isoVisible = function (e, level, ci, cj, size) {
     const a = this.P(ci * size, cj * size, 0), sc = this.z / level, pad = 2.8 * this.z;
     return e && !e.empty ? this.screenVisible(a.x - e.ax * sc, a.y - e.ay * sc, e.cv.width * sc, e.cv.height * sc, 2)
@@ -312,10 +386,16 @@
   Renderer.prototype.setGame = function (g) {
     this.game = g;
     this.displayedLevel = this.requestedLevel = null;
-    this.clearImages(); this.overview = null; this.overviewJob = null; this.overviewStale = true; this.heat = null; this.heatKey = '';
+    this.clearImages(); this.dropThemeStash(); this.overview = null; this.overviewJob = null; this.overviewStale = true; this.heat = null; this.heatKey = '';
     this.heatLayers.clear(); this.segScreens = new WeakMap(); this.segDecos = new WeakMap(); this.metroOrder = null;
     this.roadLabelGeom = new WeakMap(); this.textWidths.clear(); this._cgBmp = null;
-    this.geoPaths = new WeakMap(); this.labelImage = null;
+    this.geoPaths = new WeakMap();
+    if (this.labelImage) this.labelImage.cv.width = this.labelImage.cv.height = 1;
+    this.labelImage = null; this.lastLabelKey = null; this.lastLabelC = null;
+    for (const item of this.labelSprites.values()) item.cv.width = item.cv.height = 1;
+    this.labelSprites.clear(); this.labelSpritePx = 0;
+    this._facS = null; this._layerRects = []; this._layerNamed = null; this._layerRectsFor = null;
+    this._walkHintCache = null; this.walkTransferHints = []; this._scz = null; this._sczA = 0;
     this._hd = null; this._hdCity = null; this._lmc = null; this._lmcCity = null;
     this.lastFrameMs = null; this.detail = { tier: 0, ema: 8, busy: 0, calm: 0 };
     this.roadVer = g ? g.city.roadVersion : -1;
@@ -325,17 +405,42 @@
     this._rk = null; this.styleEpoch = g ? Math.floor(g.clock.y / 5) : null; this.styleYear = g ? this.styleEpoch * 5 : null;
   };
   // 切换主题：重建地面与建筑缓存（总览图立即重绘，避免空白）
+  // 画面内的块按主题暂存，只留一套；与当前主题共用内存预算。
+  Renderer.prototype.themeSig = function () {
+    const g = this.game;
+    return g ? [g, g.city.version, g.city.roadVersion, this.styleEpoch, this.w, this.h, this.dpr, this.detail.tier] : null;
+  };
+  Renderer.prototype.dropThemeStash = function () {
+    const st = this.themeStash; this.themeStash = null;
+    if (st) for (const cache of [st.ground, st.iso]) for (const e of cache.values()) e.cv.width = e.cv.height = 1;
+  };
   Renderer.prototype.setTheme = function (name) {
+    const prev = this.themeName, sig = this.themeSig();
+    const same = function (a, b) { return a && b && a.length === b.length && a.every(function (v, i) { return v === b[i]; }); };
+    this.cancelIsoJob(); this.cancelGroundJob();
+    const stash = { name: prev, sig: sig, ground: new Map(), iso: new Map(), px: 0 }, keep = this.frame;   // 只留上一帧画到的块（不含预绘）
+    for (const pair of [[this.ground, stash.ground], [this.iso, stash.iso]]) {
+      for (const [k, e] of pair[0]) {
+        if (sig && e.used >= keep && !e.stale && stash.px + e.px <= this.cacheLimit() * 0.45) { pair[1].set(k, e); stash.px += e.px; } else e.cv.width = e.cv.height = 1;
+      }
+      pair[0].clear();
+    }
+    this.cachePx = 0;
+    const back = this.themeStash; this.themeStash = null;
+    if (back && back.name === name && same(back.sig, sig)) { this.ground = back.ground; this.iso = back.iso; this.cachePx = back.px; }
+    else if (back) { this.themeStash = back; this.dropThemeStash(); }
+    this.themeStash = stash.px ? stash : null;
     TH = THEMES[name] || THEMES.light; GROUND = TH.ground; PAL = TH.pal;
     this.th = TH; this.themeName = name;
     this.displayedLevel = this.requestedLevel = null;
-    this.clearImages(); this.heatKey = ''; this._cgBmp = null;
+    this.heatKey = ''; this._cgBmp = null;
     if (this.game) this.renderOverview(); else this.overviewStale = true;
   };
   Renderer.prototype.resize = function () {
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const w = window.innerWidth, h = window.innerHeight;
     if (w === this.w && h === this.h && dpr === this.dpr) return;
+    this.dropThemeStash();
     this.dpr = dpr; this.w = w; this.h = h;
     this.cv.width = Math.round(w * dpr); this.cv.height = Math.round(h * dpr);
     this.cv.style.width = w + 'px'; this.cv.style.height = h + 'px';
@@ -392,7 +497,7 @@
   Renderer.prototype.updateCamera = function (dt) {
     const c = this.cam;
     if (c.fly) {
-      const f = c.fly; f.t = Math.min(1, f.t + dt / 0.65);
+      const f = c.fly; f.t = Math.min(1, f.t + dt / (f.duration || 0.65));
       const e = U.easeInOut(f.t);
       c.cx = U.lerp(f.fx, f.tx, e); c.cy = U.lerp(f.fy, f.ty, e);
       c.zoom = Math.exp(U.lerp(Math.log(f.fz), Math.log(f.tzm), e)); c.tz = c.zoom;
@@ -429,6 +534,7 @@
       this.ground.forEach(function (e) { e.stale = true; });
       this.overviewStale = true;
     }
+    this.syncMetroMask();
     if (!city.dirty.size) return;
     this.cancelIsoJob();
     const keys = new Set(), ikeys = new Set(), self = this;
@@ -449,15 +555,19 @@
     this.overviewStale = true;
     this.heatKey = '';
   };
-  Renderer.prototype.evict = function () {
-    if (this.cachePx <= CFG.perf.cacheMaxPx) return;
+  // to：淘汰到的像素数；keep：used 不小于它的块保留（默认只保留本帧用到的）
+  Renderer.prototype.evict = function (to, keep) {
+    const cap = this.cacheLimit();
+    if (this.themeStash && this.cachePx + this.themeStash.px > cap) this.dropThemeStash();
+    if (to == null) { if (this.cachePx <= cap) return; to = cap * 0.8; }
+    if (keep == null) keep = this.frame;
     const all = [];
     this.ground.forEach(function (e, k) { all.push([e, k, 'g']); });
     this.iso.forEach(function (e, k) { all.push([e, k, 'i']); });
     all.sort(function (a, b) { return a[0].used - b[0].used; });
     for (const it of all) {
-      if (this.cachePx <= CFG.perf.cacheMaxPx * 0.8) break;
-      if (it[0].used >= this.frame) continue;
+      if (this.cachePx <= to) break;
+      if (it[0].used >= keep) continue;
       (it[2] === 'g' ? this.ground : this.iso).delete(it[1]);
       this.cachePx -= it[0].px;
       it[0].cv.width = it[0].cv.height = 1;
@@ -478,6 +588,8 @@
   // 风格上以少量玻璃塔楼与低层体量为主；coarse=true（远景）时只保留较高的建筑。
   Renderer.prototype.cellBuildings = function (c, coarse) {
     const city = this.game.city, L = city.lu[c];
+    const landmark = city.protectedId[c] - 1;
+    if (landmark >= 0 && city.landmarkOn[landmark] && D.landmarks[landmark].kind === 'campus') return null;
     if (!city.street[c] && L !== LU.RURAL) return null;
     const h0 = city.bh[c];
     if (h0 <= 0) return null;
@@ -541,6 +653,9 @@
     }
     if (!out.length) return null;
     if (city.taken[c] > 0.05) { const keep = Math.max(0, Math.round(out.length * (1 - city.taken[c]))); out.length = keep; }
+    // 地面 / 高架地铁占用的子地块上的房屋已拆除（syncMetroMask）
+    const mm = this._mt && this._mt.mask.get(c);
+    if (mm) { let n = 0; for (const b of out) if (!(boxBits(b) & mm)) out[n++] = b; out.length = n; }
     return out.length ? out : null;
   };
 
@@ -553,19 +668,42 @@
     // 地块底色（按颜色批量）
     const paths = new Map();
     const P = function (col) { let p = paths.get(col); if (!p) { p = new Path2D(); paths.set(col, p); } return p; };
+    let anyHill = false;
     for (let j = j0; j < j1; j++) {
       for (let i = i0; i < i1; i++) {
         const c = j * W + i, L = city.lu[c];
         let col;
         if (L === LU.WATER) col = GROUND.farm[0];
-        else if (L === LU.HILL) col = GROUND.hill[Math.floor(U.noise2(i * 0.35, j * 0.35, 5) * 3) % 3];
+        else if (L === LU.HILL) { col = GROUND.farm[0]; anyHill = true; }   // 山体另行平滑绘制（见下）
         else if (L === LU.AIRPORT) col = GROUND.airport;
         else if (city.street[c] && L !== LU.PARK) col = GROUND.urban[L] || GROUND.urban[0];
         else col = GROUND.farm[Math.floor(U.hash2(i >> 1, j >> 1, 3) * 3)];
         P(col).rect(i - px, j - px, 1 + 2 * px, 1 + 2 * px);
       }
     }
-    paths.forEach(function (p, col) { ctx.fillStyle = col; ctx.fill(p); });
+    // 按颜色固定顺序填充：各格向外多画 1 像素，相邻不同颜色的重叠处取决于先后，顺序固定后相邻地图块、分条绘制的结果一致
+    Array.from(paths.keys()).sort().forEach(function (col) { ctx.fillStyle = col; ctx.fill(paths.get(col)); });
+    // 山体：按格的掩膜先做 3×3 平均（零散的单格淡出、成片的连成整体），再双线性放大，边缘柔和、不再是一格一格的方块；
+    // 四周多取一格，跨块连续；颜色随平滑噪声略有深浅
+    if (anyHill) {
+      const mw = i1 - i0 + 2, mh = j1 - j0 + 2, mc = makeCanvas(mw, mh), mx = mc.getContext('2d'), img = mx.createImageData(mw, mh), d = img.data;
+      const shades = GROUND.hill.map(function (h) { return U.hex2rgb(h); });
+      const isHill = function (i, j) { return city.lu[U.clamp(j, 0, H - 1) * W + U.clamp(i, 0, W - 1)] === LU.HILL ? 1 : 0; };
+      for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++) {
+        const i = i0 - 1 + x, j = j0 - 1 + y;
+        let s = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) s += isHill(i + dx, j + dy) * (dx && dy ? 0.5 : 1);
+        const cover = (s + isHill(i, j) * 2) / 9;   // 中心 3、四邻各 1、四角各 0.5，权重合计 9
+        if (cover < 0.3) continue;
+        const t = U.noise2(i * 0.18, j * 0.18, 5) * 2, k = Math.min(1, Math.floor(t)), f = t - k, a = shades[k], b = shades[k + 1], o = (y * mw + x) * 4;
+        d[o] = a[0] + (b[0] - a[0]) * f; d[o + 1] = a[1] + (b[1] - a[1]) * f; d[o + 2] = a[2] + (b[2] - a[2]) * f;
+        d[o + 3] = Math.round(255 * U.clamp((cover - 0.3) / 0.45, 0, 1));
+      }
+      mx.putImageData(img, 0, 0);
+      ctx.save(); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(mc, 0, 0, mw, mh, i0 - 1, j0 - 1, mw, mh);   // 第 x 个像素对应格 i0 − 1 + x，像素中心即格中心
+      ctx.restore();
+    }
     // 夜间：商业中心与混合街区的暖色灯光（按岗位密度分三档）
     if (TH.night && lvl >= 16) {
       const glow = [new Path2D(), new Path2D(), new Path2D()], any = [false, false, false];
@@ -588,6 +726,7 @@
     ctx.fillStyle = GROUND.hill[0]; ctx.globalAlpha = 0.85;
     for (const f of Geo.reserves) if (inBox(f.bbox, 0.5)) ctx.fill(this.featurePath(f, true), 'evenodd');
     ctx.globalAlpha = 1;
+    if (CM.Settings.get('lighting') !== false) this.drawTerrainLight(ctx);
     // 公园（真实范围）
     const pp = new Path2D();
     for (const f of Geo.parks) if (inBox(f.bbox, 0.5)) pp.addPath(this.featurePath(f, true));
@@ -595,7 +734,10 @@
     if (lvl >= 16) { ctx.strokeStyle = GROUND.parkEdge; ctx.lineWidth = px * 1.2; ctx.stroke(pp); }
     // 旧机场跑道
     const ab = city.airportBox;
-    const rw = D.airport && D.airport.runway;
+    let rw = D.airport && D.airport.runway;
+    // 跑道延长段的填海尚未成陆时，跑道止于原来的端点
+    const rx = D.airport && D.airport.runwayExt, rxr = rx && (D.reclaim || []).find(function (r) { return r.id === rx.reclaim; });
+    if (rw && rxr && rxr.year > city.terrainYear) rw = [rw[0], rx.end];
     if (rw && city.lu.indexOf(LU.AIRPORT) >= 0 && inBox([Math.min(rw[0][0], rw[1][0]), Math.min(rw[0][1], rw[1][1]), Math.max(rw[0][0], rw[1][0]), Math.max(rw[0][1], rw[1][1])], 1)) {
       // 指定方向的跑道（如伸入海港的启德跑道）
       ctx.lineCap = 'butt';
@@ -609,14 +751,36 @@
       ctx.strokeStyle = '#f4f4f0'; ctx.lineWidth = Math.max(px, 0.02); ctx.setLineDash([0.3, 0.3]);
       ctx.beginPath(); ctx.moveTo(cx, y0 + 0.2); ctx.lineTo(cx, y0 + len - 0.2); ctx.stroke(); ctx.setLineDash([]);
     }
+    // 其他机场的跑道（v2.2，如香港国际机场的三条跑道）：按启用年份画，跑道所在须已成陆
+    const ryear = g.clock.y + ((g.clock.m || 1) - 1) / 12;
+    for (const r of D.runways || []) {
+      if (ryear < r.from || !inBox([Math.min(r.a[0], r.b[0]), Math.min(r.a[1], r.b[1]), Math.max(r.a[0], r.b[0]), Math.max(r.a[1], r.b[1])], 1)) continue;
+      if (city.waterAt((r.a[0] + r.b[0]) / 2, (r.a[1] + r.b[1]) / 2)) continue;
+      ctx.lineCap = 'butt'; ctx.beginPath(); ctx.moveTo(r.a[0], r.a[1]); ctx.lineTo(r.b[0], r.b[1]);
+      ctx.strokeStyle = GROUND.apron; ctx.lineWidth = 0.55; ctx.stroke();
+      ctx.strokeStyle = GROUND.runway; ctx.lineWidth = 0.24; ctx.stroke();
+      ctx.strokeStyle = '#f4f4f0'; ctx.lineWidth = Math.max(px, 0.02); ctx.setLineDash([0.3, 0.3]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    // 场地底色先画，随后保留水系、铁路与道路的原始显示。
+    for (let k = 0; k < D.landmarks.length; k++) {
+      const lm = D.landmarks[k];
+      if (city.landmarkOn[k] && CM.Sites.complex(lm) && inBox([lm.x - Math.hypot(lm.w, lm.d) / CFG.CELL_M, lm.y - Math.hypot(lm.w, lm.d) / CFG.CELL_M, lm.x + Math.hypot(lm.w, lm.d) / CFG.CELL_M, lm.y + Math.hypot(lm.w, lm.d) / CFG.CELL_M], 0)) this.drawSiteFloor(ctx, lm);
+    }
     // 水系（真实岸线）
-    const wpth = new Path2D();
-    for (const f of Geo.water) if (inBox(f.bbox, 0.5)) wpth.addPath(this.featurePath(f, true));
+    const wpth = new Path2D(), bankPath = new Path2D();
+    for (const f of Geo.water) if (inBox(f.bbox, 0.5)) { wpth.addPath(this.featurePath(f, true)); bankPath.addPath(this.bankPath(f)); }
     ctx.lineJoin = 'round'; ctx.lineCap = 'round';
     // 历史海岸线：尚未填海成陆的区域仍画成水面（单独以 nonzero 填充，避免与海域多边形的奇偶规则抵消）
-    const rpth = new Path2D(); let anyRc = false;
-    for (const f of city.reclaimFeats ? city.reclaimFeats(true) : []) if (inBox(f.bbox, 0.5)) { const path = this.featurePath(f, true); rpth.addPath(path); wpth.addPath(path); anyRc = true; }
-    ctx.strokeStyle = GROUND.bank; ctx.lineWidth = Math.max(0.05, px * 2.4); ctx.stroke(wpth);
+    // v2.1：填海范围按平滑后的实际水面（city.reclaimWater），岸线只描旧海岸一侧
+    const rpth = new Path2D(), redge = new Path2D(); let anyRc = false;
+    for (const f of city.reclaimWater ? city.reclaimWater() : []) if (inBox(f.bbox, 0.5)) {
+      rpth.addPath(this.featurePath(f, true)); anyRc = true;
+      let ep = this.geoPaths.get(f.edge);
+      if (!ep) { ep = new Path2D(); const e = f.edge; for (let q = 0; q + 3 < e.length; q += 4) { ep.moveTo(e[q], e[q + 1]); ep.lineTo(e[q + 2], e[q + 3]); } this.geoPaths.set(f.edge, ep); }
+      redge.addPath(ep);
+    }
+    ctx.strokeStyle = GROUND.bank; ctx.lineWidth = Math.max(0.05, px * 2.4); ctx.stroke(bankPath);
+    if (anyRc) ctx.stroke(redge);
     ctx.fillStyle = GROUND.water; ctx.fill(wpth, 'evenodd');
     if (anyRc) ctx.fill(rpth, 'nonzero');
     // 水面波纹（近景）
@@ -624,7 +788,8 @@
       ctx.save(); ctx.clip(wpth, 'evenodd');
       ctx.strokeStyle = GROUND.glint; ctx.lineWidth = px * 1.2;
       ctx.beginPath();
-      for (let j = Math.floor(Y0); j < Y1; j += 0.7) for (let i = Math.floor(X0); i < X1; i += 1.3) {
+      // 波纹格点按世界坐标对齐（相邻地图块、分条绘制时图案连续）
+      for (let j = Math.floor(Y0 / 0.7) * 0.7; j < Y1; j += 0.7) for (let i = Math.floor(X0 / 1.3) * 1.3; i < X1; i += 1.3) {
         const hx = U.hash2(Math.round(i * 10), Math.round(j * 10), 17); if (hx > 0.35) continue;
         const x = i + hx * 1.5, y = j + U.hash2(Math.round(i * 10), Math.round(j * 10), 18) * 0.5;
         ctx.moveTo(x, y); ctx.lineTo(x + 0.35, y - 0.06);
@@ -632,8 +797,10 @@
       ctx.stroke(); ctx.restore();
     }
     for (const l of Geo.waterLines) {
-      if (!inBox(l.bbox, 0.5)) continue;
-      ctx.strokeStyle = GROUND.water; ctx.lineWidth = Math.max(l.w, px * 1.5);
+      const width = Math.max(l.w, px * 1.5);
+      // 河道bbox仅覆盖中心线；裁剪必须包含描边半宽和抗锯齿，否则跨图块 / 条带的宽河道会被切成方块。
+      if (!inBox(l.bbox, width / 2 + px)) continue;
+      ctx.strokeStyle = GROUND.water; ctx.lineWidth = width;
       ctx.stroke(this.featurePath(l, false));
     }
     // 2D 建筑占地（近景才显示，保持平面图简洁）
@@ -655,7 +822,7 @@
           fp.rect(x0, y0, x1 - x0, y1 - y0);
         }
       }
-      ctx.fillStyle = TH.shadow2d; ctx.fill(shadow);
+      if (CM.Settings.get('lighting') !== false) { ctx.fillStyle = TH.shadow2d; ctx.fill(shadow); }
       ctx.strokeStyle = TH.bldStroke; ctx.lineWidth = px;
       fills.forEach(function (p, col) { ctx.fillStyle = col; ctx.fill(p); if (lvl >= 32) ctx.stroke(p); });
     }
@@ -736,30 +903,51 @@
       if (lm.x < X0 - R || lm.x > X1 + R || lm.y < Y0 - R || lm.y > Y1 + R) continue;
       this.drawLandmark2D(ctx, lm, lvl);
     }
-    // 未开放区域
-    const lock = new Path2D(); let anyLock = false;
-    for (let j = j0; j < j1; j++) for (let i = i0; i < i1; i++) {
-      const c = j * W + i;
-      const rg = city.regions[city.region[c]];
-      if (city.regionOpen[city.region[c]] || rg.scenic || city.lu[c] === LU.WATER) continue;
-      lock.rect(i - px, j - px, 1 + 2 * px, 1 + 2 * px); anyLock = true;
+    // Supplemental facilities use the same ground and isometric plans.
+    for (const it of this.extraModels()) {
+      const r = Math.hypot(it.lm.w, it.lm.d) / CFG.CELL_M;
+      if (it.x < X0 - r || it.x > X1 + r || it.y < Y0 - r || it.y > Y1 + r) continue;
+      this.drawLandmark2D(ctx, it.lm, lvl);
     }
+    // 未开放区域：底色与斜线先画在临时图层上，再用按格掩膜（3×3 平均后双线性放大）裁出范围，
+    // 与山体、风景区相邻处是柔和的边缘，不再是一格一格的方块。水面格按所在区域计入（随后按真实岸线裁掉水面）
+    const locked = function (i, j) {
+      const c = U.clamp(j, 0, H - 1) * W + U.clamp(i, 0, W - 1), k = city.region[c];
+      const state = city.lockState();
+      return city.landFrac[c] >= 0.5 ? state.mask[c] : (state.info[city.lockRegion(c)].b ? 0 : 1);
+    };
+    let anyLock = false;
+    for (let j = j0; j < j1 && !anyLock; j++) for (let i = i0; i < i1; i++) if (locked(i, j) && city.lu[j * W + i] !== LU.WATER) { anyLock = true; break; }
     if (anyLock) {
-      ctx.save();
-      ctx.clip(lock);
-      // 只覆盖陆地：沿岸的格按真实岸线裁掉水面，避免锯齿状的斜线压在江面上
+      const mw = i1 - i0 + 2, mh = j1 - j0 + 2, mc = makeCanvas(mw, mh), mx = mc.getContext('2d'), img = mx.createImageData(mw, mh), d = img.data;
+      for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++) {
+        const i = i0 - 1 + x, j = j0 - 1 + y;
+        let s = locked(i, j) * 2;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) s += locked(i + dx, j + dy) * (dx && dy ? 0.5 : 1);
+        const cover = s / 9;
+        if (cover >= 0.3) { const o = (y * mw + x) * 4; d[o] = d[o + 1] = d[o + 2] = 255; d[o + 3] = Math.round(255 * U.clamp((cover - 0.3) / 0.45, 0, 1)); }
+      }
+      mx.putImageData(img, 0, 0);
+      const cv = ctx.canvas, layer = makeCanvas(cv.width, cv.height), lx = layer.getContext('2d'), tf = ctx.getTransform();
+      lx.setTransform(tf);
+      // 只覆盖陆地：沿岸按真实岸线裁掉水面，避免锯齿状的斜线压在江面上
       const land = new Path2D(); land.rect(X0 - 1, Y0 - 1, X1 - X0 + 2, Y1 - Y0 + 2); land.addPath(wpth);
-      ctx.clip(land, 'evenodd');
-      ctx.fillStyle = TH.lockFill; ctx.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
-      ctx.strokeStyle = TH.lockHatch; ctx.lineWidth = Math.max(px, 0.04);
-      ctx.beginPath();
-      for (let k = Math.floor((X0 + Y0) / 0.6) * 0.6; k < X1 + Y1; k += 0.6) { ctx.moveTo(k - Y0, Y0); ctx.lineTo(k - Y1, Y1); }
-      ctx.stroke();
-      ctx.restore();
+      lx.save(); lx.clip(land, 'evenodd');
+      lx.fillStyle = TH.lockFill; lx.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
+      lx.strokeStyle = TH.lockHatch; lx.lineWidth = Math.max(px, 0.04);
+      lx.beginPath();
+      for (let k = Math.floor((X0 + Y0) / 0.6) * 0.6; k < X1 + Y1; k += 0.6) { lx.moveTo(k - Y0, Y0); lx.lineTo(k - Y1, Y1); }
+      lx.stroke(); lx.restore();
+      // 尚未填海的水面同样不盖（单独擦除：与现代水面重叠的部分用奇偶规则会互相抵消）
+      if (anyRc) { lx.globalCompositeOperation = 'destination-out'; lx.fillStyle = '#000'; lx.fill(rpth, 'nonzero'); }
+      lx.globalCompositeOperation = 'destination-in'; lx.imageSmoothingEnabled = true; lx.imageSmoothingQuality = 'high';
+      lx.drawImage(mc, 0, 0, mw, mh, i0 - 1, j0 - 1, mw, mh);
+      ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(layer, 0, 0); ctx.restore();
     }
   };
   // 地标占地（2D 平面）：真实场地范围 + 主体建筑轮廓
   Renderer.prototype.drawLandmark2D = function (ctx, lm, lvl) {
+    if (CM.Sites.complex(lm)) return this.drawComplexSite(ctx, (x, y) => [x, y], lm, lvl, true);
     const F = TH.lm2d, N = TH.night, CMM = CFG.CELL_M;
     const ang = (lm.rot || 0) * Math.PI / 180, ca = Math.cos(ang), sa = Math.sin(ang);
     const T = function (u, v) { return [lm.x + (u * ca - v * sa) / CMM, lm.y + (u * sa + v * ca) / CMM]; };
@@ -778,29 +966,83 @@
         if (lm.kind === 'hall') { poly(ngon(0, 0, 31, 8, Math.PI / 8), '#4a83c4'); poly(ngon(0, 0, 14, 8, Math.PI / 8), '#7fb0e0', false); }
         else rect(-18, -18, 18, 18, '#f2f2ee');
         break;
+      case 'themepark': {   // 主题乐园（v2.2 重做）：与三维布局一致的平面——大街与中央广场、湖面、穹顶、城堡与外圈小火车；海洋公园为海滨乐园
+        rect(-hw, -hd, hw, hd, lawn, false);
+        const wat = N ? '#2f4a5e' : '#a9d3e8', wht = N ? '#5a6272' : '#f4f2ee', blu = N ? '#3f5ea8' : '#6f93cf', cas = N ? '#6a6f9a' : '#ece6f2';
+        if (lm.style === 'castle' && lm.id === 'sh_disney') {   // 上海迪士尼：中央城堡与奇想花园、南面米奇大街、西侧宝藏湾湖面与咆哮山、东侧创极速光轮顶棚
+          rect(-15, hd * 0.38, 15, hd * 0.88, plaza, false); poly(ngon(0, hd * 0.2, 66, 20), plaza, false); poly(ngon(0, hd * 0.2, 52, 20), N ? '#2f4a3c' : '#b6d6a8', false);
+          poly(ngon(-hw * 0.6, hd * 0.2, hw * 0.28, 20, 0, hd * 0.34), wat, false);
+          poly(ngon(-hw * 0.52, -hd * 0.44, 40, 7), N ? '#7a5a50' : '#d29a82');
+          poly(ngon(hw * 0.56, hd * 0.08, 64, 16, 0, 36), wht);
+          poly(ngon(0, -hd * 0.08, 44, 8, Math.PI / 8), cas); poly(ngon(0, -hd * 0.08, 14, 8, Math.PI / 8), blu, false);
+        } else if (lm.style === 'castle') {
+          const tk = /^fac_tk/.test(lm.id || ''), cz = tk ? -hd * 0.16 : -hd * 0.2;
+          rect(-15, tk ? hd * 0.32 : hd * 0.2, 15, tk ? hd * 0.88 : hd * 0.76, plaza, false); poly(ngon(0, tk ? hd * 0.12 : hd * 0.06, tk ? 48 : 42, 20), plaza, false);
+          poly(ngon(tk ? -hw * 0.56 : -hw * 0.54, tk ? -hd * 0.04 : hd * 0.04, hw * (tk ? 0.28 : 0.26), 20, 0, hd * (tk ? 0.4 : 0.34)), wat, false);
+          poly(ngon(hw * 0.6, tk ? -hd * 0.04 : hd * 0.04, tk ? 42 : 34, 20), wht);
+          poly(ngon(0, cz, tk ? 34 : 30, 8, Math.PI / 8), cas); poly(ngon(0, cz, 11, 8, Math.PI / 8), blu, false);
+          if (!tk) rect(-30, hd * 0.84 - 13, 30, hd * 0.84 + 13, N ? '#6a5048' : '#d8b4a6');
+          ctx.save(); ctx.strokeStyle = N ? '#8a94a8' : '#9aa6b4'; ctx.lineWidth = Math.max(1.5 / lvl, 0.008); poly(ngon(0, 0, hw * (tk ? 0.84 : 0.88), 48, 0, hd * (tk ? 0.8 : 0.84)), null); ctx.restore();
+        } else {
+          poly(ngon(-hw * 0.44, -hd * 0.1, 32, 20), N ? '#4a6080' : '#c6d6e2');
+          poly(ngon(hw * 0.16, hd * 0.1, hw * 0.32, 20, 0, hd * 0.3), wat, false);
+          rect(hw * 0.6 - 23, -hd * 0.36 - 15, hw * 0.6 + 23, -hd * 0.36 + 15, N ? '#2f4a3c' : '#a8c8a0');
+          rect(hw * 0.64 - 30, hd * 0.72 - 5, hw * 0.64 + 30, hd * 0.72 + 5, plaza);
+          for (let k = 0; k < 5; k++) rect(-hw * 0.72 + k * 32 - 6, hd * 0.56 - 7, -hw * 0.72 + k * 32 + 6, hd * 0.56 + 7, bld);
+        }
+        break;
+      }
       case 'stadium':
         rect(-hw, -hd, hw, hd, lm.w > 500 ? lawn : plaza, false);
-        if (lm.w > 500) {
+        if (lm.style === 'race') { poly(ngon(0, 0, hw * 0.92, 40, 0, hd * 0.85), N ? '#5a4a3a' : '#cdb48e'); poly(ngon(0, 0, hw * 0.8, 40, 0, hd * 0.68), N ? '#2a4a30' : '#9cc98a', false); rect(-hw * 0.6, hd * 0.86, hw * 0.6, hd, N ? '#4a5262' : '#e6e8ea'); }
+        else if (lm.w > 500) {
           poly(ngon(0, -70, 150, 36, 0, 125), N ? '#3b4250' : '#eceee9'); poly(ngon(0, -70, 108, 36, 0, 90), '#c8644a', false); poly(ngon(0, -70, 90, 36, 0, 75), '#7dbb62', false);
           poly(ngon(-270, 170, 70, 20, 0, 52), N ? '#3b4250' : '#e2e5e9'); rect(200, 125, 340, 210, N ? '#33475c' : '#cfe2ef');
         } else { poly(ngon(0, 0, hw * 0.95, 30, 0, hd * 0.95), N ? '#3b4250' : '#eceee9'); poly(ngon(0, 0, hw * 0.7, 30, 0, hd * 0.7), '#7dbb62', false); }
         break;
       case 'tvtower': poly(ngon(0, 0, 40, 24, 0, 30), N ? '#4a3f66' : '#b9bec6'); poly(ngon(0, 0, 26, 24, 0, 19), N ? '#2b2840' : '#d5d9df', false); poly(ngon(0, 0, 10, 12), N ? '#d07ae0' : '#646a74', false); break;
       case 'lattice':
-        if (lm.style === 'skytree') { rect(-hw, -hd, hw, hd, plaza, false); poly(ngon(0, 0, 39, 3, -Math.PI / 2), N ? '#3e4a5e' : '#dfe5ec'); poly(ngon(0, 0, 17, 18), N ? '#6fa8e0' : '#a9b3bf', false); }
+        if (lm.style === 'eiffel') { rect(-hw, -hd, hw, hd, plaza, false); for (const a of [-1, 1]) for (const b of [-1, 1]) poly([T(a * 38, b * 38), T(a * 62, b * 38), T(a * 62, b * 62), T(a * 38, b * 62)], N ? '#8a6a44' : '#8a7058'); rect(-38, -38, 38, 38, null); rect(-6, -6, 6, 6, N ? '#c8a064' : '#6e5a46', false); }
+        else if (lm.style === 'skytree') { rect(-hw, -hd, hw, hd, plaza, false); poly(ngon(0, 0, 39, 3, -Math.PI / 2), N ? '#3e4a5e' : '#dfe5ec'); poly(ngon(0, 0, 17, 18), N ? '#6fa8e0' : '#a9b3bf', false); }
         else { rect(-hw, -hd, hw, hd, plaza, false); rect(-45, -30, 45, 30, N ? '#4a4f5a' : '#e4e1da'); for (const a of [-1, 1]) for (const b of [-1, 1]) rect(a * 40 - 6, b * 40 - 6, a * 40 + 6, b * 40 + 6, '#d2452f'); rect(-8, -8, 8, 8, '#d2452f', false); }
         break;
       case 'pagoda': rect(-hw, -hd, hw, hd, plaza, false); rect(-77, -32, -23, -12, '#6f6d6a'); rect(-77, 2, -23, 22, '#6f6d6a'); poly(ngon(30, 0, 11, 8, Math.PI / 8), '#cfa96b'); break;
       case 'minaret': rect(-hw, -hd, hw, hd, plaza, false); rect(-40, -20, 2, 18, '#9aa7ad'); poly(ngon(22, 0, 5, 12), '#e2dccd'); break;
       case 'tower': rect(-18, -13, 18, 13, '#b5402f'); break;
-      case 'church': rect(-hw, -hd, hw, hd, plaza, false); rect(-50, -16, 20, 16, '#9a9890'); rect(20, -17, 32, -5, '#7a786f'); rect(20, 5, 32, 17, '#7a786f'); break;
+      case 'church':
+        rect(-hw, -hd, hw, hd, plaza, false);
+        if (lm.style === 'notredame') { rect(-64, -20, -50, 20, '#8a8478'); rect(-50, -12, 40, 12, '#9aa3ae'); rect(-6, -24, 6, 24, '#9aa3ae'); poly(ngon(48, 0, 12, 12), '#9aa3ae'); }
+        else { rect(-50, -16, 20, 16, '#9a9890'); rect(20, -17, 32, -5, '#7a786f'); rect(20, 5, 32, 17, '#7a786f'); }
+        break;
+      case 'palace': {
+        const ce = hw - 80, wc = N ? '#4c5260' : '#9aa6b4';
+        rect(-hw, -hd, hw, hd, plaza, false);
+        if (lm.style === 'keep') { rect(-hw, -hd, hw, hd, N ? '#4e5058' : '#cfc6b4'); rect(-hw + 8, -hd + 8, hw - 8, hd - 8, plaza, false); rect(-hw + 34, -16, -hw + 66, 16, N ? '#5e6068' : '#b8ae9a'); break; }
+        if (lm.style !== 'louvre') { const iw = Math.min(26, hw * 0.3), id2 = Math.min(26, hd * 0.3); rect(-hw, -hd, hw, hd, wc); rect(-hw + iw, -hd + id2, hw - iw, hd - id2, plaza, false); break; }
+        rect(-hw, -hd, ce - 80, -hd + 22, wc); rect(-hw, hd - 22, ce - 80, hd, wc);
+        rect(ce - 80, -80, ce + 80, 80, wc); rect(ce - 58, -58, ce + 58, 58, plaza);
+        rect(ce - 102, -hd + 22, ce - 80, -80, wc); rect(ce - 102, 80, ce - 80, hd - 22, wc);
+        if ((this.styleYear || 0) >= 1989) poly([T(ce - 192, -17), T(ce - 158, -17), T(ce - 158, 17), T(ce - 192, 17)], N ? '#5a7898' : '#bcd4e6');
+        break;
+      }
+      case 'dome': {
+        rect(-hw, -hd, hw, hd, plaza, false);
+        const bw = Math.min(hw, 70), bd = Math.min(hd, 60), R = Math.min(bw, bd) * 0.42;
+        if (lm.style === 'glass') { rect(-bw, -bd * 0.45, bw, bd * 0.45, N ? '#4c6078' : '#c4d6e4'); poly(ngon(0, 0, bd * 0.38, 16), N ? '#6a86a6' : '#d8e6f0'); }
+        else { rect(-bw, -bd, bw, bd, N ? '#4e5058' : '#d8d0c0'); poly(ngon(0, 0, R * 1.04, 16), lm.style === 'gold' ? '#c9a54e' : lm.style === 'white' ? (N ? '#7a7a76' : '#f2f0e8') : lm.style === 'copper' ? '#7aaa96' : (N ? '#5a626e' : '#9aa4ae')); }
+        break;
+      }
+      case 'arch':
+        if (lm.style === 'defense') { rect(-62, -62, 62, 62, plaza, false); rect(-56, -54, 56, -36, N ? '#7a8294' : '#e4e6ea'); rect(-56, 36, 56, 54, N ? '#7a8294' : '#e4e6ea'); rect(-56, -36, 56, 36, N ? '#5e6676' : '#f0f1f3'); }
+        else { poly(ngon(0, 0, 120, 32), plaza, false); rect(-11, -22.5, 11, 22.5, N ? '#6a665e' : '#cfc6b2'); }   // 星形广场（直径约 240 m，只作底图）
+        break;
       case 'colonial':
         rect(-hw, -hd, hw, hd, lm.w > 500 ? (N ? '#22382a' : '#d8e8c8') : plaza, false);
         if (lm.w > 500) { for (let r = 0; r < 2; r++) for (let k = 0; k < 9; k++) { if (r === 1 && k === 0) continue; const u0 = -hw + 40 + k * (lm.w - 140) / 9, v0 = [-80, 50][r]; rect(u0, v0, u0 + 52, v0 + 46, '#e6c98a'); } rect(-hw + 10, 95, -hw + 150, 140, N ? '#5a6070' : '#f4f4f0'); }
         else { rect(-60, -60, 60, -44, '#d9cfbb'); rect(-60, 44, 60, 60, '#d9cfbb'); rect(-60, -44, -44, 44, '#d9cfbb'); rect(44, -44, 60, 44, '#d9cfbb'); }
         break;
       case 'traditional': case 'temple': rect(-hw, -hd, hw, hd, plaza, false); rect(-hw + 4, -hd + 4, hw - 4, hd - 4, null); break;
-      case 'rail':
+      case 'rail': case 'station2':
         rect(-hw, -hd, hw, hd, plaza, false);
         if (lm.w > 500) { for (let k = 0; k < 5; k++) rect(-hw + 40, -120 + k * 34, hw - 40, -102 + k * 34, N ? '#30363f' : '#c9cbd0', false); rect(-170, 60, 170, 110, N ? '#4a5263' : '#dcdde3'); }
         else rect(-hw + 20, -hd + 30, hw - 20, hd - 50, N ? '#4a5263' : '#dcdde3');
@@ -812,18 +1054,61 @@
         else rect(-hw * 0.9, -hd * 0.9, hw * 0.9, hd * 0.9, N ? '#4a6080' : '#c6d6e2');
         break;
       case 'opera': rect(-hw, -hd, hw, hd, plaza, false); poly(ngon(-30, 0, 62, 7, 0.2, 48), N ? '#4c525e' : '#dcdcd8'); poly(ngon(62, 38, 32, 6, 0.6, 25), N ? '#4c525e' : '#dcdcd8'); break;
-      case 'box': rect(-hw, -hd, hw, hd, plaza, false); rect(-58, -58, 58, 58, N ? '#40424a' : '#8e8e94'); break;
+      case 'box': rect(-hw, -hd, hw, hd, plaza, false); if (lm.style === 'pompidou') rect(-83, -30, 83, 30, N ? '#4a5262' : '#e6e8ea'); else rect(-58, -58, 58, 58, N ? '#40424a' : '#8e8e94'); break;
       case 'concert': poly([T(-58, -26), T(56, -38), T(48, 36), T(-52, 30)], N ? '#5a6474' : '#eef0f2'); break;
       case 'gallery': poly(ngon(0, 0, 46, 5, -Math.PI / 2), N ? '#4a5262' : '#f4f4f2'); break;
+      // 任务设施的示意建筑（v2.2）
+      case 'hospital':
+        rect(-hw, -hd, hw, hd, plaza, false); rect(-hw * 0.8, -hd * 0.62, hw * 0.8, -hd * 0.18, bld); rect(-hw * 0.18, -hd * 0.18, hw * 0.18, hd * 0.7, bld); rect(-hw * 0.8, hd * 0.2, -hw * 0.3, hd * 0.7, bld);
+        poly(ngon(hw * 0.4, -hd * 0.4, 9, 16), N ? '#3e4a5a' : '#e9edf0');   // 屋顶直升机坪
+        rect(hw * 0.4 - 4, -hd * 0.4 - 4.5, hw * 0.4 - 2.6, -hd * 0.4 + 4.5, N ? '#c8d2dc' : '#5a8a9a', false); rect(hw * 0.4 + 2.6, -hd * 0.4 - 4.5, hw * 0.4 + 4, -hd * 0.4 + 4.5, N ? '#c8d2dc' : '#5a8a9a', false); rect(hw * 0.4 - 3, -hd * 0.4 - 0.7, hw * 0.4 + 3, -hd * 0.4 + 0.7, N ? '#c8d2dc' : '#5a8a9a', false);
+        break;
+      case 'mall': rect(-hw, -hd, hw, hd, plaza, false); rect(-hw * 0.88, -hd * 0.8, hw * 0.88, hd * 0.8, bld); rect(-hw * 0.5, -hd * 0.18, hw * 0.5, hd * 0.18, N ? '#4a6080' : '#c6d6e2', false); break;
+      case 'cluster': rect(-hw, -hd, hw, hd, plaza, false); rect(-hw * 0.8, -hd * 0.7, -hw * 0.2, -hd * 0.05, N ? '#4a6080' : '#c6d6e2'); rect(hw * 0.05, -hd * 0.75, hw * 0.75, -hd * 0.15, N ? '#4a6080' : '#c6d6e2'); rect(-hw * 0.3, hd * 0.15, hw * 0.35, hd * 0.75, N ? '#4a6080' : '#c6d6e2'); break;
+      case 'garden':
+        rect(-hw, -hd, hw, hd, lawn, false);
+        poly(ngon(hw * 0.3, hd * 0.15, hw * 0.32, 18, 0, hd * 0.3), N ? '#2f4a5e' : '#a9d3e8', false);
+        if (lm.style === 'zoo') for (const [a, b] of [[-0.55, -0.45], [-0.55, 0.35], [-0.05, -0.55]]) poly(ngon(hw * a, hd * b, hw * 0.2, 7, 0.3, hd * 0.2), N ? '#3c4a38' : '#dfe6c9');
+        else poly(ngon(-hw * 0.35, -hd * 0.25, 12, 6), bld);
+        break;
+      case 'airport': {   // 机场平面（v2.2）：停机坪、航站楼、廊桥与停机位上的客机；+v 朝跑道
+        const TT = (lm.T || 400) / 2, zf = -hd + 64, ap = N ? '#2c3540' : '#d9dfe5', pl = N ? '#9aa6b4' : '#ffffff';
+        rect(-hw, -hd + 8, hw, hd, ap, false); rect(-hw * 1.05, hd, hw * 1.05, hd + 42, ap, false);
+        rect(-TT, zf - 50, TT, zf, bld); rect(-TT * 0.9, zf - 60, TT * 0.9, zf - 52, N ? '#3a4452' : '#e8ebee', false);
+        const n = Math.max(3, Math.floor((lm.T || 400) / 75));
+        ctx.save(); ctx.fillStyle = pl;
+        const plane = function (u, v, a, L) { const c = Math.cos(a), s = Math.sin(a), P = function (p, q) { return T(u + p * c - q * s, v + p * s + q * c); };
+          poly([P(L * 0.5, 0), P(L * 0.1, L * 0.05), P(-L * 0.18, L * 0.48), P(-L * 0.26, L * 0.48), P(-L * 0.12, L * 0.05), P(-L * 0.42, L * 0.05), P(-L * 0.5, L * 0.18), P(-L * 0.52, 0), P(-L * 0.5, -L * 0.18), P(-L * 0.42, -L * 0.05), P(-L * 0.12, -L * 0.05), P(-L * 0.26, -L * 0.48), P(-L * 0.18, -L * 0.48), P(L * 0.1, -L * 0.05)], pl, false); };
+        for (let j = 0; j < n; j++) { const u = -TT + (lm.T || 400) * (j + 0.5) / n; rect(u - 1.8, zf, u + 1.8, zf + 26, N ? '#55606e' : '#c4cad2', false); plane(u, zf + 62, -Math.PI / 2, 62); }
+        if (lm.d >= 250) for (let j = 0; j < 3; j++) plane(-hw * 0.8 + j * hw * 0.26, zf + 175, -Math.PI / 2, 52);
+        plane(hw * 0.64, hd + 20, 0, 60);
+        ctx.restore();
+        poly(ngon(-TT - 48, zf - 30, 9, 12), N ? '#55606e' : '#c4cad2');
+        break;
+      }
+      case 'museum': rect(-hw, -hd, hw, hd, plaza, false); rect(-hw * 0.8, -hd * 0.7, hw * 0.8, hd * 0.7, bld); rect(-hw * 0.3, -hd * 0.3, hw * 0.3, hd * 0.3, N ? '#4a6080' : '#c6d6e2', false); break;
       default: rect(-hw * 0.8, -hd * 0.8, hw * 0.8, hd * 0.8, bld);
     }
     ctx.restore();
   };
-  Renderer.prototype.renderGroundChunk = function (lvl, ci, cj) {
+  // 分条绘制（v2.1）：较粗级别的地面块一次可达 30–40 ms，按水平条带分几帧画完，避免单帧卡顿。
+  // 条带边界落在整像素上，每个像素只属于一个条带，结果与一次画完相同
+  // 分条绘制（v2.1）：较粗级别的地面块一次可达 30–40 ms，按水平条带分几帧画完，避免单帧卡顿。
+  // 条带边界落在整像素上，每个像素只属于一个条带；图案连续，裁剪边缘允许抗锯齿微差
+  Renderer.prototype.groundChunkGen = function* (lvl, ci, cj) {
     const C = CHUNK_PX / lvl, x0 = ci * C, y0 = cj * C;
     const cv = makeCanvas(CHUNK_PX + 2, CHUNK_PX + 2), ctx = cv.getContext('2d');
-    ctx.setTransform(lvl, 0, 0, lvl, -x0 * lvl + 1, -y0 * lvl + 1);
-    this.drawGround(ctx, x0 - 1 / lvl, y0 - 1 / lvl, x0 + C + 1 / lvl, y0 + C + 1 / lvl, lvl);
+    const N = lvl <= 8 ? 8 : (lvl <= 16 ? 4 : 2), edge = x0 + C > CFG.W || y0 + C > CFG.H;
+    for (let s = 0; s < N; s++) {
+      const ya = s ? y0 + C * s / N : y0 - 1 / lvl, yb = s < N - 1 ? y0 + C * (s + 1) / N : y0 + C + 1 / lvl;
+      ctx.save();
+      ctx.setTransform(lvl, 0, 0, lvl, -x0 * lvl + 1, -y0 * lvl + 1);
+      ctx.beginPath(); ctx.rect(x0 - 1 / lvl, ya, C + 2 / lvl, yb - ya); ctx.clip();
+      if (edge) { ctx.beginPath(); ctx.rect(0, 0, CFG.W, CFG.H); ctx.clip(); }
+      this.drawGround(ctx, x0 - 1 / lvl, ya - 1 / lvl, x0 + C + 1 / lvl, yb + 1 / lvl, lvl);
+      ctx.restore();
+      if (s < N - 1) yield cv;
+    }
     return cv;
   };
   Renderer.prototype.renderOverview = function () {
@@ -849,10 +1134,6 @@
   Renderer.prototype.isoChunkGeom = function (lvl, ci, cj) {
     const C = CHUNK_PX / lvl / 1.41421356 | 0 || 1;
     return C;
-  };
-  Renderer.prototype.renderIsoChunk = function (lvl, ci, cj, C) {
-    const gen = this.isoChunkGen(lvl, ci, cj, C);
-    for (;;) { const r = gen.next(); if (r.done) return r.value; }
   };
   Renderer.prototype.isoChunkGen = function* (lvl, ci, cj, C) {
     const city = this.game.city, W = city.W, H = city.H;
@@ -880,7 +1161,10 @@
         if (i >= W || j >= H || i < 0 || j < 0) continue;
         const c = j * W + i, L = city.lu[c];
         if (L === LU.WATER || L === LU.LANDMARK) continue;
-        if (L === LU.HILL) { drew += this.isoPeak(ctx, pj, c, i, j, s); continue; }
+        if (L === LU.HILL) {
+          const relief = city.regions[city.region[c]].relief;
+          drew += relief === 0 ? this.isoTrees(ctx, pj, c, i, j, coarse ? 1 : 3, s) : this.isoPeak(ctx, pj, c, i, j, s); continue;
+        }
         if (L === LU.PARK || (city.wood[c] > 0.5 && !city.street[c])) { drew += this.isoTrees(ctx, pj, c, i, j, coarse ? 1 : 3, s); continue; }
         if (L === LU.RURAL && !city.street[c] && city.pop[c] < 12) { if (U.hash2(c, 1, 77) < 0.2) drew += this.isoTrees(ctx, pj, c, i, j, 1, s); }
         if (this.isLmCenter(c)) continue;
@@ -902,9 +1186,9 @@
   // 地标精灵：每个地标按缩放级别单独缓存（大型场地不受分块裁切），在其中心所在分块之后绘制
   Renderer.prototype.landmarkSprite = function (k, lvl) {
     const key = 'L' + lvl + ':' + k;
+    const lm = D.landmarks[k], s = lvl, siteVersion = CM.Sites.complex(lm) ? CM.Sites.version(this) : null;
     let e = this.iso.get(key);
-    if (e && !e.stale) { e.used = this.frame; return e; }
-    const lm = D.landmarks[k], s = lvl;
+    if (e && !e.stale && e.siteVersion === siteVersion) { e.used = this.frame; return e; }
     const R = Math.hypot(lm.w, lm.d) / 2 / CFG.CELL_M + 0.15;
     const tall = lm.kind === 'tvtower' || lm.kind === 'skyscraper' || lm.kind === 'lattice';
     const hMax = (lm.h || (lm.kind === 'pagoda' ? 70 : (lm.kind === 'church' ? 62 : 55))) * EX * (tall ? 1.05 : 1.6) + 0.05;
@@ -916,7 +1200,7 @@
     const ox = -minX + padd, oy = -minY + padd;
     const pj = function (x, y, h) { return [(x - y) * ISO[0] * s + ox, (x + y) * ISO[2] * s + oy - h * HSF * s]; };
     try { this.isoLandmark(ctx, pj, lm, s); } catch (err) { console.error(err); }
-    e = { cv: cv, ax: (lm.x - lm.y) * ISO[0] * s + ox, ay: (lm.x + lm.y) * ISO[2] * s + oy, px: cv.width * cv.height, used: this.frame, born: this.time, stale: false };
+    e = { cv: cv, ax: (lm.x - lm.y) * ISO[0] * s + ox, ay: (lm.x + lm.y) * ISO[2] * s + oy, px: cv.width * cv.height, used: this.frame, born: this.warmUntil ? this.time - 1 : this.time, stale: false, siteVersion: siteVersion };
     const old = this.iso.get(key); if (old) this.cachePx -= old.px;
     this.iso.set(key, e); this.cachePx += e.px;
     return e;
@@ -942,7 +1226,7 @@
     faces.sort(function (p, q) { return p.d - q.d; });
     for (const fc of faces) {
       const q = [pj(fc.a[0], fc.a[1], h0), pj(fc.b[0], fc.b[1], h0), pj(fc.b[0], fc.b[1], h1), pj(fc.a[0], fc.a[1], h1)];
-      fillPts(ctx, q, U.rgb(U.shade(wall, fc.f)));
+      fillPts(ctx, q, U.rgb(U.shade(wall, CM.Settings.get('lighting') === false ? 1 : fc.f)));
       if (opt.lines) { opt.lines(fc, q); }
     }
     if (top) fillPts(ctx, pts.map(function (p) { return pj(p[0], p[1], h1); }), U.rgb(top));
@@ -966,15 +1250,19 @@
   // 传统低层按地区区分（内地灰砖坡顶、香港唐楼、台北街屋、东京木造坡顶）。商业区按年代出现招牌与霓虹。外观按 5 年一档更新。
   // 配色保持原有浅色、克制的「云雾淡彩」风格：年代与地区只体现在形体（坡顶、窗带、竖条）和极轻的色调差异上
   const STYLE_PAL = {
-    old: { cn: [[226, 229, 233], [219, 223, 229], [231, 232, 234]], hk: [[236, 234, 228], [228, 235, 233], [236, 231, 230], [229, 231, 238]], jp: [[234, 231, 225], [227, 226, 222], [237, 234, 228]], tw: [[229, 232, 236], [222, 227, 233], [232, 232, 231]] },
-    roof: { cn: [184, 194, 208], hk: null, jp: [176, 187, 202], tw: null },
+    old: { cn: [[226, 229, 233], [219, 223, 229], [231, 232, 234]], hk: [[236, 234, 228], [228, 235, 233], [236, 231, 230], [229, 231, 238]], jp: [[234, 231, 225], [227, 226, 222], [237, 234, 228]], tw: [[229, 232, 236], [222, 227, 233], [232, 232, 231]],
+      eu: [[238, 232, 218], [233, 227, 212], [240, 236, 224]] },   // 巴黎：奥斯曼式奶油色石材立面
+    roof: { cn: [184, 194, 208], hk: null, jp: [176, 187, 202], tw: null, eu: [170, 178, 190] },   // 巴黎为锌板芒萨尔屋顶
     masonry: [[233, 229, 220], [227, 224, 216], [236, 233, 226]],
     slab: [[232, 235, 239], [226, 231, 237], [236, 238, 240], [222, 228, 236]],
     tile: [[236, 240, 245], [228, 235, 243], [240, 242, 245]],
   };
-  const NEON_YEAR = { cn: 1992, hk: 1960, jp: 1955, tw: 1975 };
+  const NEON_YEAR = { cn: 1992, hk: 1960, jp: 1955, tw: 1975, eu: 1925 };
+  const NEON_P = { eu: 0.25 };          // 出现招牌的商业楼比例（未列出的地区为 0.7）
+  const ROOF_MAX = { eu: 30 };          // 坡屋顶 / 芒萨尔屋顶的最高楼高（米，未列出的地区为 20）
   const NEON_COL = ['#ff4fa3', '#36e0ff', '#ffd23f', '#7cff6b', '#ff6a3d', '#b98cff'];
-  const REGION_KEY = { '中国内地': 'cn', '中国香港': 'hk', '中国台湾': 'tw', '日本': 'jp' };
+  const REGION_KEY = { '中国内地': 'cn', '中国香港': 'hk', '中国台湾': 'tw', '日本': 'jp', '法国': 'eu' };
+  const roofFor = function (rk, st, mh) { return st === 'old' && mh <= (ROOF_MAX[rk] || 20) ? STYLE_PAL.roof[rk] : null; };
   function nightCol(c) { return [c[0] * 0.24 + 8, c[1] * 0.26 + 12, c[2] * 0.28 + 24]; }   // 与原夜景楼宇同一深度
   Renderer.prototype.regionKey = function () { const m = CM.curMap ? CM.curMap() : null; return (m && REGION_KEY[m.region]) || 'cn'; };
   // 建筑年代（只用于外观，不影响模拟）：开局前已是城区的街区分散在开局前约 6–50 年；之后城市化的街区按城市化年份；
@@ -985,12 +1273,14 @@
     const minY = h > 100 ? 2003 : h > 60 ? 1992 : h > 32 ? 1972 : -1e9;
     if (v < minY) v = minY + 8 * U.hash2(c, k, 18);
     const age = Y - v;
-    if (age > 30 && U.hash2(c, k, 19) < (age - 30) / 50) v = Y - 25 * U.hash2(c, k, 20);
+    // 巴黎：1940 年以前的低层石材建筑整体保护，只翻新不改变风格
+    const keep = (this._rk || (this._rk = this.regionKey())) === 'eu' && v < 1940 && h <= 30;
+    if (!keep && age > 30 && U.hash2(c, k, 19) < (age - 30) / 50) v = Y - 25 * U.hash2(c, k, 20);
     return Math.min(v, Y);
   };
   Renderer.prototype.bldStyle = function (c, k, h) {
     const v = this.bldVintage(c, k, h);
-    if (v < 1960) return h <= 24 ? 'old' : 'masonry';
+    if (v < 1960) return h <= ((this._rk || (this._rk = this.regionKey())) === 'eu' ? 30 : 24) ? 'old' : 'masonry';
     if (v < 1990) return 'slab';
     if (v < 2005) return 'tile';
     return 'glass';
@@ -999,8 +1289,8 @@
   Renderer.prototype.bldTopColor = function (c, k, b) {
     const st = this.bldStyle(c, k, b[4]), rk = this._rk || (this._rk = this.regionKey());
     if (st === 'glass') { const pal = PAL[b[5]] || PAL[0]; return pal[Math.floor(U.hash2(c, k, 4) * pal.length)]; }
-    let col;
-    if (st === 'old' && b[4] <= 20 && STYLE_PAL.roof[rk]) col = U.mixc(STYLE_PAL.roof[rk], [226, 231, 237], 0.35);
+    let col; const rf = roofFor(rk, st, b[4]);
+    if (rf) col = U.mixc(rf, [226, 231, 237], 0.35);
     else { const P = st === 'old' ? (STYLE_PAL.old[rk] || STYLE_PAL.old.cn) : STYLE_PAL[st]; col = P[Math.floor(U.hash2(c, k, 4) * P.length)]; }
     return TH.night ? nightCol(col) : col;
   };
@@ -1020,6 +1310,17 @@
       fillPts(ctx, [Bt, Ct, R1, R0], U.rgb(U.shade(col, 1.08)));
     }
   }
+  // 芒萨尔屋顶（巴黎）：四面陡坡的截顶棱台，顶部为平台；凸体按先背坡、再前坡、最后顶面的顺序绘制
+  function mansardRoof(ctx, pj, A, B, C, D, h, col) {
+    const w = B[0] - A[0], d = D[1] - A[1], m = Math.min(w, d), ins = m * 0.16, rh = Math.min(h * 0.24, m * 0.42);
+    const b0 = pj(A[0], A[1], h), b1 = pj(B[0], B[1], h), b2 = pj(C[0], C[1], h), b3 = pj(D[0], D[1], h);
+    const t0 = pj(A[0] + ins, A[1] + ins, h + rh), t1 = pj(B[0] - ins, B[1] + ins, h + rh), t2 = pj(C[0] - ins, C[1] - ins, h + rh), t3 = pj(D[0] + ins, D[1] - ins, h + rh);
+    fillPts(ctx, [b0, b1, t1, t0], U.rgb(U.shade(col, 0.74)));
+    fillPts(ctx, [b0, b3, t3, t0], U.rgb(U.shade(col, 0.8)));
+    fillPts(ctx, [b3, b2, t2, t3], U.rgb(U.shade(col, 0.9)));
+    fillPts(ctx, [b1, b2, t2, t1], U.rgb(U.shade(col, 1.02)));
+    fillPts(ctx, [t0, t1, t2, t3], U.rgb(U.shade(col, 1.12)));
+  }
   // 立面上的一条水平线（两个可见立面）
   function faceBand(ctx, pj, B, C, D, hh) {
     const p0 = pj(D[0], D[1], hh), p1 = pj(C[0], C[1], hh), p2 = pj(B[0], B[1], hh);
@@ -1027,6 +1328,8 @@
   }
   // 建筑体量：两个立面 + 顶面（或坡屋顶）；按年代风格加窗带、玻璃竖条、檐口；高楼带高光；夜间少量暖色窗光与商业霓虹
   Renderer.prototype.isoBox = function (ctx, pj, i, j, b, c, k, s) {
+    const signature = s >= 16 && this.signatureOf(this.bldStyle(c, k, b[4]), b[4], c, k);
+    if (signature) return this.drawSignature(ctx, pj, i, j, b, signature, s);
     const h = b[4] * EX, mh = b[4];
     const A = [i + b[0], j + b[1]], B = [i + b[2], j + b[1]], C = [i + b[2], j + b[3]], Dd = [i + b[0], j + b[3]];
     const Bb = pj(B[0], B[1], 0), Cb = pj(C[0], C[1], 0), Db = pj(Dd[0], Dd[1], 0);
@@ -1037,8 +1340,8 @@
     else { const P = st === 'old' ? (STYLE_PAL.old[rk] || STYLE_PAL.old.cn) : STYLE_PAL[st]; base = P[Math.floor(U.hash2(c, k, 4) * P.length)]; if (TH.night) base = nightCol(base); }
     const tall = b[4] > 40;
     if (s >= 16) {
-      const so = Math.min(1.0, h * 0.45);
-      const Cs = pj(C[0] + so, C[1] - so * 0.2, 0), Bs = pj(B[0] + so, B[1] - so * 0.2, 0);
+      const so = CM.Settings.get('lighting') === false ? 0 : Math.min(1.0, h * 0.45);
+      const Cs = pj(C[0] + so, C[1] + so, 0), Bs = pj(B[0] + so, B[1] + so, 0);
       fillPts(ctx, [Bb, Bs, Cs, Cb], TH.isoShadow);
     }
     if (st === 'glass' && tall && s >= 16) {
@@ -1053,8 +1356,9 @@
       fillPts(ctx, [Db, Cb, Ct, Dt], U.rgb(U.shade(base, 0.82)));
       fillPts(ctx, [Bb, Cb, Ct, Bt], U.rgb(U.shade(base, 0.93)));
     }
-    const roof = st === 'old' && mh <= 20 && STYLE_PAL.roof[rk];
-    if (roof) pitchedRoof(ctx, pj, A, B, C, Dd, h, base, TH.night ? nightCol(roof) : roof);
+    const roof = roofFor(rk, st, mh);
+    if (roof && rk === 'eu') mansardRoof(ctx, pj, A, B, C, Dd, h, TH.night ? nightCol(roof) : roof);
+    else if (roof) pitchedRoof(ctx, pj, A, B, C, Dd, h, base, TH.night ? nightCol(roof) : roof);
     else fillPts(ctx, [At, Bt, Ct, Dt], U.rgb(U.shade(base, TH.night ? 1.12 : 1.07)));
     // 立面细节（近景）：板楼与砖石楼的水平窗带、面砖塔楼的玻璃竖条、砖石楼檐口、街屋屋顶加建
     if (s >= 32 && mh >= 9) {
@@ -1069,6 +1373,10 @@
           const a = f[0], e = f[1], p = function (t, hh) { return pj(a[0] + (e[0] - a[0]) * t, a[1] + (e[1] - a[1]) * t, hh); };
           fillPts(ctx, [p(0.4, h * 0.06), p(0.6, h * 0.06), p(0.6, h * 0.96), p(0.4, h * 0.96)], U.rgb(glass));
         }
+      } else if (st === 'old' && rk === 'eu' && mh >= 12) {
+        // 奥斯曼式立面：二层与五层的通长铁艺阳台
+        ctx.strokeStyle = TH.night ? 'rgba(255,214,140,0.2)' : 'rgba(96,92,86,0.32)'; ctx.lineWidth = 1;
+        ctx.beginPath(); faceBand(ctx, pj, B, C, Dd, h * 0.3); faceBand(ctx, pj, B, C, Dd, h * 0.8); ctx.stroke();
       } else if (st === 'old' && !roof && rk === 'tw' && U.hash2(c, k, 31) < 0.6) {
         // 台北街屋顶楼的铁皮加盖
         const sh = h * 0.18, m = function (u, v) { return [A[0] + (B[0] - A[0]) * u, A[1] + (Dd[1] - A[1]) * v]; };
@@ -1079,7 +1387,7 @@
       }
     }
     // 商业招牌：按地区年代出现。夜间为霓虹（老式楼宇为竖向招牌），白天高楼屋顶有广告牌
-    if (b[5] === LU.COM && mh >= 15 && s >= 16 && (this.styleYear || 0) >= NEON_YEAR[rk] && U.hash2(c, k, 33) < 0.7) {
+    if (b[5] === LU.COM && mh >= 15 && s >= 16 && (this.styleYear || 0) >= NEON_YEAR[rk] && U.hash2(c, k, 33) < (NEON_P[rk] || 0.7)) {
       const col = NEON_COL[Math.floor(U.hash2(c, k, 34) * NEON_COL.length)];
       const p = function (t, hh) { return pj(Dd[0] + (C[0] - Dd[0]) * t, Dd[1] + (C[1] - Dd[1]) * t, hh); };
       if (TH.night) {
@@ -1138,7 +1446,9 @@
     const m = Math.min(1, depth / 5);
     if (U.hash2(c, 3, 41) > 0.16 + 0.12 * m) return 0;
     const cx = i + 0.2 + U.hash2(c, 1, 42) * 0.6, cy = j + 0.2 + U.hash2(c, 2, 43) * 0.6;
-    const hm = (60 + 320 * m) * (0.55 + 0.75 * U.hash2(c, 4, 44));
+    const relief = this.game.city.regions[this.game.city.region[c]].relief;
+    const scale = relief == null ? 1 : Math.max(0, relief) / 380;
+    const hm = (60 + 320 * m) * scale * (0.55 + 0.75 * U.hash2(c, 4, 44));
     const r = (1.1 + 1.5 * m + U.hash2(c, 5, 45) * 0.7) * s;
     const P0 = pj(cx, cy, 0), A0 = pj(cx, cy, hm * EX * 0.6), A = [A0[0] + (U.hash2(c, 8, 47) - 0.5) * r * 0.5, A0[1]];
     const by = P0[1] + r * 0.18;
@@ -1179,10 +1489,13 @@
 
   // 地标精细模型：局部坐标为米（u 向东、v 向南，绕场地中心旋转 rot 度），高度为米
   Renderer.prototype.isoLandmark = function (ctx, pj, lm, s) {
-    const N = TH.night, CMM = CFG.CELL_M, kind = lm.kind, detail = true;
+    if (CM.Sites.complex(lm)) return this.drawComplexSite(ctx, pj, lm, s, false);
+    const N = TH.night, CMM = CFG.CELL_M, kind = lm.kind, detail = s >= 16;
+    const L = N ? ctx : null;
     const ang = (lm.rot || 0) * Math.PI / 180, ca = Math.cos(ang), sa = Math.sin(ang);
     const T = function (u, v) { return [lm.x + (u * ca - v * sa) / CMM, lm.y + (u * sa + v * ca) / CMM]; };
-    const tall = kind === 'tvtower' || kind === 'skyscraper' || kind === 'lattice';
+    // 巴黎的纪念建筑（拱门、穹顶、宫殿、圣母院）按真实高度比例绘制，与统一限高的街区相称
+    const tall = kind === 'tvtower' || kind === 'skyscraper' || kind === 'lattice' || kind === 'arch' || kind === 'dome' || kind === 'palace' || lm.style === 'notredame' || lm.real;
     const E =EX * (tall ? 1 : 1.6);
     const hw = lm.w / 2, hd = lm.d / 2;
     const Rc = function (u0, v0, u1, v1) { return [T(u0, v0), T(u1, v0), T(u1, v1), T(u0, v1)]; };
@@ -1193,6 +1506,7 @@
     const hip = function (u0, v0, u1, v1, h0, h1, col) { const c = T((u0 + u1) / 2, (v0 + v1) / 2); pyramidN(ctx, pj, Rc(u0, v0, u1, v1), c[0], c[1], h0 * E, h1 * E, col); };
     const cone = function (cu, cv, r, n, h0, h1, col, rot) { const c = T(cu, cv); pyramidN(ctx, pj, NG(cu, cv, r, n, rot), c[0], c[1], h0 * E, h1 * E, col); };
     const eaveN = function (cu, cv, r0, r1, n, h0, h1, col, rot) { const c = T(cu, cv); frustumRings(ctx, pj, NG(cu, cv, r0, n, rot), NG(cu, cv, r1, n, rot), h0 * E, h1 * E, col, c[0], c[1]); };
+    const mansardRoofL = function (u0, v0, u1, v1, h0, h1, col) { const m = Math.min(u1 - u0, v1 - v0) * 0.18, c = T((u0 + u1) / 2, (v0 + v1) / 2); frustumRings(ctx, pj, Rc(u0, v0, u1, v1), Rc(u0 + m, v0 + m, u1 - m, v1 - m), h0 * E, h1 * E, col, c[0], c[1]); };
     const eaveR = function (u0, v0, u1, v1, over, h0, h1, col) { const c = T((u0 + u1) / 2, (v0 + v1) / 2); frustumRings(ctx, pj, Rc(u0 - over, v0 - over, u1 + over, v1 + over), Rc(u0 + over * 0.3, v0 + over * 0.3, u1 - over * 0.3, v1 - over * 0.3), h0 * E, h1 * E, col, c[0], c[1]); };
     // 两坡顶：沿 u 方向的屋脊
     const gable = function (u0, v0, u1, v1, h0, h1, col, ridge) {
@@ -1205,6 +1519,10 @@
     };
     const line = function (u0, v0, h0, u1, v1, h1, col, w) { const a = T(u0, v0), b = T(u1, v1), A = pj(a[0], a[1], h0 * E), B = pj(b[0], b[1], h1 * E); ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); ctx.stroke(); };
     const dot = function (u, v, h, r, col) { const a = T(u, v), A = pj(a[0], a[1], h * E); ctx.fillStyle = col; ctx.beginPath(); ctx.arc(A[0], A[1], r, 0, Math.PI * 2); ctx.fill(); };
+    // 夜间灯光层（附加模型的车站、机场）：灯具画在 L 上，直接画入当前画布；白天不绘制
+    const glowLine = function (u0, v0, h0, u1, v1, h1, col, w) { if (!L) return; const a = T(u0, v0), b = T(u1, v1), A = pj(a[0], a[1], h0 * E), B = pj(b[0], b[1], h1 * E); L.strokeStyle = col; L.lineWidth = w; L.beginPath(); L.moveTo(A[0], A[1]); L.lineTo(B[0], B[1]); L.stroke(); };
+    const glowDot = function (u, v, h, r, col) { if (!L) return; const a = T(u, v), A = pj(a[0], a[1], h * E); L.fillStyle = col; L.beginPath(); L.arc(A[0], A[1], r, 0, Math.PI * 2); L.fill(); };
+    const glowFace = function (u0, v0, u1, v1, h0, h1, col) { if (!L) return; const a = T(u0, v0), b = T(u1, v1); fillPts(L, [pj(a[0], a[1], h0 * E), pj(b[0], b[1], h0 * E), pj(b[0], b[1], h1 * E), pj(a[0], a[1], h1 * E)], col); };
     // 夜间亮窗：立面 (u0,v0)-(u1,v1)，高度 h0-h1（米）
     const lit = function (u0, v0, u1, v1, h0, h1, rows, cols) {
       if (!N || s < 16) return;
@@ -1233,7 +1551,67 @@
       }
     };
     const glass = N ? [70, 96, 130] : [176, 205, 228], white = N ? [120, 126, 140] : [242, 242, 238], stone = N ? [112, 108, 104] : [214, 206, 192];
+    // 由远及近绘制若干部件：parts 为 [u, v, fn]，按观察方向（世界 (1,1)）上的深度排序
+    const depth = function (u, v) { return (u * ca - v * sa) + (u * sa + v * ca); };
+    const ordered = function (parts) { parts.sort(function (a, b) { return depth(a[0], a[1]) - depth(b[0], b[1]); }); for (const p of parts) p[2](); };
+    let campusFront = null;
     switch (kind) {
+      case 'hospital': {
+        box(-hw, -hd * .48, hw, hd * .6, 0, lm.h || 34, stone, white);
+        box(-hw * .28, -hd, hw * .28, hd, 0, (lm.h || 34) * .82, stone, white);
+        const roofH=(lm.h || 34)+.4, red=N?[180,95,95]:[204,112,112];
+        box(-5,-20,5,20,roofH,roofH+1,red,red);box(-20,-5,20,5,roofH,roofH+1,red,red);
+        lit(-hw,hd*.6,hw,hd*.6,4,(lm.h||34)-3,4,10);break;
+      }
+      case 'garden': {
+        const green=N?[44,75,60]:[178,209,168];box(-hw,-hd,hw,hd,0,.7,green,green);
+        box(-8,-hd,8,hd,.7,.9,stone,stone);box(-hw,-7,hw,7,.7,.9,stone,stone);
+        if(detail)trees(28,41,(u,v)=>Math.abs(u)<14||Math.abs(v)<12);break;
+      }
+      case 'cluster': {
+        ordered([[-hw*.4,-hd*.25,()=>box(-hw,-hd,-hw*.03,hd*.3,0,(lm.h||140)*.72,glass)],
+          [hw*.42,-hd*.2,()=>box(hw*.06,-hd*.85,hw,hd*.18,0,lm.h||140,glass)],
+          [0,hd*.55,()=>box(-hw*.68,hd*.3,hw*.65,hd,0,(lm.h||140)*.35,stone)]]);break;
+      }
+      case 'themepark': { // 主题乐园（v2.2，简化示意）：迪士尼为城堡与园内街道，海洋公园为观光塔、海洋馆穹顶与登山缆车
+        const water = N ? [46, 74, 96] : [150, 200, 226], pink = N ? [150, 120, 140] : [246, 222, 232], blue = N ? [58, 82, 150] : [86, 128, 206], gold = N ? '#ffe08a' : '#d2a33a';
+        if (lm.style === 'castle') {
+          const sh = lm.id === 'sh_disney';   // 上海迪士尼：城堡居中，湖面在西侧（宝藏湾），东侧为创极速光轮的玻璃顶棚
+          if (detail) trees(70, 31, function (u, v) { return Math.hypot(u, v + hd * (sh ? 0.04 : 0.2)) < 110 || Math.abs(u) < 18; });
+          if (sh) { box(-hw * 0.74, -hd * 0.02, -hw * 0.38, hd * 0.42, 0, 0.6, water, water); box(hw * 0.4, -hd * 0.06, hw * 0.72, hd * 0.2, 0, 15, N ? [70, 90, 110] : [176, 206, 224], null); }
+          else box(hw * 0.12, hd * 0.0, hw * 0.72, hd * 0.5, 0, 0.6, water, water);                       // 园内湖
+          // 大街两侧的彩色小楼
+          for (let k = 0; k < 6; k++) for (const sd of [-1, 1]) {
+            const v0 = hd * 0.15 + k * 30, cols = [[236, 196, 150], [214, 120, 110], [150, 190, 220], [240, 220, 140]], c = cols[(k + (sd > 0 ? 1 : 0)) % 4];
+            box(sd * 18, v0, sd * 38, v0 + 24, 0, 9, N ? U.shade(c, 0.5) : c, null); gable(sd > 0 ? 18 : -38, v0 - 1, sd > 0 ? 38 : -18, v0 + 25, 9, 13, N ? [90, 70, 70] : [170, 92, 80]);
+          }
+          // 城堡：主体、四角圆塔与蓝色尖顶，中央高塔与金色尖端
+          const cv = sh ? -hd * 0.04 : -hd * 0.2;
+          box(-30, cv - 22, 30, cv + 22, 0, 16, pink, null);
+          for (const a of [-1, 1]) for (const b of [-1, 1]) { cyl(a * 30, cv + b * 22, 7, 10, 0, 26, pink, null); cone(a * 30, cv + b * 22, 8.5, 10, 26, 40, blue); }
+          cyl(0, cv, 12, 12, 16, 38, pink, null); cone(0, cv, 14, 12, 38, 60, blue);
+          for (const a of [-1, 1]) { cyl(a * 13, cv - 8, 5, 8, 16, 46, pink, null); cone(a * 13, cv - 8, 6, 8, 46, 58, blue); }
+          line(0, cv, 60, 0, cv, 68, gold, Math.max(1.5, s / 22));
+          glowDot(0, cv, 50, 3, 'rgba(255,214,140,0.9)');
+          // 园内游乐设施：几座彩色帐篷顶
+          for (const p of [[-hw * 0.55, -hd * 0.45, [226, 90, 80]], [-hw * 0.6, hd * 0.35, [90, 170, 120]], [hw * 0.55, -hd * 0.5, [240, 190, 70]]]) { cyl(p[0], p[1], 16, 12, 0, 8, N ? [100, 100, 110] : [236, 236, 236], null); cone(p[0], p[1], 19, 12, 8, 22, N ? U.shade(p[2], 0.55) : p[2]); }
+        } else {
+          if (detail) trees(40, 37, function (u, v) { return u > -hw * 0.1 && Math.abs(v) < hd * 0.5; });
+          box(-hw * 0.65, -hd * 0.25, -hw * 0.05, hd * 0.45, 0, 0.6, water, water);                  // 园内湖与海洋池
+          // 海洋馆：圆形场馆与玻璃穹顶
+          cyl(hw * 0.4, 0, 34, 16, 0, 12, N ? [80, 96, 116] : [220, 228, 236], null); cone(hw * 0.4, 0, 30, 16, 12, 26, N ? [60, 100, 140] : [150, 200, 230]);
+          // 观光塔（约 72 m）：塔柱与环形观景舱
+          const tu = -hw * 0.6, tv = -hd * 0.55;
+          cyl(tu, tv, 3.2, 10, 0, 72, N ? [150, 150, 160] : [236, 236, 240], null);
+          cyl(tu, tv, 9, 14, 58, 64, N ? [160, 90, 90] : [226, 92, 72], N ? [180, 110, 110] : [240, 120, 100]);
+          glowDot(tu, tv, 72, 3, 'rgba(255,120,90,0.9)');
+          // 登山缆车：塔架与缆索，通往南朗山上的园区
+          for (let k = 0; k < 4; k++) { const u = hw * 0.15 + k * 45, v = hd * 0.2 + k * 35, h = 18 + k * 20; box(u - 2, v - 2, u + 2, v + 2, 0, h, N ? [120, 120, 130] : [190, 190, 196], null); if (k) line(u - 45, v - 35, h - 20, u, v, h, N ? '#9aa' : '#666a72', Math.max(1, s / 40)); }
+          // 园内的几座游乐设施
+          for (const p of [[hw * 0.05, -hd * 0.3, [240, 190, 70]], [-hw * 0.2, hd * 0.6, [90, 170, 220]]]) { cyl(p[0], p[1], 14, 12, 0, 7, N ? [100, 100, 110] : [236, 236, 236], null); cone(p[0], p[1], 16, 12, 7, 18, N ? U.shade(p[2], 0.55) : p[2]); }
+        }
+        break;
+      }
       case 'hall': { // 中山纪念堂：八角形宝蓝琉璃瓦大屋顶、四面抱厦
         const wall = [238, 228, 206], blue = [40, 96, 170], gold = [222, 176, 64];
         if (detail) trees(26, 11, function (u, v) { return Math.abs(u) < 70 && Math.abs(v) < 70 || (Math.abs(u) < 16 && v > 0); });
@@ -1251,6 +1629,20 @@
         break;
       }
       case 'tower': { // 镇海楼：红砂岩台基、五层红墙绿瓦
+        if (lm.style === 'yellowcrane') { // 黄鹤楼（1985 年重建，51 m）：台基上五层，朱红柱廊、层层黄色琉璃瓦飞檐，四面出抱厦，金色宝顶
+          const red = [184, 66, 50], yel = N ? [214, 174, 72] : [236, 190, 62];
+          box(-26, -26, 26, 26, 0, 4, N ? [104, 100, 96] : [206, 198, 182]);
+          for (let k = 0; k < 5; k++) {
+            const w = 15.5 - k * 1.7, h0 = 4 + k * 8.4;
+            if (k < 3) { box(-w - 4, -w * 0.4, w + 4, w * 0.4, h0, h0 + 5.6, red, null); box(-w * 0.4, -w - 4, w * 0.4, w + 4, h0, h0 + 5.6, red, null); }
+            box(-w, -w, w, w, h0, h0 + 5.6, red, null);
+            lit(-w, w, w, w, h0 + 1, h0 + 5, 1, 4);
+            eaveR(-w - (k < 3 ? 4 : 0), -w - (k < 3 ? 4 : 0), w + (k < 3 ? 4 : 0), w + (k < 3 ? 4 : 0), 3, h0 + 5.6, h0 + 8.4, yel);
+          }
+          hip(-7, -7, 7, 7, 46, 50, yel);
+          line(0, 0, 50, 0, 0, 54, N ? '#ffe08a' : '#c9a03e', Math.max(1.5, s / 20));
+          break;
+        }
         const red = [176, 58, 46], green = [64, 112, 92];
         box(-18, -13, 18, 13, 0, 5, [160, 112, 96]);
         for (let k = 0; k < 5; k++) {
@@ -1302,6 +1694,17 @@
         break;
       }
       case 'church': { // 石室圣心大教堂：哥特式双尖塔（58 m）
+        if (lm.style === 'notredame') { // 巴黎圣母院：西立面双塔（69 m，平顶）、中殿与耳堂、半圆形后殿、交叉部尖塔（96 m）
+          const st = N ? [110, 104, 96] : [218, 208, 188], rf = N ? [70, 78, 90] : [126, 136, 148];
+          ordered([
+            [-57, 0, function () { box(-64, -20, -50, 20, 0, 45, st, null); lit(-64, 20, -50, 20, 6, 40, 3, 4); for (const dv of [-12.5, 12.5]) box(-64, dv - 7.5, -50, dv + 7.5, 45, 69, st, U.shade(st, 1.06)); }],
+            [0, -18, function () { box(-6, -24, 6, -12, 0, 33, st, null); hip(-7, -25, 7, -11, 33, 40, rf); }],
+            [-5, 0, function () { box(-50, -12, 40, 12, 0, 33, st, null); gable(-50, -13, 40, 13, 33, 43, rf); lit(-50, 12, 40, 12, 8, 28, 2, 10); line(0, 0, 43, 0, 0, 96, N ? '#c8c0b0' : '#5a6070', Math.max(1.4, s / 22)); cone(0, 0, 3.5, 8, 43, 70, rf); }],
+            [0, 18, function () { box(-6, 12, 6, 24, 0, 33, st, null); hip(-7, 11, 7, 25, 33, 40, rf); }],
+            [48, 0, function () { cyl(48, 0, 12, 12, 0, 30, st, null); cone(48, 0, 13, 12, 30, 40, rf); }],
+          ]);
+          break;
+        }
         const st = N ? [96, 96, 98] : [158, 156, 150], dark = N ? [70, 70, 74] : [112, 110, 106];
         box(-48, -15, 20, 15, 0, 22, st, null);
         gable(-50, -16, 20, 16, 22, 31, dark);
@@ -1341,7 +1744,128 @@
         }
         break;
       }
+      case 'bund': { // 外滩建筑群：沿江一字排开的石砌大楼（u 沿江岸），海关大楼钟楼、汇丰银行穹顶、和平饭店绿色金字塔顶
+        const sc = N ? [120, 114, 104] : [224, 216, 198], green = N ? [70, 110, 96] : [86, 140, 118], n = 13, gap = 6, bw = (lm.w - gap * (n - 1)) / n;
+        const parts = [];
+        for (let k = 0; k < n; k++) {
+          const u0 = -hw + k * (bw + gap), u1 = u0 + bw, uc = (u0 + u1) / 2, h = 24 + 14 * U.hash2(k, 3, 77);
+          parts.push([uc, 0, function () {
+            box(u0, -hd, u1, hd, 0, h, sc, null); lit(u0, hd, u1, hd, 3, h - 3, Math.max(2, Math.round(h / 6)), 3);
+            if (k === 5) { cyl(uc, 0, Math.min(14, bw * 0.3), 12, h, h + 6, sc, null); eaveN(uc, 0, Math.min(14, bw * 0.3), 2, 12, h + 6, h + 16, N ? [96, 104, 116] : [160, 168, 176]); }   // 汇丰银行大楼穹顶
+            if (k === 6) { box(uc - 9, -9, uc + 9, 9, h, 66, sc, null); hip(uc - 10, -10, uc + 10, 10, 66, 79, sc); dot(uc, 9, 58, Math.max(1.4, s / 22), N ? '#ffe08a' : '#f4f1e8'); }   // 海关大楼钟楼
+            if (k === 9) { box(uc - 10, -10, uc + 10, 10, h, 58, sc, null); hip(uc - 11, -11, uc + 11, 11, 58, 77, green); }   // 和平饭店
+          }]);
+        }
+        ordered(parts);
+        break;
+      }
+      case 'palace': { // 宫殿式合院：石材四翼围合庭院、芒萨尔屋顶（市政厅、卢森堡宫）；style 'keep' 为城堡（围墙与 52 m 主塔），'louvre' 为卢浮宫
+        const wall = N ? [116, 110, 100] : [228, 220, 202], rf = N ? [72, 80, 92] : [150, 160, 172], hh = 24;
+        const wing = function (u0, v0, u1, v1) { return [(u0 + u1) / 2, (v0 + v1) / 2, function () { box(u0, v0, u1, v1, 0, hh, wall, null); mansardRoofL(u0, v0, u1, v1, hh, hh + 7, rf); lit(u0, v1, u1, v1, 3, hh - 3, 2, Math.max(3, Math.round((u1 - u0) / 30))); }]; };
+        if (lm.style === 'keep') { // 万塞讷城堡：长方形城墙、角楼与主塔
+          const sw = N ? [104, 100, 92] : [206, 198, 182], t = 8;
+          const wallSeg = function (u0, v0, u1, v1) { return [(u0 + u1) / 2, (v0 + v1) / 2, function () { box(u0, v0, u1, v1, 0, 14, sw, null); }]; };
+          const parts = [wallSeg(-hw, -hd, hw, -hd + t), wallSeg(-hw, hd - t, hw, hd), wallSeg(-hw, -hd + t, -hw + t, hd - t), wallSeg(hw - t, -hd + t, hw, hd - t)];
+          for (const q of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) parts.push([q[0] * (hw - 6), q[1] * (hd - 6), function () { box(q[0] * (hw - 6) - 7, q[1] * (hd - 6) - 7, q[0] * (hw - 6) + 7, q[1] * (hd - 6) + 7, 0, 22, sw, null); }]);
+          parts.push([-hw + 50, 0, function () { box(-hw + 34, -16, -hw + 66, 16, 0, 52, sw, U.shade(sw, 1.05)); lit(-hw + 34, 16, -hw + 66, 16, 8, 46, 4, 3); }]);
+          ordered(parts);
+          break;
+        }
+        if (lm.style === 'clock' || lm.style === 'spire') { // 江汉关：石砌大楼与正面钟楼；上海展览中心：俄式主楼与镀金尖塔（lm.h 为塔尖高度）
+          const sw = N ? [116, 110, 100] : [222, 214, 196], H = lm.h || 46, tw = lm.style === 'spire' ? 14 : 9;
+          ordered([
+            [0, -hd * 0.3, function () { box(-hw, -hd, hw, hd * 0.4, 0, 20, sw, null); lit(-hw, hd * 0.4, hw, hd * 0.4, 3, 18, 3, 10); }],
+            [0, hd * 0.5, function () {
+              const v0 = hd * 0.4 - tw * 2;
+              box(-tw, v0, tw, v0 + tw * 2, 0, H * (lm.style === 'spire' ? 0.42 : 0.82), sw, null);
+              if (lm.style === 'spire') { eaveN(0, v0 + tw, tw * 0.9, tw * 0.5, 8, H * 0.42, H * 0.55, sw, Math.PI / 8); line(0, v0 + tw, H * 0.55, 0, v0 + tw, H, N ? '#ffe08a' : '#c9a03e', Math.max(1.4, s / 22)); }
+              else { hip(-tw - 1, v0 - 1, tw + 1, v0 + tw * 2 + 1, H * 0.82, H, N ? [70, 96, 90] : [92, 132, 118]); dot(0, v0 + tw * 2, H * 0.7, Math.max(1.4, s / 22), N ? '#ffe08a' : '#f4f1e8'); }
+            }],
+          ]);
+          break;
+        }
+        if (lm.style !== 'louvre') {
+          const iw = Math.min(26, hw * 0.3), id2 = Math.min(26, hd * 0.3);
+          ordered([wing(-hw, -hd, hw, -hd + id2), wing(-hw, -hd + id2, -hw + iw, hd - id2), wing(hw - iw, -hd + id2, hw, hd - id2), wing(-hw, hd - id2, hw, hd)]);
+          break;
+        }
+        // 卢浮宫：东端方形的卡雷庭院，沿里沃利街与塞纳河的两翼长廊（南翼为大画廊）；1989 年起拿破仑庭院中的玻璃金字塔
+        const ce = hw - 80;   // 卡雷庭院中心
+        const parts = [
+          wing(-hw, -hd, ce - 80, -hd + 22), wing(-hw, hd - 22, ce - 80, hd),
+          wing(ce - 80, -80, ce + 80, -58), wing(ce - 80, 58, ce + 80, 80), wing(ce - 80, -58, ce - 58, 58), wing(ce + 58, -58, ce + 80, 58),
+          wing(ce - 102, -hd + 22, ce - 80, -80), wing(ce - 102, 80, ce - 80, hd - 22),
+        ];
+        if ((this.styleYear || 0) >= 1989) parts.push([ce - 175, 0, function () { const c = T(ce - 175, 0); pyramidN(ctx, pj, Rc(ce - 192, -17, ce - 158, 17), c[0], c[1], 0, 21.6 * E, N ? [130, 176, 220] : [190, 214, 230]); }]);
+        ordered(parts);
+        break;
+      }
+      case 'dome': { // 穹顶建筑：先贤祠、荣军院（金顶）、圣心大教堂（白色石灰华与小穹顶）、大皇宫（玻璃筒拱与玻璃穹顶）
+        const H = lm.h || 60, sty = lm.style || '';
+        const wall = sty === 'white' ? (N ? [136, 134, 128] : [246, 244, 236]) : stone;
+        const domeC = sty === 'gold' ? (N ? [196, 160, 80] : [206, 174, 96]) : sty === 'white' ? wall : sty === 'glass' ? (N ? [96, 136, 176] : [198, 214, 226]) : sty === 'copper' ? (N ? [74, 116, 104] : [122, 170, 150]) : (N ? [84, 92, 104] : [146, 156, 166]);
+        const bw = Math.min(hw, 70), bd = Math.min(hd, 60);
+        const domeAt = function (cu, cv, R, h0) { // 半球近似：逐级收小的截锥环
+          let r0 = R; const n = 16;
+          for (let k = 1; k <= 5; k++) { const a = k / 10 * Math.PI, r1 = Math.max(R * Math.cos(a), R * 0.08); eaveN(cu, cv, r0, r1, n, h0 + R * 0.92 * Math.sin((k - 1) / 10 * Math.PI), h0 + R * 0.92 * Math.sin(a), domeC); r0 = r1; }
+          return h0 + R * 0.92;
+        };
+        if (sty === 'glass') {
+          box(-bw, -bd * 0.45, bw, bd * 0.45, 0, 20, wall, null);
+          gable(-bw, -bd * 0.45, bw, bd * 0.45, 20, 32, domeC);
+          lit(-bw, bd * 0.45, bw, bd * 0.45, 3, 17, 2, 14);
+          const top = domeAt(0, 0, bd * 0.38, 26);
+          line(0, 0, top, 0, 0, H, N ? '#ffe2a0' : '#8a8f96', Math.max(1, s / 30));
+          break;
+        }
+        box(-bw, -bd, bw, bd, 0, H * 0.3, wall, null);
+        lit(-bw, bd, bw, bd, 3, H * 0.3 - 3, 2, 10);
+        const R = Math.min(bw, bd) * 0.42, h0 = H * 0.3, dh = H * 0.25;
+        if (sty === 'white') for (const q of [[-1, -1], [1, -1]]) { const cu = q[0] * bw * 0.62, cv = q[1] * bd * 0.55; cyl(cu, cv, R * 0.36, 12, h0, h0 + dh * 0.5, wall, null); domeAt(cu, cv, R * 0.38, h0 + dh * 0.5); }
+        cyl(0, 0, R, 16, h0, h0 + dh, wall, null);
+        if (N && s >= 16) lit(-R, R, R, R, h0 + 3, h0 + dh - 3, 1, 6);
+        const top = domeAt(0, 0, R * 1.04, h0 + dh);
+        cyl(0, 0, R * 0.16, 8, top - 1, top + (H - top) * 0.55, wall, null);
+        line(0, 0, top + (H - top) * 0.55, 0, 0, H, sty === 'gold' ? (N ? '#ffe08a' : '#c9a03e') : (N ? '#c8c0b0' : '#7a7f86'), Math.max(1.2, s / 26));
+        if (sty === 'white') for (const q of [[-1, 1], [1, 1]]) { const cu = q[0] * bw * 0.62, cv = q[1] * bd * 0.55; cyl(cu, cv, R * 0.36, 12, h0, h0 + dh * 0.5, wall, null); domeAt(cu, cv, R * 0.38, h0 + dh * 0.5); }
+        break;
+      }
+      case 'arch': {
+        if (lm.style === 'defense') { // 新凯旋门：近 110 m 的空心立方体（白色大理石与玻璃），开口沿历史轴线
+          const c = N ? [150, 158, 174] : [240, 242, 245], gl = { lines: function (fc, q) { if (s < 16) return; ctx.strokeStyle = N ? 'rgba(255,214,140,0.35)' : 'rgba(150,164,182,0.35)'; ctx.lineWidth = 1; ctx.beginPath(); for (let t = 0.125; t < 1; t += 0.125) { ctx.moveTo(q[0][0] + (q[1][0] - q[0][0]) * t, q[0][1] + (q[1][1] - q[0][1]) * t); ctx.lineTo(q[3][0] + (q[2][0] - q[3][0]) * t, q[3][1] + (q[2][1] - q[3][1]) * t); } ctx.stroke(); } };
+          box(-62, -62, 62, 62, 0, 4, N ? [96, 100, 110] : [222, 222, 218]);
+          ordered([
+            [0, -45, function () { box(-56, -54, 56, -36, 4, 92, c, null, gl); }],
+            [0, 0, function () { box(-56, -54, 56, 54, 92, 110, c, U.shade(c, 1.04)); }],
+            [0, 45, function () { box(-56, 36, 56, 54, 4, 92, c, null, gl); }],
+          ]);
+          break;
+        }
+        // 凯旋门：高 50 m、宽 45 m、深 22 m，主拱沿香榭丽舍大街轴线贯通
+        const c = N ? [124, 118, 108] : [224, 216, 198];
+        ordered([
+          [0, -15, function () { box(-11, -22.5, 11, -7.3, 0, 29, c, null); }],
+          [0, 0, function () { box(-11, -22.5, 11, 22.5, 29, 50, c, U.shade(c, 1.05)); if (s >= 16) { line(-11, -22.5, 44, -11, 22.5, 44, N ? 'rgba(255,214,140,0.4)' : 'rgba(120,110,96,0.45)', 1); line(-11, 22.5, 44, 11, 22.5, 44, N ? 'rgba(255,214,140,0.4)' : 'rgba(120,110,96,0.45)', 1); } }],
+          [0, 15, function () { box(-11, 7.3, 11, 22.5, 0, 29, c, null); }],
+        ]);
+        if (N && s >= 16) dot(0, 0, 50, Math.max(1.2, s / 30), 'rgba(255,214,140,0.9)');
+        break;
+      }
       case 'museum': { // 南越王墓博物馆：红砂岩阶梯体量与覆斗形墓室
+        if (lm.style === 'ding') { // 上海博物馆：方形基座、圆形顶部（「天圆地方」，形如青铜鼎）
+          const sc = N ? [116, 110, 100] : [214, 202, 178];
+          box(-58, -58, 58, 58, 0, 6, sc, null); box(-50, -50, 50, 50, 6, 18, sc, null); lit(-50, 50, 50, 50, 8, 16, 1, 8);
+          cyl(0, 0, 44, 24, 18, 25, sc, null); eaveN(0, 0, 44, 52, 24, 25, 29.5, U.shade(sc, 1.05));
+          break;
+        }
+        if (lm.style === 'crown') { // 中国馆（2010 年世博会）：四根核心筒托起倒置的斗拱形红色展厅（63 m）
+          const red = N ? [170, 50, 44] : [196, 44, 36], core = N ? [140, 46, 40] : [176, 40, 32];
+          box(-70, -70, 70, 70, 0, 4, N ? [96, 92, 90] : [206, 196, 186]);
+          for (const q of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) box(q[0] * 26 - 9, q[1] * 26 - 9, q[0] * 26 + 9, q[1] * 26 + 9, 4, 33, core, null);
+          const c0 = T(0, 0);
+          for (let k = 0; k < 4; k++) { const a = 36 + k * 8.5, b = a + 8.5, h0 = 33 + k * 7.5; frustumRings(ctx, pj, Rc(-a, -a, a, a), Rc(-b, -b, b, b), h0 * E, (h0 + 7.5) * E, red, c0[0], c0[1], k < 3); }
+          break;
+        }
         const st = [178, 98, 76];
         if (detail) trees(10, 61, function (u, v) { return Math.abs(u) < 60 && Math.abs(v) < 50; });
         box(-55, -40, 55, 40, 0, 10, st, U.shade(st, 1.1));
@@ -1366,6 +1890,7 @@
           fillPts(ctx, ringAt(0.72).map(function (p) { return pj(p[0], p[1], 0); }), '#c8644a');
           fillPts(ctx, ringAt(0.6).map(function (p) { return pj(p[0], p[1], 0); }), '#79b85e');
           prism(ctx, pj, ringAt(1), 0, H * E, N ? [92, 100, 116] : [206, 210, 216], null, { lines: function (fc, q) { if (!N || s < 16) return; ctx.fillStyle = 'rgba(255,214,140,0.7)'; ctx.fillRect((q[0][0] + q[1][0]) / 2 - 1, (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4 - 1, 2, 2); } });
+          prism(ctx, pj, ringAt(0.76), 0, H * 0.3 * E, N ? [84, 92, 106] : [196, 200, 208], null);   // 三维：看台前沿的矮墙（从场内看不到看台底下）
           const top = ringAt(1).map(function (p) { return pj(p[0], p[1], H * E); }), inner = ringAt(0.76).map(function (p) { return pj(p[0], p[1], H * 0.3 * E); });
           ctx.fillStyle = N ? '#5a6474' : '#b9c0c8'; ctx.beginPath(); top.forEach(function (p, k) { if (k) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }); ctx.closePath(); inner.slice().reverse().forEach(function (p, k) { if (k) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }); ctx.closePath(); ctx.fill('evenodd');
           if (roofOn) {
@@ -1383,13 +1908,32 @@
         } else bowl(0, 0, lm.w / 2 * 0.95, lm.d / 2 * 0.95, 14, false);
         break;
       }
-      case 'campus': { // 校园标志建筑（其余校舍由街区建筑生成）
+      case 'campus': { // 校园标志建筑 + 周围一圈教学楼、图书馆与林荫（其余校舍由街区建筑生成）
         const brick = [180, 92, 70], tile = [80, 124, 98];
+        const R0 = Math.min(150, Math.min(hw, hd) * 0.55);
+        if (R0 > 70) {
+          const pal = lm.style === 'palace' || lm.id === 'scut' ? [[214, 204, 180], [70, 120, 96]] : lm.id === 'sysu' ? [brick, [96, 100, 106]] : [N ? [104, 110, 124] : [232, 230, 224], null];
+          const parts = [];
+          // [u, v, 半长, 半宽, 高]：长条形低层教学楼（两侧）、图书馆（前方）与实验楼（后方）
+          const blocks = [[-R0, -R0 * 0.5, 14, 42, 9], [R0, -R0 * 0.5, 14, 42, 9], [-R0, R0 * 0.5, 14, 42, 9], [R0, R0 * 0.5, 14, 42, 9], [0, R0, 46, 20, 12], [0, -R0, 40, 14, 8]];
+          blocks.forEach(function (bk, q) {
+            parts.push([bk[0], bk[1], function () {
+              const wall = N ? U.shade(pal[0], 0.55) : pal[0], uw = bk[2], vw = bk[3], hh = bk[4];
+              box(bk[0] - uw, bk[1] - vw, bk[0] + uw, bk[1] + vw, 0, hh, wall, pal[1] ? null : undefined);
+              if (pal[1]) hip(bk[0] - uw - 2, bk[1] - vw - 2, bk[0] + uw + 2, bk[1] + vw + 2, hh, hh + 6, N ? U.shade(pal[1], 0.6) : pal[1]);
+              lit(bk[0] - uw, bk[1] + vw, bk[0] + uw, bk[1] + vw, 2, hh - 2, 2, 6);
+            }]);
+          });
+          if (detail) trees(Math.round(R0 / 4), 57, function (u, v) { return Math.abs(u) < 40 && Math.abs(v) < 30 || blocks.some(function (bk) { return Math.abs(u - bk[0]) < bk[2] + 6 && Math.abs(v - bk[1]) < bk[3] + 6; }); });
+          // 视线后方的楼先画，前方的楼在标志建筑之后画（见本分支末尾）
+          ordered(parts.filter(function (p) { return depth(p[0], p[1]) < 0; }));
+          campusFront = parts.filter(function (p) { return depth(p[0], p[1]) >= 0; });
+        }
         if (lm.id === 'sysu') { // 怀士堂：红砖钟楼礼堂
           box(-24, -12, 24, 12, 0, 12, brick, null); hip(-26, -14, 26, 14, 12, 18, tile);
           box(-6, -20, 6, -8, 0, 26, brick, null); hip(-7, -21, 7, -7, 26, 32, tile);
           lit(-24, 12, 24, 12, 2, 10, 2, 6);
-        } else if (lm.id === 'scut') { // 华工一号楼：宫殿式教学楼
+        } else if (lm.id === 'scut' || lm.style === 'palace') { // 华工一号楼、武汉大学等：宫殿式教学楼
           box(-40, -10, 40, 10, 0, 16, [214, 204, 180], null); hip(-43, -13, 43, 13, 16, 24, [70, 120, 96]);
           box(-12, -14, 12, 14, 0, 20, [214, 204, 180], null); hip(-14, -16, 14, 16, 20, 28, [70, 120, 96]);
           lit(-40, 10, 40, 10, 2, 14, 3, 10);
@@ -1397,10 +1941,18 @@
           box(-30, -22, 30, 22, 0, 14, white, U.shade(white, 1.04)); cyl(0, 0, 16, 16, 14, 20, N ? [110, 130, 160] : [170, 196, 222]);
           lit(-30, 22, 30, 22, 2, 12, 2, 8);
         }
+        if (campusFront) ordered(campusFront);
         break;
       }
       case 'rail': { // 广州站：长条站房 + 中央钟楼 + 站台雨棚；广州东站：大跨度方形站房
         const body = N ? [86, 92, 104] : [226, 226, 230];
+        if (lm.style === 'round') { // 上海南站：圆形站房与圆盘形屋顶
+          const R = Math.min(hw, hd) * 0.8;
+          cyl(0, 0, R * 0.9, 32, 0, 14, body, null);
+          lit(-R * 0.9, R * 0.6, R * 0.9, R * 0.6, 3, 12, 2, 12);
+          eaveN(0, 0, R * 1.02, R * 0.4, 32, 14, 24, N ? [120, 150, 186] : [196, 214, 230]);
+          break;
+        }
         if (lm.w > 500) {
           for (let k = 0; k < 5; k++) { const v0 = -120 + k * 34; box(-hw + 40, v0, hw - 40, v0 + 18, 6, 9, N ? [70, 76, 88] : [196, 200, 206], N ? [96, 104, 118] : [212, 216, 222]); }
           box(-170, 60, 170, 110, 0, 22, body, U.shade(body, 1.04));
@@ -1416,6 +1968,64 @@
           for (let k = n; k >= 0; k--) { const t = k / n, w = T(-hw + 20 + (lm.w - 40) * t, hd - 50), p = pj(w[0], w[1], (36 + 10 * Math.sin(Math.PI * t)) * E); ctx.lineTo(p[0], p[1]); }
           ctx.fill();
         }
+        break;
+      }
+      case 'station2': { // 车站（附加模型）：盖在铁路上的两跨低矮站台雨棚 + 一侧的站房（玻璃门厅朝外）
+        const sd = lm.side || 1, cw = 20, roofC = N ? [88, 100, 120] : [214, 222, 232], hallC = N ? [96, 102, 116] : [234, 232, 228];
+        const parts = [];
+        if (lm.tracks) parts.push([0, 0, function () {
+          for (const v0 of [-cw, 0]) box(-hw * 0.95, v0 + 1, hw * 0.95, v0 + cw - 1, 5.5, 6.6, roofC, U.shade(roofC, 1.06));
+          for (const vv of [-cw / 2, cw / 2]) glowLine(-hw * 0.9, vv, 5.4, hw * 0.9, vv, 5.4, 'rgba(255,240,210,0.95)', Math.max(1, s / 28));   // 雨棚下的灯带
+        }]);
+        const hv = lm.tracks ? sd * (cw + 20) : 0, hu = lm.tracks ? 64 : hw;
+        parts.push([0, hv, function () {
+          box(-hu, hv - 14, hu, hv + 14, 0, 12, hallC, null);
+          box(-hu + 8, hv + sd * 14 - (sd > 0 ? 0.6 : 0), hu - 8, hv + sd * 14 + (sd > 0 ? 0 : 0.6), 1.5, 10.5, glass, null);   // 门厅玻璃
+          eaveR(-hu, hv - 14, hu, hv + 14, 3, 12, 15, roofC);
+          lit(-hu + 8, hv + sd * 14, hu - 8, hv + sd * 14, 2, 10, 2, 10);
+          glowFace(-hu + 8, hv + sd * 14, hu - 8, hv + sd * 14, 1.5, 10.5, 'rgba(255,214,150,0.6)');
+        }]);
+        ordered(parts);
+        break;
+      }
+      case 'airport': { // 机场（附加模型）：放在地面图的停机坪上——与跑道平行的航站楼、登机廊桥与停机位上的客机、塔台；+v 一侧朝向跑道
+        const body = N ? [96, 104, 118] : [236, 238, 242], roof = N ? [120, 134, 156] : [206, 216, 228], td = 18;
+        const plane = function (u, v, tail) {
+          return function () {
+            const wc = N ? [150, 156, 168] : [250, 250, 252], k = 1.1;
+            poly([T(u - 18 * k, v + 3 * k), T(u + 18 * k, v + 3 * k), T(u + 3 * k, v - 3 * k), T(u - 3 * k, v - 3 * k)], 2.6, 3.1, wc, U.shade(wc, 0.92));   // 主翼
+            box(u - 2.2 * k, v - 21 * k, u + 2.2 * k, v + 21 * k, 1.2, 5.2, wc, U.shade(wc, 1.02));   // 机身（机头朝航站楼）
+            poly([T(u - 7 * k, v + 18 * k), T(u + 7 * k, v + 18 * k), T(u + 2 * k, v + 14 * k), T(u - 2 * k, v + 14 * k)], 4.6, 5.0, wc, null);   // 平尾
+            box(u - 0.5 * k, v + 14 * k, u + 0.5 * k, v + 21 * k, 5, 11, tail, U.shade(tail, 1.05));   // 垂尾（航空公司色）
+            glowDot(u, v - 21 * k, 3, Math.max(0.8, s / 50), 'rgba(255,255,255,0.9)');
+          };
+        };
+        const tails = [[200, 54, 48], [36, 92, 170], [24, 140, 110], [226, 150, 40]];
+        const parts = [[0, 0, function () {
+          box(-hw, -td, hw, td, 0, 11, body, null);
+          box(-hw + 6, td - 0.6, hw - 6, td, 1.5, 9.5, glass, null);   // 朝停机坪的玻璃幕墙
+          lit(-hw + 6, td, hw - 6, td, 2, 9, 2, 16);
+          eaveR(-hw, -td, hw, td, 5, 11, 14, roof);
+          glowFace(-hw + 6, td, hw - 6, td, 1.5, 9.5, 'rgba(255,214,160,0.6)');
+        }]];
+        for (let k = 0; k < 3; k++) {
+          const u = -hw * 0.6 + k * hw * 0.6;
+          parts.push([u, td + 14, function () { box(u - 1.8, td, u + 1.8, td + 26, 4, 7, N ? [110, 116, 128] : [212, 214, 218]); }]);   // 登机廊桥
+          parts.push([u, td + 52, plane(u, td + 52, tails[(k + Math.round(lm.x * 7)) % 4])]);
+        }
+        for (const u of [-hw * 0.9, 0, hw * 0.9]) parts.push([u, td + 92, function () {   // 机坪高杆灯
+          line(u, td + 92, 0, u, td + 92, 20, N ? '#8c96a6' : '#9aa2ae', Math.max(0.6, s / 70));
+          glowDot(u, td + 92, 20, Math.max(2, s / 14), 'rgba(255,236,200,0.95)');
+        }]);
+        parts.push([-hw - 26, -td + 6, function () {   // 塔台
+          cyl(-hw - 26, -td + 6, 4.5, 12, 0, 30, body, null);
+          cyl(-hw - 26, -td + 6, 7.5, 12, 30, 35, glass, null);
+          cyl(-hw - 26, -td + 6, 8.2, 12, 35, 36.5, roof, null);
+          line(-hw - 26, -td + 6, 36.5, -hw - 26, -td + 6, 44, N ? '#c8d0dc' : '#6a7280', Math.max(0.8, s / 50));
+          glowDot(-hw - 26, -td + 6, 32.5, Math.max(1.6, s / 18), 'rgba(170,255,220,0.9)');
+          if (N) dot(-hw - 26, -td + 6, 44, Math.max(1, s / 36), '#ff5a4a');
+        }]);
+        ordered(parts);
         break;
       }
       case 'expo': { // 琶洲会展中心：三排展馆的波浪形屋面
@@ -1436,47 +2046,126 @@
         break;
       }
       case 'tvtower': { // 广州塔：扭转收腰的钢结构网格外筒（454 m）+ 天线桅杆（600 m）
+        if (lm.style === 'pearl' || lm.style === 'needle') {
+          const b0 = pj(lm.x, lm.y, 0);
+          ctx.fillStyle = TH.modelShadow; ctx.beginPath(); ctx.ellipse(b0[0], b0[1], 40 / CMM * s, 18 / CMM * s, 0, 0, Math.PI * 2); ctx.fill();
+          const conc = N ? [150, 154, 170] : [222, 224, 228];
+          // 球体：沿高度分成若干截锥环（下半逐渐放大、上半逐渐收小）
+          const sphere = function (cu, cv, hc, R, col) {
+            const n = 16, steps = 10; let r0 = R * 0.12, h0 = hc - R;
+            for (let k = 1; k <= steps; k++) { const a = -Math.PI / 2 + k / steps * Math.PI, r1 = Math.max(R * 0.12, R * Math.cos(a)), h1 = hc + R * Math.sin(a); eaveN(cu, cv, r0, r1, n, h0, h1, col); r0 = r1; h0 = h1; }
+          };
+          if (lm.style === 'pearl') { // 东方明珠（1994，468 m）：三根立柱与三根斜撑，下球体（68–118 m）、上球体（250–295 m）、太空舱（335–349 m）
+            const H = lm.h || 468, pink = N ? [236, 100, 176] : [204, 86, 136], lw = Math.max(1, s / 30);
+            for (let k = 0; k < 3; k++) { const a = -Math.PI / 2 + k * Math.PI * 2 / 3; line(Math.cos(a) * 46, Math.sin(a) * 46, 0, Math.cos(a) * 18, Math.sin(a) * 18, 80, N ? '#9aa4c0' : '#c8ccd4', lw * 2.2); }
+            for (let k = 0; k < 3; k++) { const a = -Math.PI / 2 + k * Math.PI * 2 / 3; cyl(Math.cos(a) * 10, Math.sin(a) * 10, 4.5, 8, 0, 335, conc, null); }
+            sphere(0, 0, 93, 25, pink);
+            for (const hc of [140, 175, 210]) sphere(0, 0, hc, 5.5, pink);   // 中间的小球
+            sphere(0, 0, 272, 22.5, pink);
+            sphere(0, 0, 342, 7, pink);
+            cyl(0, 0, 3, 8, 349, 370, conc, null);
+            line(0, 0, 370, 0, 0, H, N ? '#e8ecff' : '#a0a6b0', Math.max(1, s / 30));
+            if (N) dot(0, 0, H, Math.max(1.2, s / 24), '#ff4d6d');
+          } else { // 混凝土电视塔（龟山电视塔，221 m）：收分塔身、塔楼与天线
+            const H = lm.h || 221, glassC = N ? [110, 160, 220] : [176, 200, 222];
+            eaveN(0, 0, 9, 5, 12, 0, H * 0.62, conc);
+            eaveN(0, 0, 5.5, 15, 16, H * 0.62, H * 0.66, conc);
+            cyl(0, 0, 15, 16, H * 0.66, H * 0.71, glassC, null);
+            eaveN(0, 0, 15, 6, 16, H * 0.71, H * 0.74, conc);
+            cyl(0, 0, 3.5, 8, H * 0.74, H * 0.84, conc, null);
+            line(0, 0, H * 0.84, 0, 0, H, N ? '#e8ecff' : '#a0a6b0', Math.max(1, s / 30));
+            if (N) dot(0, 0, H, Math.max(1.2, s / 24), '#ff4d6d');
+          }
+          break;
+        }
         // 白天：中灰立柱与斜撑、深灰圆环、深灰混凝土核心筒、灰色桅杆（顶部红色航空障碍灯）；夜间：结构内嵌的彩色 LED 灯光
         const H = 454, rings = 26, nv = 24, tw = 280 / H;
         // 双曲面外筒：底部椭圆约 80 × 60 m，280 m 处收腰约 27 × 21 m，顶部约 54 × 41 m
         const radius = function (t) { const d = t - tw; return { rx: Math.sqrt(13.5 * 13.5 + 3692 * d * d), ry: Math.sqrt(10.5 * 10.5 + 2057 * d * d) }; };
         const b = pj(lm.x, lm.y, 0), top = pj(lm.x, lm.y, H * E);
-        ctx.fillStyle = TH.isoShadow; ctx.beginPath(); ctx.ellipse(b[0], b[1], 70 / CMM * s, 30 / CMM * s, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = TH.modelShadow; ctx.beginPath(); ctx.ellipse(b[0], b[1], 70 / CMM * s, 30 / CMM * s, 0, 0, Math.PI * 2); ctx.fill();
         cyl(0, 0, 7, 12, 0, H * 0.98, N ? [40, 38, 54] : [92, 98, 108], null, 0, 8.5);   // 椭圆核心筒约 14 × 17 m
         let col, brace, ringCol;
         if (N) {
           const gr = ctx.createLinearGradient(b[0], b[1], top[0], top[1]);
-          gr.addColorStop(0, 'rgba(255,72,150,0.95)'); gr.addColorStop(0.45, 'rgba(196,92,255,0.95)'); gr.addColorStop(1, 'rgba(84,176,255,0.95)');
+          gr.addColorStop(0, 'rgba(186,148,174,0.95)'); gr.addColorStop(0.45, 'rgba(169,154,193,0.95)'); gr.addColorStop(1, 'rgba(145,176,204,0.95)');
           col = gr; brace = gr; ringCol = 'rgba(255,214,246,0.55)';
-        } else { col = 'rgba(128,135,146,0.95)'; brace = 'rgba(128,135,146,0.55)'; ringCol = 'rgba(88,95,106,0.85)'; }
+        } else { col = 'rgba(228,233,238,0.98)'; brace = 'rgba(200,209,218,0.9)'; ringCol = 'rgba(190,201,212,0.95)'; }
         const strand = function (a0, twist, style, lw) {
           ctx.strokeStyle = style; ctx.lineWidth = lw; ctx.beginPath();
           for (let q = 0; q <= rings; q++) {
             const t = q / rings, a = a0 + t * twist, r = radius(t);
-            if (Math.cos(a) + Math.sin(a) < -0.3) { ctx.stroke(); ctx.beginPath(); continue; }
             const w = T(Math.cos(a) * r.rx, Math.sin(a) * r.ry), p = pj(w[0], w[1], H * t * E);
             if (q) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]);
           }
           ctx.stroke();
         };
-        const lw = Math.max(1.1, s / 34);
+        const lw = 1.8 / CMM * s;
+        ctx.meshLines = true;
         for (let v = 0; v < nv; v++) strand(v / nv * Math.PI * 2, Math.PI * 0.9, col, lw);          // 24 根倾斜立柱
         if (s >= 16) for (let v = 0; v < nv; v += 2) strand(v / nv * Math.PI * 2, -Math.PI * 0.55, brace, lw * 0.7); // 反向斜撑
         ctx.strokeStyle = ringCol; ctx.lineWidth = lw;
-        for (let q = 1; q <= rings; q += 2) { const t = q / rings, r = radius(t); ctx.beginPath(); for (let a = -0.8; a <= 2.4; a += 0.2) { const w = T(Math.cos(a) * r.rx, Math.sin(a) * r.ry), p = pj(w[0], w[1], H * t * E); if (a > -0.8) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); } ctx.stroke(); }
+        for (let q = 1; q <= rings; q += 2) { const t = q / rings, r = radius(t), start = 0, end = Math.PI * 2; ctx.beginPath(); for (let a = start; a <= end + 0.001; a += (end - start) / 40) { const w = T(Math.cos(a) * r.rx, Math.sin(a) * r.ry), p = pj(w[0], w[1], H * t * E); if (a > start) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); } ctx.stroke(); }
         // 顶部观光层圆环
         { const r = radius(1); ctx.strokeStyle = N ? 'rgba(255,236,250,0.9)' : 'rgba(176,182,192,0.95)'; ctx.lineWidth = lw * 1.6; ctx.beginPath(); for (let a = 0; a <= Math.PI * 2 + 0.01; a += 0.25) { const w = T(Math.cos(a) * r.rx, Math.sin(a) * r.ry), p = pj(w[0], w[1], H * E); if (a > 0) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); } ctx.stroke(); }
-        line(0, 0, H, 0, 0, 600, N ? '#f4dcff' : '#8e949c', Math.max(1.2, s / 26));
-        line(0, 0, 540, 0, 0, 600, N ? '#ffffff' : '#a6acb4', Math.max(0.8, s / 40));
+        line(0, 0, H, 0, 0, 600, N ? '#c6becd' : '#a5adb7', 1.4 / CMM * s);
+        line(0, 0, 540, 0, 0, 600, N ? '#d5d8df' : '#b2b8c0', 0.8 / CMM * s);
         dot(0, 0, 600, Math.max(1.2, s / (N ? 24 : 34)), N ? '#ff4d6d' : '#e0403a');
+        ctx.meshLines = false;
         break;
       }
       case 'lattice': { // 钢结构电波塔：东京塔（国际橙/白相间桁架）与东京晴空塔（三角底座渐变为圆形的白色桁架）
         const b = pj(lm.x, lm.y, 0);
-        ctx.fillStyle = TH.isoShadow; ctx.beginPath(); ctx.ellipse(b[0], b[1], 60 / CMM * s, 26 / CMM * s, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = TH.modelShadow; ctx.beginPath(); ctx.ellipse(b[0], b[1], 60 / CMM * s, 26 / CMM * s, 0, 0, Math.PI * 2); ctx.fill();
         const lw = Math.max(0.8, s / 40);
         // 正对观察者的立面：世界方向 (1,1)
         const front = function (u, v) { return (u * ca - v * sa) + (u * sa + v * ca) > -0.1; };
+        if (lm.style === 'eiffel') { // 埃菲尔铁塔：底边约 125 m 的四足熟铁塔，57 m 一层、115 m 二层、276 m 顶层平台；塔顶天线（lm.h，1889 年 312 m）
+          const H = lm.h || 324, PR = [[0, 62], [57, 35], [115, 19], [180, 9], [276, 4.6], [300, 3]];
+          const hwAt = function (h) { return U.interp(PR, h); };
+          const BR = N ? [214, 160, 86] : [132, 108, 84], PL = N ? [255, 206, 128] : [156, 130, 100];
+          const sq = function (w) { return Rc(-w, -w, w, w); };
+          const brace = function (h0, h1) { // 立面上的 X 形斜撑
+            if (s < 16) return;
+            const w0 = hwAt(h0), w1 = hwAt(h1);
+            ctx.strokeStyle = N ? 'rgba(255,236,190,0.5)' : 'rgba(70,52,36,0.45)'; ctx.lineWidth = lw; ctx.beginPath();
+            for (const sd of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+              if (!front(sd[0], sd[1])) continue;
+              const P = function (t, w, h) { const u = sd[0] ? sd[0] * w : (t * 2 - 1) * w, v = sd[1] ? sd[1] * w : (t * 2 - 1) * w, q = T(u, v); return pj(q[0], q[1], h * E); };
+              const a0 = P(0, w0, h0), a1 = P(1, w1, h1), b0 = P(1, w0, h0), b1 = P(0, w1, h1);
+              ctx.moveTo(a0[0], a0[1]); ctx.lineTo(a1[0], a1[1]); ctx.moveTo(b0[0], b0[1]); ctx.lineTo(b1[0], b1[1]);
+            }
+            ctx.stroke();
+          };
+          // 四足：底部各约 24 m 见方，向上收拢到一层平台
+          const legs = [[-1, -1], [1, -1], [-1, 1], [1, 1]].sort(function (a, b) { return depth(a[0], a[1]) - depth(b[0], b[1]); });
+          for (const L of legs) {
+            const u0 = L[0] * 50, v0 = L[1] * 50, u1 = L[0] * 29, v1 = L[1] * 29;
+            const c0 = T((u0 + u1) / 2, (v0 + v1) / 2);
+            frustumRings(ctx, pj, Rc(u0 - 12, v0 - 12, u0 + 12, v0 + 12), Rc(u1 - 6, v1 - 6, u1 + 6, v1 + 6), 0, 57 * E, BR, c0[0], c0[1]);
+          }
+          // 一层下方的装饰拱
+          if (s >= 16) {
+            ctx.strokeStyle = N ? 'rgba(255,226,160,0.8)' : 'rgba(96,74,54,0.75)'; ctx.lineWidth = lw * 1.3;
+            for (const sd of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+              if (!front(sd[0], sd[1])) continue;
+              ctx.beginPath();
+              for (let k = 0; k <= 12; k++) { const t = k / 12, x = (t * 2 - 1) * 34, hh = 12 + 27 * Math.sin(Math.PI * t), q = T(sd[0] ? sd[0] * 42 : x, sd[1] ? sd[1] * 42 : x), p = pj(q[0], q[1], hh * E); if (k) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }
+              ctx.stroke();
+            }
+          }
+          box(-38, -38, 38, 38, 57, 64, PL); lit(-38, 38, 38, 38, 58, 63, 1, 10);
+          const bands = [64, 90, 115];
+          for (let q = 1; q < bands.length; q++) { frustumRings(ctx, pj, sq(hwAt(bands[q - 1])), sq(hwAt(bands[q])), bands[q - 1] * E, bands[q] * E, BR, lm.x, lm.y, true); brace(bands[q - 1], bands[q]); }
+          box(-21, -21, 21, 21, 115, 121, PL); lit(-21, 21, 21, 21, 116, 120, 1, 6);
+          const up = [121, 150, 180, 215, 245, 276];
+          for (let q = 1; q < up.length; q++) { frustumRings(ctx, pj, sq(hwAt(up[q - 1])), sq(hwAt(up[q])), up[q - 1] * E, up[q] * E, BR, lm.x, lm.y, q < up.length - 1); brace(up[q - 1], up[q]); }
+          box(-6, -6, 6, 6, 276, 284, PL);
+          cyl(0, 0, 3, 8, 284, 300, BR, null);
+          line(0, 0, 300, 0, 0, H, N ? '#ffe0a0' : '#7a6650', Math.max(1, s / 30));
+          if (N) dot(0, 0, H, Math.max(1.2, s / 24), '#ff4d6d');
+          break;
+        }
         if (lm.style === 'skytree') {
           const H = 634, f0 = -Math.PI / 2, n = 18;
           const R = function (h) { return 17 + 22 * Math.pow(Math.max(0, 1 - h / 350), 1.6); };
@@ -1585,11 +2274,53 @@
           frustumRings(ctx, pj, q2(18), q2(12), 352 * kh * E, 392 * kh * E, col, lm.x, lm.y, false);
           line(0, 0, 392 * kh, 0, 0, H, N ? '#c8d0dc' : '#8a929c', Math.max(1, s / 26));
           if (N) dot(0, 0, H, 2, '#ff4d4d');
+        } else if (lm.style === 'jinmao') { // 金茂大厦（1999，420.5 m）：宝塔式逐段收分的银灰色塔身，顶部尖塔
+          const kh = H / 420.5, col = N ? [92, 106, 128] : [184, 192, 202];
+          box(-42, -42, 42, 42, 0, 24 * kh, N ? [80, 88, 104] : [212, 210, 204]);
+          let h0 = 24, w = 27;
+          for (let k = 0; k < 10; k++) {
+            const th = 52 * Math.pow(0.86, k), w1 = w - 1.6;
+            frustumRings(ctx, pj, Rc(-w, -w, w, w), Rc(-w1, -w1, w1, w1), h0 * kh * E, (h0 + th) * kh * E, k % 2 ? col : U.shade(col, 1.05), lm.x, lm.y, false);
+            eaveR(-w1, -w1, w1, w1, 2.2, (h0 + th - 3) * kh, (h0 + th) * kh, U.shade(col, 1.12));
+            h0 += th; w = w1 - 0.8;
+          }
+          hip(-w, -w, w, w, h0 * kh, (h0 + 40) * kh, U.shade(col, 1.08));
+          line(0, 0, (h0 + 40) * kh, 0, 0, H, N ? '#d8e2f0' : '#8a929c', Math.max(1, s / 28));
+          if (N) dot(0, 0, H, 2, '#ff4d4d');
+        } else if (lm.style === 'swfc') { // 上海环球金融中心（2008，492 m）：方形底座两侧以弧面收成一条斜线，顶部梯形开口
+          const kh = H / 492, col = N ? [74, 98, 132] : [176, 198, 218], segs = 8;
+          for (let k = 0; k < segs; k++) {
+            const t0 = k / segs, t1 = (k + 1) / segs, f = function (t) { return 29 * (1 - 0.88 * Math.pow(t, 1.3)); };
+            frustumRings(ctx, pj, Rc(-29, -f(t0), 29, f(t0)), Rc(-29, -f(t1), 29, f(t1)), t0 * 492 * kh * E, t1 * 492 * kh * E, col, lm.x, lm.y, k < segs - 1);
+          }
+          if (s >= 12) { // 顶部开口：两个可见立面上画出透空的梯形
+            const sky = N ? 'rgba(20,28,44,0.9)' : 'rgba(226,236,246,0.95)';
+            for (const sv of [-1, 1]) {
+              if (!(depth(0, sv) > 0)) continue;
+              const vv = sv * 29 * (1 - 0.88 * Math.pow(0.93, 1.3)), P = function (u, h) { const q = T(u, vv); return pj(q[0], q[1], h * kh * E); };
+              fillPts(ctx, [P(-20, 440), P(20, 440), P(14, 475), P(-14, 475)], sky);
+            }
+          }
+          if (N) dot(0, 0, H, 2, '#ff4d4d');
+        } else if (lm.style === 'shtower') { // 上海中心大厦（2015，632 m）：圆角三角形平面，逐段收分并扭转约 120°
+          const kh = H / 632, segs = 9, col = N ? [70, 100, 136] : [176, 202, 222];
+          const ring = function (sc, rot) { const o = []; for (let k = 0; k < 18; k++) { const t = k / 18 * Math.PI * 2 + rot; const r = 36 * sc * (1 + 0.12 * Math.cos(3 * (t - rot))); o.push(T(Math.cos(t) * r, Math.sin(t) * r)); } return o; };
+          box(-48, -48, 48, 48, 0, 30 * kh, N ? [80, 88, 104] : [214, 214, 210]);
+          for (let k = 0; k < segs; k++) {
+            const t0 = k / segs, t1 = (k + 1) / segs, h0 = 30 + t0 * 550, h1 = 30 + t1 * 550;
+            frustumRings(ctx, pj, ring(1 - 0.45 * t0, t0 * Math.PI * 2 / 3), ring(1 - 0.45 * t1, t1 * Math.PI * 2 / 3), h0 * kh * E, h1 * kh * E, k % 2 ? col : U.shade(col, 1.04), lm.x, lm.y, k < segs - 1);
+          }
+          const top = ring(0.55, Math.PI * 2 / 3), c0 = T(0, 0);
+          frustumRings(ctx, pj, top, ring(0.45, Math.PI * 2 / 3 + 0.2), 580 * kh * E, H * E, U.shade(col, 1.1), c0[0], c0[1], false);
+          if (N) dot(0, 0, H, 2, '#ff4d4d');
         } else { // 东塔：方形分段收分，白色竖向陶板（其他城市的超高层按高度与占地等比缩放）
           const kh = H / 530, kw = Math.min(1.2, (lm.w || 78) / 78);
           const tiers = [[38, 0, 160], [36, 160, 330], [33, 330, 470], [29, 470, 515]];
+          // 裙楼（占地足够时）与塔冠亮带
+          if ((lm.w || 78) >= 90) box(-hw * 0.48, -hd * 0.48, hw * 0.48, hd * 0.48, 0, Math.min(36, 30 * kh * 1.6), N ? [80, 88, 104] : [216, 216, 212], null);
           for (const t of tiers) box(-t[0] * kw, -t[0] * 0.9 * kw, t[0] * kw, t[0] * 0.9 * kw, t[1] * kh, t[2] * kh, N ? [80, 92, 112] : [214, 222, 230], null, { lines: function (fc, q) { if (s < 16) return; ctx.strokeStyle = N ? 'rgba(255,214,140,0.4)' : 'rgba(255,255,255,0.75)'; ctx.lineWidth = 1; ctx.beginPath(); for (let k = 0.08; k < 1; k += 0.14) { ctx.moveTo(q[0][0] + (q[1][0] - q[0][0]) * k, q[0][1] + (q[1][1] - q[0][1]) * k); ctx.lineTo(q[3][0] + (q[2][0] - q[3][0]) * k, q[3][1] + (q[2][1] - q[3][1]) * k); } ctx.stroke(); } });
           box(-22 * kw, -20 * kw, 22 * kw, 20 * kw, 515 * kh, H, N ? [110, 120, 140] : [196, 204, 214]);
+          box(-29 * kw, -26.1 * kw, 29 * kw, 26.1 * kw, 505 * kh, 515 * kh, N ? [150, 170, 200] : [238, 242, 246]);   // 塔冠亮带
           if (N) dot(0, 0, H, 2, '#ff4d4d');
         }
         break;
@@ -1603,24 +2334,56 @@
         break;
       }
       case 'box': { // 广东省博物馆：“宝盒”
+        if (lm.style === 'pompidou') { // 蓬皮杜中心：外露的彩色设备管道（蓝：空调，绿：给水，黄：电气，红：交通）与外挂自动扶梯
+          box(-83, -30, 83, 30, 0, 42, N ? [96, 104, 118] : [228, 230, 232], null, { lines: function (fc, q) { if (s < 16) return; const cols = ['#2f6fb6', '#2e9b55', '#e8c22c', '#d9412f']; ctx.lineWidth = Math.max(0.8, s / 60); ctx.globalAlpha = 0.7; for (let k = 0; k < 8; k++) { const t = (k + 0.5) / 8; ctx.strokeStyle = cols[k % 4]; ctx.beginPath(); ctx.moveTo(q[0][0] + (q[1][0] - q[0][0]) * t, q[0][1] + (q[1][1] - q[0][1]) * t); ctx.lineTo(q[3][0] + (q[2][0] - q[3][0]) * t, q[3][1] + (q[2][1] - q[3][1]) * t); ctx.stroke(); } ctx.globalAlpha = 1; } });
+          lit(-83, 30, 83, 30, 3, 40, 5, 12);
+          line(-78, 31, 3, 70, 31, 41, '#d9412f', Math.max(1.4, s / 24));
+          break;
+        }
         box(-40, -40, 40, 40, 0, 7, N ? [60, 64, 72] : [120, 124, 130], null);
         box(-58, -58, 58, 58, 7, 42, N ? [70, 72, 80] : [96, 96, 100], N ? [90, 92, 100] : [150, 150, 156], { lines: function (fc, q) { if (s < 16) return; ctx.strokeStyle = N ? 'rgba(220,180,90,0.35)' : 'rgba(220,200,160,0.5)'; ctx.lineWidth = 1; ctx.beginPath(); for (let t = 0.12; t < 1; t += 0.18) { ctx.moveTo(q[0][0] + (q[3][0] - q[0][0]) * t, q[0][1] + (q[3][1] - q[0][1]) * t); ctx.lineTo(q[1][0] + (q[2][0] - q[1][0]) * t, q[1][1] + (q[2][1] - q[1][1]) * t); } ctx.stroke(); } });
         break;
       }
       case 'library': { // 广州图书馆：“之”字形层叠
+        if (lm.style === 'bnf') { // 法国国家图书馆：木质平台四角的四座 L 形玻璃塔楼（79 m，形如打开的书），中央为下沉花园
+          const a = hw - 6, b = hd - 6, L = Math.min(60, hw * 0.4), t = 18, gC = N ? [74, 104, 140] : [186, 208, 226];
+          box(-hw, -hd, hw, hd, 0, 5, N ? [104, 92, 80] : [196, 170, 140]);
+          if (detail) trees(26, 91, function (u, v) { return Math.abs(u) > hw - 60 || Math.abs(v) > hd - 50; });
+          const parts = [];
+          for (const q of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+            const cu = q[0] * a, cv = q[1] * b;
+            parts.push([cu - q[0] * L * 0.3, cv - q[1] * L * 0.3, function () {
+              box(Math.min(cu, cu - q[0] * L), Math.min(cv, cv - q[1] * t), Math.max(cu, cu - q[0] * L), Math.max(cv, cv - q[1] * t), 5, 79, gC, null);
+              box(Math.min(cu, cu - q[0] * t), Math.min(cv - q[1] * t, cv - q[1] * L), Math.max(cu, cu - q[0] * t), Math.max(cv - q[1] * t, cv - q[1] * L), 5, 79, gC, null);
+            }]);
+          }
+          ordered(parts);
+          break;
+        }
         const c1 = N ? [96, 100, 112] : [206, 200, 188];
         box(-62, -36, 10, 36, 0, 26, c1, null); box(-10, -36, 62, 36, 26, 50, c1);
         box(-62, -36, 10, 36, 26, 28, U.shade(c1, 0.9)); lit(-62, 36, 10, 36, 3, 24, 4, 8); lit(-10, 36, 62, 36, 28, 48, 4, 8);
         break;
       }
-      case 'mall': { // 天河城：商业裙楼
-        box(-hw + 10, -hd + 10, hw - 10, hd - 10, 0, 32, N ? [86, 92, 110] : [224, 218, 206], null);
-        lit(-hw + 10, hd - 10, hw - 10, hd - 10, 3, 30, 6, 14);
-        box(-30, -30, 30, 30, 32, 40, N ? [110, 120, 140] : [196, 210, 224]);
+      case 'mall': { // 天河城：商业裙楼——底层玻璃橱窗带、立面招牌带、退台屋顶与屋面设备
+        const wall = N ? [86, 92, 110] : [224, 218, 206], gl = N ? [70, 96, 130] : [180, 204, 226];
+        const u0 = -hw + 10, v0 = -hd + 10, u1 = hw - 10, v1 = hd - 10;
+        box(u0, v0, u1, v1, 0, 32, wall, null, { lines: function (fc, q) { if (s < 16) return; const L = function (t) { ctx.beginPath(); ctx.moveTo(q[0][0] + (q[3][0] - q[0][0]) * t, q[0][1] + (q[3][1] - q[0][1]) * t); ctx.lineTo(q[1][0] + (q[2][0] - q[1][0]) * t, q[1][1] + (q[2][1] - q[1][1]) * t); ctx.stroke(); }; ctx.strokeStyle = N ? 'rgba(150,180,220,0.45)' : 'rgba(150,175,205,0.55)'; ctx.lineWidth = Math.max(2, s / 14); L(0.9); ctx.strokeStyle = N ? 'rgba(255,200,120,0.55)' : 'rgba(200,90,70,0.55)'; ctx.lineWidth = Math.max(1.5, s / 22); L(0.42); } });
+        box(u0, v0, u1, v1, 0, 6, gl, null);
+        lit(u0, v1, u1, v1, 8, 30, 5, 14);
+        box(u0 + 24, v0 + 24, u1 - 24, v1 - 24, 32, 38, U.shade(wall, 0.96));
+        box(-30, -30, 30, 30, 38, 46, N ? [110, 120, 140] : [196, 210, 224]);
+        for (const d of [[-1, -1], [1, 1]]) box(d[0] * 45 - 8, d[1] * 40 - 6, d[0] * 45 + 8, d[1] * 40 + 6, 38, 41, N ? [70, 76, 88] : [190, 192, 196]);
         break;
       }
-      case 'conference': { // 白云国际会议中心：彩色竖向遮阳板
-        box(-hw + 20, -hd + 30, hw - 20, hd - 30, 0, 36, N ? [86, 92, 106] : [226, 226, 222], null, { lines: function (fc, q) { if (s < 16) return; const cols = ['#d94f3d', '#f0a72b', '#2f6fb6', '#16a085', '#8e44ad']; for (let k = 0; k < 14; k++) { const t = (k + 0.5) / 14; ctx.strokeStyle = cols[k % 5]; ctx.lineWidth = Math.max(1, s / 30); ctx.beginPath(); ctx.moveTo(q[0][0] + (q[1][0] - q[0][0]) * t, q[0][1] + (q[1][1] - q[0][1]) * t); ctx.lineTo(q[3][0] + (q[2][0] - q[3][0]) * t, q[3][1] + (q[2][1] - q[3][1]) * t); ctx.stroke(); } } });
+      case 'conference': { // 白云国际会议中心：依山而建的两组白色长楼，立面为彩色竖向遮阳板（细密、柔和），底层玻璃
+        const wall = N ? [86, 92, 106] : [232, 232, 228], gl = N ? [70, 96, 130] : [186, 208, 228];
+        const louvres = { lines: function (fc, q) { if (s < 16) return; const cols = ['#d94f3d', '#f0a72b', '#2f6fb6', '#16a085', '#8e44ad']; const n = Math.max(16, Math.round(s * 0.8)); ctx.globalAlpha = N ? 0.55 : 0.7; ctx.lineWidth = Math.max(0.8, s / 70); for (let k = 0; k < n; k++) { const t = (k + 0.5) / n; ctx.strokeStyle = cols[(k * 3 + (k >> 2)) % 5]; ctx.beginPath(); ctx.moveTo(q[0][0] + (q[1][0] - q[0][0]) * t, q[0][1] + (q[1][1] - q[0][1]) * t); ctx.lineTo(q[3][0] + (q[2][0] - q[3][0]) * t, q[3][1] + (q[2][1] - q[3][1]) * t); ctx.stroke(); } ctx.globalAlpha = 1; } };
+        const u0 = -hw + 20, u1 = hw - 20, v0 = -hd + 30, v1 = hd - 30, um = (u0 + u1) / 2;
+        ordered([
+          [(u0 + um) / 2 - 4, 0, function () { box(u0, v0, um - 8, v1, 0, 6, gl, null); box(u0, v0, um - 8, v1, 6, 34, wall, null, louvres); }],
+          [(um + u1) / 2 + 4, 0, function () { box(um + 8, v0 + 6, u1, v1 - 6, 0, 6, gl, null); box(um + 8, v0 + 6, u1, v1 - 6, 6, 30, wall, null, louvres); }],
+        ]);
         break;
       }
       case 'concert': { // 星海音乐厅：双曲抛物面屋顶
@@ -1670,7 +2433,7 @@
     const g = this.game, city = g.city, model = g.model, W = city.W, H = city.H, LO = this.layerOpt, lay = this.layer;
     const access = lay === 'cover' || lay === 'gap' ? model.net : null;
     const dyn = lay === 'fac' || lay === 'gap';
-    const key = lay + ':' + city.version + ':' + g.clock.y + ':' + g.clock.m + ':' + (lay === 'cover' ? g.netVersion + ':' + LO.cover : '') + (lay === 'fac' ? LO.facP + ':' + LO.facDt : '') + (lay === 'gap' ? LO.gapDt + ':' + g.netVersion : '') + (dyn ? ':' + model.cycles + ':' + (model.settled ? 's' : '') : '');
+    const key = this.themeName + ':' + AX.flag() + ':' + lay + ':' + city.version + ':' + g.clock.y + ':' + g.clock.m + ':' + (lay === 'cover' ? g.netVersion + ':' + LO.cover : '') + (lay === 'fac' ? LO.facP + ':' + LO.facDt : '') + (lay === 'gap' ? LO.gapDt + ':' + g.netVersion : '') + (lay === 'dev' ? LO.devK + ':' + LO.devB + ':' + (g.eraBase ? g.eraBase.id : '') : '') + (dyn ? ':' + model.cycles + ':' + (model.settled ? 's' : '') : '');
     const old = this.heatLayers.get(lay);
     if (old && old.key === key && old.access === access) { this.heat = old.cv; this.heatKey = key; return; }
     this.heatKey = key;
@@ -1707,24 +2470,34 @@
       }
       gapCell = this.zoneToCells(zv, this.cellWeights('all'));
     }
-    const stCol = function (k) { const hsh = (k * 2654435761) >>> 0; return [40 + (hsh & 127), 110 + ((hsh >> 7) & 100), 60 + ((hsh >> 14) & 140)]; };
+    // 城市发展（v2.2）：与本阶段开始（或本局开始）相比，每约 1 km 方块的人口、岗位或已开发用地的增减（按方块面积折算为密度变化）
+    const dv = lay === 'dev' && CM.Eras ? CM.Eras.change(g, LO.devB, LO.devK) : null;
+    const devRamp = LO.devK === 'jobs' ? [[0, [196, 214, 250]], [0.5, [92, 132, 230]], [1, [40, 70, 190]]] : LO.devK === 'land' ? [[0, [250, 226, 170]], [0.5, [226, 160, 60]], [1, [176, 96, 20]]] : [[0, [200, 236, 210]], [0.5, [72, 178, 120]], [1, [20, 120, 70]]];
+    const devFull = LO.devK === 'land' ? 1 : 3000;   // 满色：每方块增加 3000 人 / 个岗位，或 1 km² 用地
+    const stCol = function (k) { if (AX.enabled()) return U.hex2rgb(AX.category(k)); const hsh = (k * 2654435761) >>> 0; return [40 + (hsh & 127), 110 + ((hsh >> 7) & 100), 60 + ((hsh >> 14) & 140)]; };
     for (let c = 0; c < W * H; c++) {
       let col = null, a = 0;
       const p = city.pop[c] / 0.0625, jb = city.jobs[c] / 0.0625;
       if (lay === 'fac') {
-        if (facCell) { const v = facCell[c] / 0.0625; if (v > 150) { const t = U.clamp(Math.sqrt(v / 40000), 0, 1); col = U.hex2rgb(TR.color[PK[facDom[c]]] || '#888888'); a = 0.1 + 0.42 * t; } }
+        if (facCell) { const v = facCell[c] / 0.0625; if (v > 150) { const t = U.clamp(Math.sqrt(v / 40000), 0, 1); col = U.hex2rgb(AX.category(facDom[c], TR.color[PK[facDom[c]]] || '#888888')); a = 0.1 + 0.42 * t; } }
       } else if (lay === 'gap') {
-        if (gapCell) { const v = gapCell[c] / 0.0625; if (v > 400) { const t = U.clamp(Math.sqrt(v / 60000), 0, 1); col = U.ramp([[0, [255, 214, 170]], [0.5, [236, 112, 72]], [1, [180, 24, 34]]], t); a = 0.12 + 0.45 * t; } }
+        if (gapCell) { const v = gapCell[c] / 0.0625; if (v > 400) { const t = U.clamp(Math.sqrt(v / 60000), 0, 1); col = AX.ramp([[0, [255, 214, 170]], [0.5, [236, 112, 72]], [1, [180, 24, 34]]], t); a = 0.12 + 0.45 * t; } }
       } else if (lay === 'cover' && LO.cover === 'station') {
         const w = acc ? acc.cellWalk[c] : Infinity, k = acc ? acc.cellStation[c] : -1;
         if (k >= 0 && w <= CFG.walk.maxAccessM) { col = stCol(k); a = 0.42 - 0.18 * U.clamp(w / CFG.walk.maxAccessM, 0, 1); }
         else if (p > 4000) { col = [215, 48, 39]; a = U.clamp(0.1 + p / 120000, 0, 0.38); }
+      } else if (lay === 'dev') {
+        if (dv && city.lu[c] !== CM.LU.WATER) {
+          const x = c % W, y = (c - x) / W, v = dv.v[Math.floor(y / dv.bs) * dv.bw + Math.floor(x / dv.bs)];
+          const t = U.clamp(Math.sqrt(Math.abs(v) / devFull), 0, 1);
+          if (Math.abs(v) >= (LO.devK === 'land' ? 0.12 : 500)) { col = v > 0 ? AX.ramp(devRamp, t) : AX.ramp([[0, [250, 210, 205]], [1, [200, 50, 50]]], t); a = 0.1 + 0.48 * t; }
+        }
       } else if (lay === 'pop') {
         // 浅色单色渐变、半透明（最高约 0.5），道路与地名仍清楚可见
-        if (p > 200) { const t = U.clamp(Math.sqrt(p / 60000), 0, 1); col = U.ramp([[0, [255, 226, 150]], [0.5, [249, 158, 76]], [1, [222, 84, 52]]], t); a = 0.12 + 0.4 * t; }
+        if (p > 200) { const t = U.clamp(Math.sqrt(p / 60000), 0, 1); col = AX.ramp([[0, [255, 226, 150]], [0.5, [249, 158, 76]], [1, [222, 84, 52]]], t); a = 0.12 + 0.4 * t; }
       } else if (this.layer === 'jobs') {
         const t = p + jb;
-        if (t > 300) { const sh = p / t; col = U.mixc([52, 104, 214], [240, 150, 60], sh); a = U.clamp(0.12 + 0.4 * Math.sqrt(t / 90000), 0, 0.5); }
+        if (t > 300) { const sh = p / t; col = AX.mix([52, 104, 214], [240, 150, 60], sh); a = U.clamp(0.12 + 0.4 * Math.sqrt(t / 90000), 0, 0.5); }
       } else if (this.layer === 'cover') {
         const w = acc ? acc.cellWalk[c] : Infinity;
         const m = w / CFG.walk.mPerMin;
@@ -1735,9 +2508,9 @@
       } else if (this.layer === 'region') {
         const rg = city.regions[city.region[c]];
         if (rg.scenic) { col = [120, 170, 110]; a = 0.25; }
-        else if (!city.regionOpen[city.region[c]]) { col = [150, 150, 150]; a = 0.25; }
+        else if (city.cellLocked(c)) { col = [150, 150, 150]; a = 0.25; }
       }
-      if (col) { const o = c * 4; d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = a * 255; }
+      if (col) { col = AX.rgb(col); const o = c * 4; d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = a * 255; }
     }
     ctx.putImageData(img, 0, 0);
     this.heatLayers.set(this.layer, { key: key, access: access, cv: this.heat });
@@ -1753,6 +2526,7 @@
     if (!g) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = U.rgb(TH.bg); ctx.fillRect(0, 0, this.cv.width, this.cv.height); return; }
     if (g.preview && this.layer !== 'none') this.layer = 'none';   // 开始界面背景没有交通模型，不画分析图层
     this.updateCamera(dt);
+    this.syncFacModels();
     this.markDirty();
     const cam = this.cam, under = U.smooth(cam.under), t = this.tEase;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1832,6 +2606,8 @@
     if (this.layerFade > 0.01 && (this.layer === 'cong' || this.layer === 'flow' || this.layer === 'station' || !layerOn)) {
       ctx.fillStyle = U.rgb(TH.fog || TH.bg, 0.5 * this.layerFade); ctx.fillRect(0, 0, this.w, this.h);
     }
+    // 经纬网格（视图工具）：画在地面上、建筑之下，保持低调
+    if (CM.Grid) CM.Grid.draw(ctx, this);
     // ---- 建筑与动态对象 ----
     const agents = this.agentsOn && this.layerFade < 0.5 ? CM.agents : null;
     if (t >= 0.999 && cam.view === 1) this.bFade = Math.min(1, this.bFade + dt / 0.3); else this.bFade = Math.max(0, this.bFade - dt / 0.15);
@@ -1845,7 +2621,7 @@
       const list = [];
       for (let cj = cj0; cj <= cj1; cj++) for (let ci = ci0; ci <= ci1; ci++) list.push([ci, cj]);
       list.sort(function (a, b) { return (a[0] + a[1]) - (b[0] + b[1]) || a[0] - b[0]; });
-      const buckets = agents && agentAlpha > 0 ? agents.bucket(C) : null;
+      const buckets = agents && agentAlpha > 0 ? agents.bucket(C, this) : null;
       const sc = z / ilvl;
       // 地标按其中心所在分块归组，在该分块之后绘制（与前后建筑正确遮挡）
       const city = this.game.city, lmBy = new Map();
@@ -1853,6 +2629,11 @@
         if (!city.landmarkOn[k]) continue;
         const lm = D.landmarks[k], kk = Math.floor(lm.x / C) + ':' + Math.floor(lm.y / C);
         let l = lmBy.get(kk); if (!l) { l = []; lmBy.set(kk, l); } l.push(k);
+      }
+      const extraBy = new Map();
+      for (const it of this.extraModels()) {
+        const key = Math.floor(it.x / C) + ':' + Math.floor(it.y / C);
+        let a = extraBy.get(key); if (!a) extraBy.set(key, a = []); a.push(it);
       }
       for (const it of list) {
         const ci = it[0], cj = it[1];
@@ -1868,6 +2649,8 @@
           ctx.globalAlpha = bAlpha * fade;
           ctx.drawImage(e.cv, a.x - e.ax * sc, a.y - e.ay * sc, e.cv.width * sc, e.cv.height * sc);
         } else if (visible && e) e.used = this.frame;
+        const facilities = extraBy.get(ci + ':' + cj);
+        if (facilities) for (const it of facilities) this.drawFacilitySprite(ctx, it.lm, Math.min(64, ilvl), bAlpha);
         const lks = lmBy.get(ci + ':' + cj);
         if (lks) for (const k of lks) {
           let landmarkLvl = 64;
@@ -1889,7 +2672,11 @@
     if (this.layer === 'flow') this.drawDesire(ctx);
     if (this.layer === 'cover') this.drawCoverExtras(ctx, ui);
     // ---- 地铁 ----
+    this.drawDemolitions(ctx, under);
+    this.drawScenicZones(ctx, under);
     this.drawMetro(ctx, ui);
+    this.drawPortals(ctx, (1 - under) * (1 - this.layerFade));
+    if (CM.BgTransit && this.game === CM.game) CM.BgTransit.draw2D(ctx, this, agentAlpha);
     if (agents) agents.drawTrains(ctx, this, ui);
     if (this.layer === 'station') this.drawStationFlows(ctx);
     if (this.layer === 'gap') this.drawGapOverload(ctx);
@@ -1898,23 +2685,55 @@
     if (under < 0.5) this.drawAtmosphere(ctx);
     // ---- 标注 ----
     this.drawLabels(ctx, ui);
+    if (CM.Grid) CM.Grid.drawLabels(ctx, this);
     if (this.hl) this.drawHighlight(ctx);
     if (ui && ui.drawOverlay) ui.drawOverlay(ctx, this);
     // ---- 缓存渲染队列 ----
+    // 优先补齐当前画面；空闲时在网页版的帧预算内预绘。
+    let pending = 0;
+    for (const q of queue) if (q.kind !== 'o') pending++;
+    this.stats.pendingVisible = pending;
+    const warming = this.warmUntil && performance.now() < this.warmUntil;
+    if (!warming) this.warmUntil = 0;
+    let budget;
+    if (warming) budget = CFG.perf.warmBudgetMs;
+    else if (pending) budget = Math.max(2, Math.min(g.preview ? 4 : CFG.perf.sharpBudgetMs, 16 - (performance.now() - tStart)));
+    else {
+      budget = this.detail.ema < 14 && !(this.cam.fly) ? Math.min(CFG.perf.prefetchMs, Math.max(0, 14 - (performance.now() - tStart))) : 0;
+      if (budget > 0.5) this.prefetch(queue, lvl, { x0: wx0, y0: wy0, x1: wx1, y1: wy1 }, t >= 0.999 && cam.view === 1 && under < 0.99 && this.layerFade < 0.99);
+      else budget = 0;
+    }
+    // 镜头移动中（拖动、滚轮缩放、键盘平移）：每帧补块的预算收紧，保证移动流畅；停下后再用完整预算补齐
+    const camKey = cam.cx.toFixed(3) + ':' + cam.cy.toFixed(3) + ':' + cam.zoom.toFixed(3) + ':' + cam.t.toFixed(2) + ':' + cam.under.toFixed(2);
+    const moving = camKey !== this._camKey; this._camKey = camKey;
+    if (moving) budget = Math.min(budget, CFG.perf.movingBudgetMs || 3);
+    if (!warming || moving) budget = Math.min(budget, Math.max(0, 14 - (performance.now() - (this.frameWorkStart || frameStart))));
     if (this.isoJob) {
       const active = queue.find((q) => q.kind === 'i' && q.key === this.isoJob.key);
       if (!active || this.isoJob.version !== g.city.version) this.cancelIsoJob();
       else active.d = Math.min(active.d, -0.6);
     }
+    const gver = g.city.version + ':' + this.roadVer + ':' + this.styleEpoch + ':' + this.themeName;
+    if (this.groundJob) {
+      const active = queue.find((q) => q.kind === 'g' && q.key === this.groundJob.key);
+      if (!active || this.groundJob.ver !== gver) this.cancelGroundJob();
+      else active.d = Math.min(active.d, -0.7);
+    }
     queue.sort(function (a, b) { return a.d - b.d; });
-    const budget = Math.max(1, Math.min(CFG.perf.chunkBudgetMs, this.detail.tier ? 3 : 6, 11 - (performance.now() - tStart)));
     const queueStart = performance.now();
     let n = 0;
     for (const q of queue) {
-      if (n > 0 && performance.now() - queueStart >= (this.game.preview ? Math.min(3, budget) : budget)) break;
+      if (n > 0 && performance.now() - queueStart >= budget) break;
       const t1 = performance.now();
       if (q.kind === 'g') {
-        const cv = this.renderGroundChunk(q.lvl, q.ci, q.cj);
+        // 地面块按条带分帧绘制（groundChunkGen），同一时间只进行一块
+        if (this.groundJob && this.groundJob.key !== q.key) continue;
+        if (!this.groundJob) this.groundJob = { key: q.key, ver: gver, gen: this.groundChunkGen(q.lvl, q.ci, q.cj) };
+        const deadline = performance.now() + Math.max(0.25, budget - (performance.now() - queueStart));
+        let cv = null;
+        do { const step = this.groundJob.gen.next(); if (step.done) { cv = step.value; break; } this.groundJob.cv = step.value; } while (performance.now() < deadline);
+        if (!cv) { n++; break; }
+        this.groundJob = null;
         const old = this.ground.get(q.key); if (old) this.cachePx -= old.px;
         this.ground.set(q.key, { cv: cv, lvl: q.lvl, key: q.key, used: this.frame, px: cv.width * cv.height, stale: false });
         this.cachePx += cv.width * cv.height;
@@ -1923,12 +2742,12 @@
       } else {
         if (this.isoJob && this.isoJob.key !== q.key) continue;
         if (!this.isoJob) this.isoJob = { key: q.key, version: g.city.version, gen: this.isoChunkGen(q.lvl, q.ci, q.cj, q.C), cv: null };
-        const deadline = performance.now() + Math.max(0.25, Math.min(2, budget - (performance.now() - queueStart)));
+        const deadline = performance.now() + Math.max(0.25, budget - (performance.now() - queueStart));
         do {
           const step = this.isoJob.gen.next();
           if (step.done) {
             const r = step.value, old = this.iso.get(q.key); if (old) this.cachePx -= old.px;
-            r.used = this.frame; r.born = old ? this.time - 1 : this.time; r.stale = false;
+            r.used = this.frame; r.born = old || warming || q.d >= 100 ? this.time - 1 : this.time; r.stale = false;
             this.iso.set(q.key, r); this.cachePx += r.px; this.isoJob = null; break;
           }
           this.isoJob.cv = step.value.cv;
@@ -1938,6 +2757,7 @@
       if (performance.now() - t1 > budget) break;
     }
     this.stats.chunksDrawn = n;
+    this.lastQueueMs = performance.now() - queueStart;
     this.evict();
     this.lastRenderMs = performance.now() - frameStart;
   };
@@ -2058,7 +2878,7 @@
       if (bb[2] < v.x0 - 6 || bb[0] > v.x1 + 6 || bb[3] < v.y0 - 6 || bb[1] > v.y1 + 6) continue;
       const arr = this.segScreen(cs, under);
       this.segPx.set(s.id, arr);
-      const col = line.color;
+      const col = AX.line(line);
       let alpha = 1, width = lw;
       if (s.type === 'underground') { alpha = U.lerp(0.92, 1, under); width = lw * U.lerp(0.95, 1.05, under); }
       else if (under > 0) alpha = U.lerp(1, 0.35, under);
@@ -2104,9 +2924,10 @@
       for (const l of xLinks) { const A = C.stations[l[0]], B = C.stations[l[1]], pa = this.P(A.x, A.y, stH(A)), pb = this.P(B.x, B.y, stH(B)); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); }
       ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
     }
+    this.drawWalkTransferHints(ctx, C, ui, xLinks);
     // 车站
     this.stPx = [];
-    const R0 = U.clamp(this.z * 0.11, 3.2, 9);
+    const R0 = U.clamp(this.z * 0.11, 3.2, 9), portalA = (1 - under) * (1 - (this.layerFade || 0));
     const mult = { S: 0.8, M: 1, L: 1.3 };
     for (let i = 0; i < C.stations.length; i++) {
       const s = C.stations[i];
@@ -2122,6 +2943,9 @@
       if (hlLine && !lines.has(hlLine)) alpha = 0.35;
       alpha *= lyrDim;
       ctx.globalAlpha = alpha;
+      // Connected boundary stations use the portal arrow in the normal view.
+      const portalSym = s.portal && serviced && portalA > 0.5 && CM.Fac && CM.Fac.isPortalStation(s);
+      if (!portalSym) {
       if (s.type === 'underground' && under > 0.05) {
         const gp = this.P(s.x, s.y, 0);
         ctx.strokeStyle = 'rgba(90,100,120,0.6)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(gp.x, gp.y); ctx.lineTo(p.x, p.y); ctx.stroke();
@@ -2130,12 +2954,29 @@
         const gp = this.P(s.x, s.y, 0);
         ctx.strokeStyle = 'rgba(120,124,130,0.7)'; ctx.lineWidth = Math.max(2, r * 0.6); ctx.beginPath(); ctx.moveTo(gp.x, gp.y); ctx.lineTo(p.x, p.y); ctx.stroke();
       }
+      // 天地换乘：其他站台层画在各自高度，用竖向通道（深色实线、白色内芯）与主站台相连，
+      // 站台圈描该层颜色（平面视图中与主站台重合，只看右上角的站台层标志）
+      const lvs = C.stLevels && C.stLevels[i];
+      if (lvs && this.tEase > 0.05) for (const t of lvs) {
+        if (t === s.type) continue;
+        let hh = CFG.metro.height[t]; if (hh < 0) hh = hh * under * UNDER_DEPTH;
+        const q = this.P(s.x, s.y, hh);
+        if (Math.hypot(q.x - p.x, q.y - p.y) < 1.5) continue;
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = TH.stInter; ctx.lineWidth = Math.max(3, r * 0.55);
+        ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = Math.max(1, r * 0.18);
+        ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
+        ctx.beginPath(); ctx.arc(q.x, q.y, r * 0.86, 0, Math.PI * 2); ctx.fillStyle = TH.stFill; ctx.fill();
+        ctx.strokeStyle = LEVEL_COL[t]; ctx.lineWidth = Math.max(2.4, r * 0.34); ctx.stroke();
+        ctx.strokeStyle = TH.stInter; ctx.lineWidth = Math.max(1, r * 0.1); ctx.beginPath(); ctx.arc(q.x, q.y, r * 0.86 + Math.max(1.2, r * 0.17), 0, Math.PI * 2); ctx.stroke();
+      }
       ctx.beginPath();
       ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
       ctx.fillStyle = TH.stFill; ctx.fill();
       if (!serviced) { ctx.setLineDash([3, 2]); ctx.strokeStyle = '#8a8f98'; }
       else if (inter) ctx.strokeStyle = TH.stInter;
-      else { const lid = lines.values().next().value; ctx.strokeStyle = C.net.lines[lid] ? C.net.lines[lid].color : '#444'; }
+      else { const lid = lines.values().next().value; ctx.strokeStyle = C.net.lines[lid] ? AX.line(C.net.lines[lid]) : '#444'; }
       const ow = inter ? Math.max(2.2, r * 0.3) : Math.max(1.8, r * 0.36);
       ctx.lineWidth = ow;
       ctx.stroke(); ctx.setLineDash([]);
@@ -2148,11 +2989,13 @@
           for (let k = 0; k < n; k++) {
             const L = C.net.lines[ls[k]]; if (!L) continue;
             const a0 = -Math.PI / 2 + k * Math.PI * 2 / n + gap / 2, a1 = -Math.PI / 2 + (k + 1) * Math.PI * 2 / n - gap / 2;
-            ctx.strokeStyle = L.color; ctx.beginPath(); ctx.arc(p.x, p.y, rr, a0, a1); ctx.stroke();
+            ctx.strokeStyle = AX.line(L); ctx.beginPath(); ctx.arc(p.x, p.y, rr, a0, a1); ctx.stroke();
           }
           ctx.lineCap = 'round';
         }
         if (r >= 6.5) xferGlyph(ctx, p.x, p.y, r * 0.36, TH.stInter);
+      }
+      if (lvs && lvs.length > 1 && serviced) levelBadge(ctx, p.x + r * 0.85, p.y - r * 0.85, Math.max(12, r * 1.4), lvs, TH.stInter);
       }
       if (draft && !g.net.stations[s.id]) {
         ctx.strokeStyle = 'rgba(30,136,229,0.9)'; ctx.lineWidth = 1.5; ctx.setLineDash([3, 3]); ctx.lineDashOffset = -this.time * 10;
@@ -2231,6 +3074,33 @@
     const n = arr.length / 2, a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
     return Math.atan2(arr[b * 2 + 1] - arr[a * 2 + 1], arr[b * 2] - arr[a * 2]);
   }
+  Renderer.prototype.drawWalkTransferHints = function (ctx,C,ui,existing) {
+    this.walkTransferHints=[];const g=this.game,T=CM.tools,model=g.model;
+    if(this.cam.under>.5||g.preview||g.pending||g.jumping||!model||!model.walkTransferPreview||!T||T.tool!=='line'||(ui&&ui.blocking()))return;
+    const walk=g.city.walk,rules=CFG.walk.transferMaxM+':'+CFG.metro.minSpacingM;
+    let cache=this._walkHintCache;
+    if(!cache||cache.C!==C||cache.walk!==walk||cache.rules!==rules||cache.chain!==T.chain){cache=this._walkHintCache={C,walk,rules,chain:T.chain,links:[]};
+      const seen=new Set((existing||[]).map(p=>[C.stations[p[0]].id,C.stations[p[1]].id].sort().join('|')));
+      if(g.draft)for(let i=0;i<C.stations.length;i++){
+        const s=C.stations[i],old=g.net.stations[s.id];
+        if(old&&U.dist(old.x,old.y,s.x,s.y)<1e-7&&g.compiled.serviced[g.compiled.sIndex.get(s.id)])continue;
+        const lines=C.stationLines[i];if(!C.serviced[i]&&T.chain!==s.id)continue;
+        const targets=C.stations.filter((b,k)=>b.id!==s.id&&C.serviced[k]&&!Array.from(lines).some(l=>C.stationLines[k].has(l))&&U.dist(s.x,s.y,b.x,b.y)*CFG.CELL_M+1e-6>=CFG.metro.minSpacingM);
+        for(const link of model.walkTransferPreview(s,targets)){const key=[s.id,link.station].sort().join('|');if(seen.has(key))continue;seen.add(key);cache.links.push({from:s.id,to:link.station,metres:link.metres,path:link.path});}
+      }
+    }
+    const hints=cache.links.slice(),cursor=T.snapPt||T.cursor;
+    if(cursor&&Number.isFinite(cursor.x+cursor.y)&&T.hover?.kind!=='station'){
+      const key=[cursor.x,cursor.y,T.lineChoice,T.buildType,T.chain].join(':');
+      if(cache.hoverKey!==key){cache.hoverKey=key;cache.hover=[];
+        const valid=CM.Metro.checkSite(g.city,cursor.x,cursor.y,T.buildType).ok&&!C.stations.some(s=>U.dist(s.x,s.y,cursor.x,cursor.y)*CFG.CELL_M+1e-6<CFG.metro.minSpacingM);
+        if(valid){const targets=C.stations.filter((s,i)=>C.serviced[i]&&!C.stationLines[i].has(T.lineChoice));for(const link of model.walkTransferPreview(cursor,targets))cache.hover.push({from:'@cursor',to:link.station,metres:link.metres,path:link.path,hover:true});}
+      }hints.push(...cache.hover);
+    }
+    this.walkTransferHints=hints;if(!hints.length)return;
+    ctx.save();ctx.strokeStyle=TH.stInter;ctx.globalAlpha=.3;ctx.lineWidth=1.4;ctx.setLineDash([3,5]);ctx.lineCap='round';ctx.beginPath();
+    for(const h of hints){for(let i=0;i<h.path.length;i++){const p=this.P(h.path[i][0],h.path[i][1],0);if(i)ctx.lineTo(p.x,p.y);else ctx.moveTo(p.x,p.y);}}ctx.stroke();ctx.restore();
+  };
   // batched：隧道外廓与越江隧道已在 drawMetro 中合并描边
   Renderer.prototype.drawTrack = function (ctx, cs, arr, col, alpha, width, under, t, batched) {
     const s = cs.seg, z = this.z;
@@ -2345,6 +3215,17 @@
     }
   };
   // 换乘箭头（⇄）：上箭头向右、下箭头向左
+  const LEVEL_ROWS = ['elevated', 'surface', 'underground'], LEVEL_COL = { elevated: '#f59f45', surface: '#4fbf7f', underground: '#6f9bff' };
+  CM.LEVEL_COL = LEVEL_COL;
+  function levelBadge(ctx, x, y, hh, types, ink) {
+    const w = hh * 0.9, bw = w * 0.62, bh = hh * 0.17, gap = (hh - 3 * bh) / 4;
+    ctx.beginPath(); ctx.roundRect(x - w / 2, y - hh / 2, w, hh, hh * 0.24);
+    ctx.fillStyle = ink; ctx.fill(); ctx.strokeStyle = '#ffffff'; ctx.lineWidth = Math.max(1.2, hh * 0.1); ctx.stroke();
+    for (let k = 0; k < 3; k++) {
+      ctx.beginPath(); ctx.roundRect(x - bw / 2, y - hh / 2 + gap + k * (bh + gap), bw, bh, bh / 2);
+      ctx.fillStyle = types.indexOf(LEVEL_ROWS[k]) >= 0 ? LEVEL_COL[LEVEL_ROWS[k]] : 'rgba(255,255,255,0.18)'; ctx.fill();
+    }
+  }
   function xferGlyph(ctx, x, y, s, col) {
     const a = s * 0.42, hd = s * 0.5;
     ctx.strokeStyle = col; ctx.lineWidth = Math.max(1.2, s * 0.3); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
@@ -2365,7 +3246,7 @@
   // 0 畅通 · 1 缓行 · 2 拥堵 · 3 严重拥堵；按饱和度（小时流量 ÷ 通行能力）分档。已建成的主要道路全部着色（车少时为绿色）
   // 性能：各档连续段在时刻档（5 分钟）变化时才重建为世界坐标的 Path2D（只保留原折线顶点与分档断点），每帧按地图变换整体描边
   const CONG_COLS = ['#33a660', '#f2bf3a', '#f27a24', '#d3203a'];
-  const CONG_CUT = [0.3, 0.55, 0.8];
+  const CONG_CUT = [1.15, 1.35, 1.60];
   Renderer.CONG_COLS = CONG_COLS;
   Renderer.prototype.congIndex = function () {
     const city = this.game.city, car = city.car;
@@ -2400,12 +3281,17 @@
   // 按当前时刻（5 分钟一档）把各条道路分成不同拥堵档的连续段，并生成各档、各等级的 Path2D
   Renderer.prototype.congRuns = function () {
     const g = this.game, model = g.model, city = g.city, idx = this.congIndex();
-    const key = model.version + ':' + Math.floor(g.clock.minute / 5) + ':' + city.roadVersion;
+    const am = this.layerOpt.cong === 'am';
+    const key = model.version + ':' + (am ? 'wd-am' : model.dayType + ':' + Math.floor(g.clock.minute / 5)) + ':' + city.roadVersion;
     if (this._cgRuns && this._cgRunsKey === key) return this._cgRuns;
     const W = model.weights(g.clock.minute), sat = new Map();
     const satOf = function (id) {
       let v = sat.get(id);
-      if (v === undefined) { v = Math.max(model.arcVolAt(2 * id, W), model.arcVolAt(2 * id + 1, W)) / model.cap(2 * id); sat.set(id, v); }
+      if (v === undefined) {
+        const P = model.resultsFor('wd').per[0];
+        v = am ? Math.max(P.arcTime[2 * id] / model.road.arcT0[2 * id], P.arcTime[2 * id + 1] / model.road.arcT0[2 * id + 1]) : Math.max(model.arcRatioAt(2 * id, W), model.arcRatioAt(2 * id + 1, W));
+        sat.set(id, v);
+      }
       return v;
     };
     const lvl = function (x) { let k = 0; while (k < 3 && x >= CONG_CUT[k]) k++; return k; };
@@ -2443,9 +3329,11 @@
     ctx.strokeStyle = TH.halo;
     for (const cls of [3, 4]) { ctx.lineWidth = lw * widthOf[cls] * 1.15 + halo; ctx.stroke(cr.halo[cls]); }
     for (let k = 0; k < 4; k++) {
-      ctx.strokeStyle = CONG_COLS[k];
+      ctx.strokeStyle = AX.enabled() ? AX.statuses()[k] : CONG_COLS[k];
+      ctx.setLineDash(AX.dash(k).split(' ').filter(Boolean).map(function (n) { return +n / z; }));
       for (const cls of [3, 4]) { ctx.lineWidth = lw * widthOf[cls] * (k >= 2 ? 1.15 : 1); ctx.stroke(cr.paths[k][cls]); }
     }
+    ctx.setLineDash([]);
   }
   // 性能：大城市的主要道路很多，逐帧描边的栅格化开销会让帧率掉到 30 帧。改为把描边画进一张与世界坐标对齐的位图
   // （当前视野四周各留三成余量，像素数有上限），每帧按地图变换贴图。视野移出位图范围时立即重画；
@@ -2733,7 +3621,7 @@
       for (let k = 0; k < rt.segRefs.length; k++) {
         let d = 0, lf = 0;
         for (const x of dts) for (let p = 0; p < 4; p++) {
-          const P = model.ctxs[x[0]].per[p];
+          const P = model.resultsFor(x[0]).per[p];
           if (!P.load || P.load.length !== net.nE) continue;
           d += ((P.load[re[2 * k]] || 0) + (P.load[re[2 * k + 1]] || 0)) * model.pHours[p] * (p === 3 ? 0.9 : 1) * x[1];
           const capH = Math.max(1, (P.freq[r] || 0) * rt.cap);
@@ -2748,6 +3636,7 @@
     return this._sf;
   };
   Renderer.prototype.drawStationFlows = function (ctx) {
+    this._layerRects = []; this._layerRectsFor = 'station'; this._layerNamed = new Set();
     const g = this.game, model = g.model, net = model.net;
     if (!net || !this.stPx || !this.drawnC) return;
     const sf = this.stationFlowData(); if (!sf) return;
@@ -2760,8 +3649,8 @@
       const cs = C.segs.get(id), L = cs && C.net.lines[cs.seg.line]; if (!L) return;
       if (loadView) {
         const lf = sf.segLF.get(id) || 0, col = lf > 1 ? [217, 58, 58] : (lf > 0.6 ? [232, 163, 58] : [47, 163, 107]);
-        ctx.strokeStyle = U.rgb(col, 0.55); ctx.lineWidth = this.lineWidthPx() + (4 + 10 * Math.min(1.5, lf)) * zk;
-      } else { ctx.strokeStyle = U.rgb(U.hex2rgb(L.color), 0.32); ctx.lineWidth = this.lineWidthPx() + (3 + 22 * Math.sqrt(v / sf.smax)) * zk; }
+        ctx.strokeStyle = U.rgb(AX.rgb(col), 0.55); ctx.lineWidth = this.lineWidthPx() + (4 + 10 * Math.min(1.5, lf)) * zk;
+      } else { ctx.strokeStyle = U.rgb(U.hex2rgb(AX.line(L)), 0.32); ctx.lineWidth = this.lineWidthPx() + (3 + 22 * Math.sqrt(v / sf.smax)) * zk; }
       this.strokeArr(ctx, arr);
     });
     // 车站：按客流从小到大画，大站在上
@@ -2774,21 +3663,22 @@
     list.sort(function (a, b) { return a.v - b.v; });
     for (const it of list) {
       const rt = sf.ratio[it.i], col = rt > 1 ? [217, 58, 58] : (rt > 0.6 ? [240, 160, 32] : [31, 143, 191]);
-      ctx.fillStyle = U.rgb(col, 0.78); ctx.strokeStyle = TH.halo; ctx.lineWidth = 2;
+      ctx.fillStyle = U.rgb(AX.rgb(col), 0.78); ctx.strokeStyle = TH.halo; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(it.sp.x, it.sp.y, it.r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
     }
     // 标注：站名 + 日客流，放在圆的下方；大站优先，互不重叠（本图层不显示普通站名）
     const placed = list.map(function (it) { return [it.sp.x - it.r * 0.7, it.sp.y - it.r * 0.7, it.sp.x + it.r * 0.7, it.sp.y + it.r * 0.7]; });
+    this._layerRects = placed;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     let shown = 0;
     for (let q = list.length - 1; q >= 0 && shown < 30; q--) {
-      const it = list[q], name = C.stations[it.i].name, val = loadView ? '高峰负荷 ' + U.fmtPct(sf.ratio[it.i], 0) : U.fmtPeople(it.v) + ' 人次';
+      const it = list[q], name = C.stations[it.i].name, val = loadView ? '高峰负荷 ' + U.fmtPct(sf.ratio[it.i], 0) : U.fmtPeople(it.v) + ' 人次' + (AX.enabled() ? ' · 负荷 ' + U.fmtPct(sf.ratio[it.i], 0) : '');
       ctx.font = '600 12px ' + FONT; const w1 = ctx.measureText(name).width;
       ctx.font = '11px ' + FONT; const w2 = ctx.measureText(val).width;
       const w = Math.max(w1, w2) + 6, x = it.sp.x, y = it.sp.y + it.r + 4;
       const b = [x - w / 2, y, x + w / 2, y + 28];
       if (placed.some(function (o, k) { return k !== q && b[0] < o[2] && b[2] > o[0] && b[1] < o[3] && b[3] > o[1]; })) continue;
-      placed.push(b); shown++;
+      placed.push(b); shown++; this._layerNamed.add(C.stations[it.i].id);
       ctx.lineJoin = 'round'; ctx.lineWidth = 3.2; ctx.strokeStyle = TH.halo;
       ctx.font = '600 12px ' + FONT; ctx.strokeText(name, x, y + 7); ctx.fillStyle = TH.ink; ctx.fillText(name, x, y + 7);
       ctx.font = '11px ' + FONT; ctx.strokeText(val, x, y + 21); ctx.fillStyle = TH.roadInk; ctx.fillText(val, x, y + 21);
@@ -2812,45 +3702,442 @@
       out.push({ f: f, k: k, v: v, share: v > 0 ? m / Math.max(v, 1) : 0, cov: cov });
       if (v > vmax) vmax = v;
     }, this);
-    return { list: out, vmax: vmax };
+    return { list: out, vmax: vmax, key: dt + ':' + (this.layer === 'fac' ? facP : '') };
+  };
+  // 显示用的平滑值（v2.1）：模拟每天重算一次设施客流，数值会跳；圆点大小逐帧缓动到最新结果，
+  // 设施表更新、新结果暂缺时沿用上一份（不再整体消失再出现）；出现 / 消失的设施淡入淡出
+  Renderer.prototype.facSmooth = function () {
+    const raw = this.facMarkers(), S = this._facS || (this._facS = { m: new Map(), vmax: 0, key: null, list: [] });
+    const dt = this.layer === 'gap' ? (this.layerOpt.gapDt === 'we' ? 'we' : 'wd') : (this.layerOpt.facDt === 'we' ? 'we' : 'wd');
+    const skey = this.layer + ':' + (raw ? raw.key : dt + ':' + (this.layer === 'fac' ? this.layerOpt.facP : ''));
+    const snap = S.key !== skey && raw;   // 切换图层 / 日类型 / 出行目的：直接取新值，不做缓动
+    // 新口径暂未算好时不能把旧口径当新结果；相同口径等待计算时则保留上一份。
+    if (S.key !== skey) { S.m.clear(); S.vmax = S.tvmax = raw ? raw.vmax : 1; S.key = skey; }
+    const a = snap ? 1 : 1 - Math.exp(-(this.dt || 0.016) / 0.35);
+    if (raw) {
+      const live = new Set();
+      for (const it of raw.list) {
+        live.add(it.f.id);
+        let o = S.m.get(it.f.id);
+        if (!o) { o = { f: it.f, v: snap ? it.v : 0, share: it.share, alpha: snap ? 1 : 0, lab: false, la: 0 }; S.m.set(it.f.id, o); }
+        o.f = it.f; o.k = it.k; o.tv = it.v; o.tshare = it.share; o.cov = it.cov; o.on = true;
+      }
+      S.m.forEach(function (o, id) { if (!live.has(id)) { o.on = false; o.tv = o.v; } });
+      S.tvmax = raw.vmax;
+    }
+    if (!S.m.size) return null;
+    S.vmax += ((S.tvmax || S.vmax || 1) - S.vmax) * a;
+    const list = [];
+    S.m.forEach(function (o, id) {
+      o.v += (o.tv - o.v) * a; o.share += (o.tshare - o.share) * a;
+      o.alpha = U.clamp(o.alpha + (o.on ? 1 : -1) * (this.dt || 0.016) / 0.3, 0, 1);
+      if (!o.on && o.alpha <= 0) { S.m.delete(id); return; }
+      list.push(o);
+    }, this);
+    return { list: list, vmax: Math.max(1, S.vmax) };
   };
   Renderer.prototype.drawFacilities = function (ctx) {
-    this._facPx = [];
-    const fm = this.facMarkers(); if (!fm) return;
+    this._facPx = []; this._layerRects = []; this._layerRectsFor = this.layer;
+    const fm = this.facSmooth(); if (!fm) return;
     const gap = this.layer === 'gap', zk = U.clamp(this.z / 26, 0.5, 1.15), tmp = {};
-    const list = fm.list.slice().sort(function (a, b) { return a.v - b.v; });
+    // 服务缺口图层的显示门槛带回差：已显示的设施要明显越过门槛才隐藏，避免在门槛附近反复闪现
+    for (const it of fm.list) { const show = it.gapOn ? (it.cov < 0.36 && it.tv >= 1300) : (it.cov < 0.3 && it.tv >= 1500); it.gapOn = show; it.hide = gap && !show; }
+    const list = fm.list.slice().sort(function (a, b) { return (a.f.ext ? 1 : 0) - (b.f.ext ? 1 : 0) || a.v - b.v; });
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     for (const it of list) {
-      if (gap && (it.cov >= 0.3 || it.v < 1500)) continue;
+      if (it.hide) continue;
       const p = this.P(it.f.x, it.f.y, 0, tmp);
       if (p.x < -40 || p.y < -40 || p.x > this.w + 40 || p.y > this.h + 40) continue;
       const r = (4 + 16 * Math.sqrt(it.v / fm.vmax)) * zk;
-      const ring = gap ? [122, 31, 31] : U.ramp([[0, [214, 52, 52]], [0.25, [236, 160, 50]], [0.6, [40, 160, 90]]], U.clamp(it.share, 0, 0.6) / 0.6);
-      ctx.fillStyle = gap ? 'rgba(122,31,31,0.18)' : U.rgb(U.hex2rgb(CFG.trips.color[Object.keys(it.f.p)[0]] || '#888888'), 0.55);
+      ctx.globalAlpha = it.alpha;
+      const ring = gap ? [122, 31, 31] : AX.ramp([[0, [214, 52, 52]], [0.25, [236, 160, 50]], [0.6, [40, 160, 90]]], U.clamp(it.share, 0, 0.6) / 0.6);
+      const fill = gap ? AX.color('rgba(122,31,31,0.18)') : U.rgb(U.hex2rgb(AX.category(CFG.trips.keys.indexOf(Object.keys(it.f.p)[0]), CFG.trips.color[Object.keys(it.f.p)[0]] || '#888888')), 0.55);
+      if (it.f.ext) { it.ring = U.rgb(AX.rgb(ring), 0.95); it.gate = this.drawExtFacility(ctx, it.f, p, r, fill, it.ring); this._facPx.push({ id: it.f.id, x: it.gate.x, y: it.gate.y, r: Math.max(12, it.gate.r + 4) }); continue; }
+      ctx.fillStyle = fill;
       ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
-      ctx.lineWidth = 3; ctx.strokeStyle = U.rgb(ring, 0.95); ctx.stroke();
+      ctx.lineWidth = 3; ctx.strokeStyle = U.rgb(AX.rgb(ring), 0.95); ctx.stroke();
       ctx.lineWidth = 1.2; ctx.strokeStyle = TH.halo; ctx.beginPath(); ctx.arc(p.x, p.y, r + 2, 0, Math.PI * 2); ctx.stroke();
       this._facPx.push({ id: it.f.id, x: p.x, y: p.y, r: Math.max(8, r + 2) });
+      this._layerRects.push([p.x - r, p.y - r, p.x + r, p.y + r]);
     }
-    // 标注：到访量较大的设施（不互相重叠）
+    ctx.globalAlpha = 1;
+    // 标注：文字用最新结果（只在每天重算后变一次，不随缓动滚动）；上一帧已标注的设施优先保留位置（回差），
+    // 新出现的标注淡入，不在相近的设施之间来回跳
     const placed = [];
     let shown = 0;
-    for (let q = list.length - 1; q >= 0 && shown < 24; q--) {
-      const it = list[q];
-      if (gap && (it.cov >= 0.3 || it.v < 1500)) continue;
-      const p = this.P(it.f.x, it.f.y, 0, tmp), r = (4 + 16 * Math.sqrt(it.v / fm.vmax)) * zk;
-      const name = it.f.name.replace(/（.*）/, ''), val = gap ? '无地铁接驳 · ' + U.fmtPeople(it.v) + ' 人次' : U.fmtPeople(it.v) + ' 人次 · 地铁 ' + U.fmtPct(it.share, 0);
+    const valText = function (it) { return gap ? '无地铁接驳 · ' + U.fmtPeople(it.tv) + ' 人次' : U.fmtPeople(it.tv) + ' 人次 · 地铁 ' + U.fmtPct(it.tshare, 0); };
+    // 地图外设施：名称牌接在客流圆点外侧（同在地图边缘外）；其余设施按到访量从大到小标注
+    for (const it of list) {
+      if (!it.f.ext || !it.gate || it.hide) continue;
+      ctx.globalAlpha = it.alpha;
+      this.extFacLabel(ctx, it.f, it.gate, CM.Fac.shortName(it.f) + (CM.Fac.extLink(it.f, this.game) ? ' · 已接通' : ' · 地图外 ' + it.f.ext.km + ' km'), (gap ? '无地铁接驳 · ' : '') + U.fmtPeople(it.tv) + ' 人次 · 地铁 ' + U.fmtPct(it.tshare, 0), it.ring);
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const order = list.filter(function (it) { return !it.f.ext && !it.hide; }).sort(function (a, b) { return b.v * (b.lab ? 1.6 : 1) - a.v * (a.lab ? 1.6 : 1); });
+    const step = (this.dt || 0.016) / 0.25;
+    for (const it of order) {
+      const was = it.lab; it.lab = false;
+      if (shown >= 24) { it.la = 0; continue; }
+      const p = this.P(it.f.x, it.f.y, 0, tmp);
+      const r = (4 + 16 * Math.sqrt(it.v / fm.vmax)) * zk;
+      const name = it.f.name.replace(/（.*）/, ''), val = valText(it);
       ctx.font = '600 12px ' + FONT; const w = Math.max(ctx.measureText(name).width, ctx.measureText(val).width * 0.92) + 8;
-      const b = [p.x - w / 2, p.y + r + 2, p.x + w / 2, p.y + r + 30];
-      if (b[2] < 0 || b[0] > this.w || b[3] < 0 || b[1] > this.h) continue;
-      if (placed.some(function (o) { return b[0] < o[2] && b[2] > o[0] && b[1] < o[3] && b[3] > o[1]; })) continue;
-      placed.push(b); shown++;
+      const y0 = p.y + r + 2;
+      const b = [p.x - w / 2, y0, p.x + w / 2, y0 + 28];
+      if (b[2] < 0 || b[0] > this.w || b[3] < 0 || b[1] > this.h) { it.la = 0; continue; }
+      if (placed.some(function (o) { return b[0] < o[2] && b[2] > o[0] && b[1] < o[3] && b[3] > o[1]; })) { it.la = 0; continue; }
+      placed.push(b); shown++; it.lab = true;
+      it.la = was ? Math.min(1, it.la + step) : step;
+      ctx.globalAlpha = Math.min(it.la, it.alpha);
       ctx.lineJoin = 'round'; ctx.lineWidth = 3.2; ctx.strokeStyle = TH.halo;
-      ctx.strokeText(name, p.x, p.y + r + 9); ctx.fillStyle = TH.ink; ctx.fillText(name, p.x, p.y + r + 9);
-      ctx.font = '11px ' + FONT; ctx.strokeText(val, p.x, p.y + r + 23); ctx.fillStyle = TH.roadInk; ctx.fillText(val, p.x, p.y + r + 23);
+      ctx.strokeText(name, p.x, y0 + 7); ctx.fillStyle = TH.ink; ctx.fillText(name, p.x, y0 + 7);
+      ctx.font = '11px ' + FONT; ctx.strokeText(val, p.x, y0 + 21); ctx.fillStyle = TH.roadInk; ctx.fillText(val, p.x, y0 + 21);
+    }
+    ctx.globalAlpha = 1;
+    for (const b of placed) this._layerRects.push(b);
+  };
+  // ---------------- 地图外设施的接驳口（v2.1） ----------------
+  // 机场等设施在地图外：提示卡（飞机徽标指向设施方向 + 名称、距离）整块画在地图边缘外侧，不压在地图上；
+  // 地图边缘线上是「接驳口」：尚未接通时为虚线圆（建站 / 绘线工具下呼吸闪烁），把线路修到边缘线附近、或点提示卡，都会自动吸附到接驳口建站；
+  // 接通后接驳口换成横跨边缘线的线路颜色双向箭头，提示卡徽标也换成线路颜色。设施图层中，该设施的客流圆点同样画在边缘外侧
+  const PLANE = typeof Path2D !== 'undefined' ? new Path2D('M10.5 21l1.5-1.2 1.5 1.2v-2l-1-1V13l7 2v-2l-7-4V4.5a1 1 0 0 0-2 0V9l-7 4v2l7-2v4.9l-1 1z') : null;
+  // 双向箭头（屏幕坐标，沿单位方向 dx,dy，中心 x,y，半长 k）：表示与地图外双向接通
+  function biArrow(ctx, x, y, dx, dy, k, color, halo) {
+    const nx = -dy, ny = dx, hw = k * 0.55, hl = k * 0.6, sw = Math.max(1.6, k * 0.22);
+    const head = function (sx) {
+      const tx = x + dx * k * sx, ty = y + dy * k * sx, bx = tx - dx * hl * sx, by = ty - dy * hl * sx;
+      ctx.moveTo(tx, ty); ctx.lineTo(bx + nx * hw, by + ny * hw); ctx.lineTo(bx - nx * hw, by - ny * hw); ctx.closePath();
+    };
+    ctx.beginPath(); ctx.moveTo(x - dx * (k - hl), y - dy * (k - hl)); ctx.lineTo(x + dx * (k - hl), y + dy * (k - hl));
+    ctx.lineCap = 'round'; ctx.lineWidth = sw + 3.5; ctx.strokeStyle = halo; ctx.stroke();
+    ctx.beginPath(); head(1); head(-1); ctx.lineJoin = 'round'; ctx.lineWidth = 3.5; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x - dx * (k - hl), y - dy * (k - hl)); ctx.lineTo(x + dx * (k - hl), y + dy * (k - hl));
+    ctx.lineWidth = sw; ctx.strokeStyle = color; ctx.stroke();
+    ctx.beginPath(); head(1); head(-1); ctx.fillStyle = color; ctx.fill();
+  }
+  function planeIcon(ctx, x, y, dx, dy, size, color) {
+    if (!PLANE) return;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(Math.atan2(dy, dx) + Math.PI / 2); ctx.scale(size / 24, size / 24); ctx.translate(-12, -12.6);
+    ctx.fillStyle = color; ctx.fill(PLANE); ctx.restore();
+  }
+  function roundRect(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+  // 接驳口的屏幕几何：边缘点 e（接驳口所在）、该处地图边界的外法向 n、指向设施的方向 (dx, dy)
+  Renderer.prototype.gateGeom = function (f) {
+    const P0 = CM.Fac.portal(f), v = f.ext.v;
+    const e = this.P(P0.ex, P0.ey, 0, {}), q = this.P(P0.ex + v[0], P0.ey + v[1], 0, {});
+    let dx = q.x - e.x, dy = q.y - e.y, L = Math.hypot(dx, dy) || 1; dx /= L; dy /= L;
+    const wn = P0.ex <= 1e-6 ? [-1, 0] : P0.ex >= CFG.W - 1e-6 ? [1, 0] : P0.ey <= 1e-6 ? [0, -1] : [0, 1];
+    const m = this.P(P0.ex + wn[0], P0.ey + wn[1], 0, {}), t = this.P(P0.ex + wn[1], P0.ey + wn[0], 0, {});
+    let nx = m.x - e.x, ny = m.y - e.y; L = Math.hypot(nx, ny) || 1; nx /= L; ny /= L;
+    // o：画面上垂直于边缘线、指向地图外的方向（立体视图中与 n 不同），用来保证提示整块落在边缘线外
+    let ox = -(t.y - e.y), oy = t.x - e.x; L = Math.hypot(ox, oy) || 1; ox /= L; oy /= L;
+    if (ox * nx + oy * ny < 0) { ox = -ox; oy = -oy; }
+    return { e: e, dx: dx, dy: dy, n: { x: nx, y: ny }, o: { x: ox, y: oy } };
+  };
+  // 把以 (x, y, w, h) 为外框的提示推到边缘线外至少 gap px，返回需要平移的量
+  function gatePush(G, x, y, w, h, gap) {
+    let dm = Infinity;
+    for (const cx of [x, x + w]) for (const cy of [y, y + h]) dm = Math.min(dm, (cx - G.e.x) * G.o.x + (cy - G.e.y) * G.o.y);
+    const s = dm < gap ? gap - dm : 0;
+    return { x: G.o.x * s, y: G.o.y * s };
+  }
+  // 提示卡布局：胶囊形卡片整块放在边缘外侧，徽标一端靠近接驳口；只沿边缘方向贴回画面（不往地图里挪）
+  Renderer.prototype.gateCard = function (ctx, G, gr, title, sub) {
+    ctx.font = '700 12.5px ' + FONT; const w1 = title ? this.textWidth(ctx, title) : 0;
+    ctx.font = '11px ' + FONT; const w2 = sub ? this.textWidth(ctx, sub) : 0;
+    const tw = Math.max(w1, w2), pad = 5, h = Math.max(gr * 2 + pad * 2, sub ? 42 : 28), w = gr * 2 + pad * 2 + (tw ? tw + 18 : 0);
+    const n = G.n, side = Math.abs(n.x) > Math.abs(n.y), flip = side && n.x < 0;   // 东西两侧：卡片沿法向展开；西侧徽标在右端
+    const off = 22 + (side ? pad + gr : h / 2);   // 让出边缘线上接驳口（双向箭头）的位置
+    let bx = G.e.x + n.x * off, by = G.e.y + n.y * off;
+    let x = flip ? bx + gr + pad - w : bx - gr - pad, y = by - h / 2;
+    if (side) { const y2 = U.clamp(y, 8, Math.max(8, this.h - h - 8)); by += y2 - y; y = y2; }
+    else { const x2 = U.clamp(x, 8, Math.max(8, this.w - w - 8)); bx += x2 - x; x = x2; }
+    const d = gatePush(G, x, y, w, h, 12); x += d.x; y += d.y; bx += d.x; by += d.y;
+    return { x: x, y: y, w: w, h: h, bx: bx, by: by, gr: gr, tx: flip ? x + 14 : bx + gr + 10, title: title, sub: sub };
+  };
+  Renderer.prototype.drawGateCard = function (ctx, c, G, col, dim) {
+    ctx.save();
+    ctx.shadowColor = 'rgba(15,30,55,0.22)'; ctx.shadowBlur = 10; ctx.shadowOffsetY = 2;
+    roundRect(ctx, c.x, c.y, c.w, c.h, c.h / 2); ctx.fillStyle = TH.night ? 'rgba(24,34,50,0.94)' : 'rgba(255,255,255,0.96)'; ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.beginPath(); ctx.arc(c.bx, c.by, c.gr, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill();
+    if (dim) { ctx.fillStyle = TH.night ? 'rgba(24,34,50,0.35)' : 'rgba(255,255,255,0.35)'; ctx.fill(); }
+    planeIcon(ctx, c.bx, c.by, G.dx, G.dy, c.gr * 1.25, '#ffffff');
+    if (c.title) {
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.font = '700 12.5px ' + FONT; ctx.fillStyle = TH.ink; ctx.fillText(c.title, c.tx, c.sub ? c.by - 7.5 : c.by);
+      if (c.sub) { ctx.font = '11px ' + FONT; ctx.fillStyle = TH.roadInk; ctx.fillText(c.sub, c.tx, c.by + 8.5); }
+    }
+    ctx.restore();
+  };
+  // 接驳口到提示卡徽标的引线
+  function gateLeader(ctx, G, c, col, dashed, w) {
+    const vx = c.bx - G.e.x, vy = c.by - G.e.y, L = Math.hypot(vx, vy);
+    if (L <= c.gr + 4) return;
+    ctx.beginPath(); ctx.moveTo(G.e.x + vx / L * 4, G.e.y + vy / L * 4); ctx.lineTo(c.bx - vx / L * c.gr, c.by - vy / L * c.gr);
+    ctx.setLineDash(dashed ? [3, 4] : []); ctx.lineWidth = w; ctx.strokeStyle = col; ctx.stroke(); ctx.setLineDash([]);
+  }
+  // 普通视图中的接驳口（不进入地下视图、分析图层与开始界面）
+  Renderer.prototype.drawPortals = function (ctx, alpha) {
+    const g = this.game, Fac = CM.Fac;
+    this._portals = [];
+    if (!Fac || g.preview || !CM.DATA.facilities || alpha <= 0.02) return;
+    const yr = g.year ? g.year() : g.clock.y, z = this.z, lw = this.lineWidthPx(), net = g.net;
+    const T = CM.tools, building = T && (T.tool === 'station' || T.tool === 'line'), hov = T && T.portalHover;
+    const accent = TH.night ? '#6f9fe0' : '#3f6fb0', grey = TH.night ? '#5d6a7e' : '#9aa6b6';
+    const gr = U.clamp(z * 0.4, 11, 15), sel = CM.ui && CM.ui.selection;
+    for (const f of Fac.list()) {
+      if (!f.ext) continue;
+      const G = this.gateGeom(f), e = G.e, n = G.n;
+      if (e.x < -240 || e.x > this.w + 240 || e.y < -240 || e.y > this.h + 240) { this._portals.push({ f: f, sx: e.x, sy: e.y, card: null }); continue; }
+      const active = yr >= f.open && (f.close == null || yr < f.close);
+      const lk = active ? Fac.extLink(f, g) : null;
+      const L = lk ? net.lines[lk.lines[0]] : null, col = L ? AX.line(L) : (active ? accent : grey);
+      const km = f.ext.km + ' km', labels = z >= 6 && this.labelsOn;
+      const sub = !active ? (f.open > yr ? Math.floor(f.open) + ' 年启用 · 地图外 ' + km : '已停用') : lk ? '已接通 ⇄ ' + (lk.portal ? '接驳口' : '经「' + lk.st.name + '」') : '地图外 ' + km + ' · 线路修到边缘即接通';
+      const card = this.gateCard(ctx, G, gr, labels ? Fac.shortName(f) : '', labels ? sub : '');
+      this._portals.push({ f: f, sx: e.x, sy: e.y, card: card });
+      ctx.save();
+      ctx.globalAlpha = alpha * (active ? 1 : 0.75);
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      gateLeader(ctx, G, card, col, !lk, lk ? Math.max(2, lw * 0.5) : 1.6);
+      if (lk) {
+        // 接通：车站 → 接驳口的线路色连线（步行接通时为虚线），接驳口画成横跨边缘线的双向箭头
+        const a = this.P(lk.st.x, lk.st.y, 0, {});
+        if (Math.hypot(a.x - e.x, a.y - e.y) > 1) {
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(e.x, e.y);
+          ctx.lineWidth = lw + 3; ctx.strokeStyle = TH.lineCase; ctx.stroke();
+          ctx.lineWidth = lw; ctx.strokeStyle = col; if (!lk.portal) ctx.setLineDash([Math.max(6, lw * 2), Math.max(4, lw * 1.3)]); ctx.stroke(); ctx.setLineDash([]);
+        }
+        const k = U.clamp(lw * 2, 9, 14);
+        if (lk.portal && sel && sel.kind === 'station' && sel.id === lk.st.id) {
+          const pulse = 0.5 + 0.5 * Math.sin(this.time * 4);
+          ctx.strokeStyle = 'rgba(30,136,229,' + (0.5 + 0.4 * pulse) + ')'; ctx.lineWidth = 2.5;
+          ctx.beginPath(); ctx.arc(e.x, e.y, k + 5 + pulse * 2, 0, Math.PI * 2); ctx.stroke();
+        }
+        biArrow(ctx, e.x, e.y, n.x, n.y, k, col, TH.halo);
+      } else if (active) {
+        // 待接通：边缘线上的接驳口（建设工具下呼吸闪烁，鼠标靠近时变实线）
+        const pulse = building ? 0.5 + 0.5 * Math.sin(this.time * 4) : 0, hot = hov === f.id, rr = 7.5 + (hot ? 2.5 : 0);
+        if (building) { ctx.beginPath(); ctx.arc(e.x, e.y, rr + 3 + pulse * 6, 0, Math.PI * 2); ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.globalAlpha = alpha * (0.55 - pulse * 0.45); ctx.stroke(); ctx.globalAlpha = alpha; }
+        ctx.beginPath(); ctx.arc(e.x, e.y, rr, 0, Math.PI * 2);
+        ctx.fillStyle = hot ? col : (TH.night ? 'rgba(20,30,46,0.92)' : 'rgba(255,255,255,0.94)'); ctx.fill();
+        ctx.setLineDash(hot ? [] : [3, 2.5]); ctx.lineWidth = 2; ctx.strokeStyle = col; ctx.stroke(); ctx.setLineDash([]);
+        // 圆内的小双向箭头：示意「接通后双向连通」
+        const tx = -n.y, ty = n.x, s = rr * 0.5;
+        ctx.beginPath(); ctx.moveTo(e.x - n.x * s, e.y - n.y * s); ctx.lineTo(e.x + n.x * s, e.y + n.y * s);
+        for (const sg of [1, -1]) { const hx = e.x + n.x * s * sg, hy = e.y + n.y * s * sg; ctx.moveTo(hx - n.x * 3 * sg + tx * 2.6, hy - n.y * 3 * sg + ty * 2.6); ctx.lineTo(hx, hy); ctx.lineTo(hx - n.x * 3 * sg - tx * 2.6, hy - n.y * 3 * sg - ty * 2.6); }
+        ctx.lineWidth = 1.6; ctx.strokeStyle = hot ? '#ffffff' : col; ctx.stroke();
+      }
+      this.drawGateCard(ctx, card, G, col, !active);
+      ctx.restore();
     }
   };
+  // 设施图层中的地图外设施：客流圆点画在边缘外侧（大小 = 接驳客流，描边颜色 = 乘地铁比例），飞机图标指向设施方向；
+  // 场内接驳点 → 接驳口为虚线（接通后为实线并在边缘线上显示双向箭头）
+  Renderer.prototype.drawExtFacility = function (ctx, f, p, r, fill, ring) {
+    const lk = CM.Fac.extLink(f, this.game), G = this.gateGeom(f), e = G.e, n = G.n;
+    r = Math.max(r, 12 * U.clamp(this.z / 26, 0.6, 1.15));
+    const d = gatePush(G, e.x + n.x * (r + 16) - r, e.y + n.y * (r + 16) - r, r * 2, r * 2, 12), gx = e.x + n.x * (r + 16) + d.x, gy = e.y + n.y * (r + 16) + d.y;
+    ctx.save();
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(e.x, e.y); ctx.lineTo(gx - n.x * r, gy - n.y * r);
+    ctx.lineWidth = 4; ctx.strokeStyle = TH.halo; ctx.stroke();
+    ctx.setLineDash(lk ? [] : [5, 4]); ctx.lineWidth = 2; ctx.strokeStyle = ring; ctx.stroke(); ctx.setLineDash([]);
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fillStyle = ring; ctx.fill();
+    ctx.beginPath(); ctx.arc(gx, gy, r, 0, Math.PI * 2);
+    ctx.lineWidth = 6; ctx.strokeStyle = TH.halo; ctx.stroke();
+    ctx.fillStyle = fill; ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = ring; ctx.stroke();
+    planeIcon(ctx, gx, gy, G.dx, G.dy, Math.min(r * 1.25, 26), TH.night ? '#ffffff' : '#1d2b40');
+    if (lk) biArrow(ctx, e.x, e.y, n.x, n.y, 8, ring, TH.halo);
+    ctx.restore();
+    return { x: gx, y: gy, r: r };
+  };
+  // 设施图层中地图外设施的名称牌：接在客流圆点外侧（东西两侧边缘横向接出，南北两侧放在圆点旁），只沿边缘方向贴回画面
+  Renderer.prototype.extFacLabel = function (ctx, f, gate, title, sub, accent) {
+    const G = this.gateGeom(f), n = G.n;
+    ctx.font = '700 12.5px ' + FONT; const w1 = this.textWidth(ctx, title);
+    ctx.font = '11px ' + FONT; const w2 = this.textWidth(ctx, sub);
+    const w = Math.max(w1, w2) + 22, h = 38, side = Math.abs(n.x) > Math.abs(n.y);
+    let x, y;
+    if (side) { x = n.x > 0 ? gate.x + gate.r + 8 : gate.x - gate.r - 8 - w; y = U.clamp(gate.y - h / 2, 8, Math.max(8, this.h - h - 8)); }
+    else { x = U.clamp(gate.x + gate.r + 8, 8, Math.max(8, this.w - w - 8)); y = gate.y - h / 2; if (x < gate.x + gate.r && x + w > gate.x - gate.r) y = n.y < 0 ? gate.y - gate.r - 8 - h : gate.y + gate.r + 8; }
+    const d = gatePush(G, x, y, w, h, 10); x += d.x; y += d.y;
+    ctx.save();
+    ctx.shadowColor = 'rgba(15,30,55,0.22)'; ctx.shadowBlur = 10; ctx.shadowOffsetY = 2;
+    roundRect(ctx, x, y, w, h, 9); ctx.fillStyle = TH.night ? 'rgba(24,34,50,0.94)' : 'rgba(255,255,255,0.96)'; ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.fillStyle = accent; roundRect(ctx, x, y, 4, h, 2); ctx.fill();
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.font = '700 12.5px ' + FONT; ctx.fillStyle = TH.ink; ctx.fillText(title, x + 12, y + 13);
+    ctx.font = '11px ' + FONT; ctx.fillStyle = TH.roadInk; ctx.fillText(sub, x + 12, y + 27);
+    ctx.restore();
+  };
+  // ---------------- 风景区内的景区站可建范围（v2.1） ----------------
+  // 风景区一般不能设站；运营中的景点约 600 m 内可建地下景区站（metro.js M.scenicGate）。
+  // 建站 / 绘线工具下与「区域」图层中，用很淡的填充加一圈细边标出这片范围（只含风景区内、非水面的部分）
+  const SCENIC_RAD = 2.4, SCENIC_RES = 18;
+  Renderer.prototype.scenicZones = function () {
+    const g = this.game, city = g.city, Fac = CM.Fac;
+    if (!Fac || !city.regions.some(function (r) { return r.scenic; })) return null;
+    const yr = city.terrainYear || CFG.START.y;
+    const active = Fac.list().filter(function (f) { return !f.T.hub && Fac.active(f, yr, city); });
+    const key = [city.uid, city.terrainVer, city.regionOpen.join(','), city.landmarkOn.join(','), active.map(function (f) { return f.id; }).join(','), this.themeName].join(':');
+    if (this._scz && this._scz.key === key) return this._scz.list;
+    const list = [], night = TH.night;
+    const fillC = night ? [128, 214, 160] : [38, 132, 84];
+    for (const f of active) {
+      const c0 = city.cellAt(f.x, f.y);
+      if (c0 < 0 || !city.regions[city.region[c0]].scenic || !Fac.active(f, yr, city)) continue;
+      const n = Math.ceil(SCENIC_RAD * 2 * SCENIC_RES), x0 = f.x - SCENIC_RAD, y0 = f.y - SCENIC_RAD;
+      const inside = new Uint8Array(n * n);
+      for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+        const x = x0 + (i + 0.5) / SCENIC_RES, y = y0 + (j + 0.5) / SCENIC_RES;
+        if (U.dist(x, y, f.x, f.y) > SCENIC_RAD) continue;
+        const c = city.cellAt(x, y);
+        if (c < 0 || !city.regions[city.region[c]].scenic || !CM.Metro.checkSite(city, x, y, 'underground').ok) continue;
+        inside[j * n + i] = 1;
+      }
+      const cv = makeCanvas(n, n), x = cv.getContext('2d'), img = x.createImageData(n, n), d = img.data;
+      for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+        const k = j * n + i; if (!inside[k]) continue;
+        const edge = i === 0 || j === 0 || i === n - 1 || j === n - 1 || !inside[k - 1] || !inside[k + 1] || !inside[k - n] || !inside[k + n];
+        d[k * 4] = fillC[0]; d[k * 4 + 1] = fillC[1]; d[k * 4 + 2] = fillC[2]; d[k * 4 + 3] = edge ? 165 : 28;
+      }
+      x.putImageData(img, 0, 0);
+      list.push({ f: f, cv: cv, x0: x0, y0: y0, n: n, ink: U.rgb(fillC, 0.95) });
+    }
+    this._scz = { key: key, list: list };
+    return list;
+  };
+  Renderer.prototype.drawScenicZones = function (ctx, under) {
+    if (this.game.jumping || this.game.pending || (CM.ui && CM.ui.blocking())) { this._sczA = 0; return; }
+    const T = CM.tools, want = !this.game.preview && under < 0.5 && ((T && (T.tool === 'station' || T.tool === 'line')) || this.layer === 'region');
+    this._sczA = U.clamp((this._sczA || 0) + (want ? 1 : -1) * (this.dt || 0.016) / 0.25, 0, 1);
+    if (this._sczA <= 0.01) return;
+    const list = this.scenicZones(); if (!list || !list.length) return;
+    const M = this.M, z = this.z, v = this.view;
+    ctx.save();
+    ctx.globalAlpha = this._sczA * (1 - 2 * under);
+    ctx.imageSmoothingEnabled = true;
+    for (const it of list) {
+      if (it.x0 > v.x1 || it.y0 > v.y1 || it.x0 + SCENIC_RAD * 2 < v.x0 || it.y0 + SCENIC_RAD * 2 < v.y0) continue;
+      {
+        ctx.save();
+        ctx.transform(M[0] * z, M[2] * z, M[1] * z, M[3] * z, this.ox, this.oy);
+        ctx.drawImage(it.cv, it.x0, it.y0, it.n / SCENIC_RES, it.n / SCENIC_RES);
+        ctx.restore();
+      }
+      if (z >= 10) {
+        const p = this.P(it.f.x, it.f.y + SCENIC_RAD + 0.12, 0, {}), text = it.f.name.replace(/（.*）/, '') + ' · 景区站可建范围';   // 放在范围下沿，避开地标名称
+        ctx.font = '600 11px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        ctx.lineJoin = 'round'; ctx.lineWidth = 3; ctx.strokeStyle = TH.halo; ctx.strokeText(text, p.x, p.y);
+        ctx.fillStyle = it.ink; ctx.fillText(text, p.x, p.y);
+      }
+    }
+    ctx.restore();
+  };
   // 点击选中设施：设施图层中的圆点；其他情况下点在设施场地（地标）或其中心附近
+  const MT_HALF = { surface: 0.11, elevated: 0.07 }, ST_LEN = { S: 0.3, M: 0.4, L: 0.5 }, ST_HALF = 0.09, MT_STEP = 0.06;
+  // net 中地面 / 高架的轨道与车站占用的子地块：Map(格 → 16 位掩码)。only(id, kind) 返回 false 的对象跳过
+  Renderer.prototype.metroMaskOf = function (net, only) {
+    const city = this.game.city, MT = CM.Metro, W = city.W, H = city.H, mask = new Map();
+    const mark = function (x, y, r) {
+      const u0 = Math.floor((x - r) * 4), u1 = Math.floor((x + r) * 4), v0 = Math.floor((y - r) * 4), v1 = Math.floor((y + r) * 4);
+      for (let v = v0; v <= v1; v++) for (let u = u0; u <= u1; u++) {
+        const qx = U.clamp(x, u / 4, (u + 1) / 4), qy = U.clamp(y, v / 4, (v + 1) / 4);
+        if ((qx - x) * (qx - x) + (qy - y) * (qy - y) > r * r) continue;
+        const i = u >> 2, j = v >> 2; if (i < 0 || j < 0 || i >= W || j >= H) continue;
+        const c = j * W + i; mask.set(c, (mask.get(c) || 0) | (1 << ((v & 3) * 4 + (u & 3))));
+      }
+    };
+    for (const id in net.segments) {
+      const sg = net.segments[id], r = MT_HALF[sg.type];
+      if (!r || (only && !only(id, 'seg'))) continue;
+      const pts = MT.segGeom(net, sg, city).pts;
+      for (let k = 1; k < pts.length; k++) {
+        const a = pts[k - 1], b = pts[k], L = U.dist(a[0], a[1], b[0], b[1]), n = Math.max(1, Math.ceil(L / MT_STEP));
+        for (let q = 0; q <= n; q++) mark(a[0] + (b[0] - a[0]) * q / n, a[1] + (b[1] - a[1]) * q / n, r);
+      }
+    }
+    for (const id in net.stations) {
+      const st = net.stations[id];
+      if (only && !only(id, 'st')) continue;
+      for (const t of MT.stationLevels(net, id)) {
+        if (t === 'underground') continue;
+        const lid = MT.stationLines(net, id).find(function (l) { return MT.platType(st, l) === t; });
+        const a = (lid && MT.platformDir(net, id, lid)) || 0, len = ST_LEN[st.size] || 0.4, n = Math.ceil(len * 2 / MT_STEP);
+        for (let q = 0; q <= n; q++) { const s = -len + 2 * len * q / n; mark(st.x + Math.cos(a) * s, st.y + Math.sin(a) * s, ST_HALF); }
+      }
+    }
+    return mask;
+  };
+  // 建筑体块覆盖的子地块位
+  function boxBits(b) {
+    let m = 0;
+    for (let v = Math.floor(b[1] * 4); v <= Math.min(3, Math.floor((b[3] - 1e-6) * 4)); v++) for (let u = Math.floor(b[0] * 4); u <= Math.min(3, Math.floor((b[2] - 1e-6) * 4)); u++) m |= 1 << (v * 4 + u);
+    return m;
+  }
+  // 正式线网的占用掩码：线网或城市变化时重算，变化的格标为过期，建筑分块随之重绘
+  Renderer.prototype.syncMetroMask = function () {
+    const g = this.game; if (!g || !g.net || g.preview) { this._mt = null; return; }
+    const key = g.netVersion + ':' + (g.city.uid || 0) + ':' + (g.city.terrainVer || 0);
+    if (this._mt && this._mt.key === key) return;
+    const old = this._mt ? this._mt.mask : new Map(), mask = this.metroMaskOf(g.net), dirty = g.city.dirty;
+    mask.forEach(function (m, c) { if (old.get(c) !== m) dirty.add(c); });
+    old.forEach(function (m, c) { if (!mask.has(c)) dirty.add(c); });
+    this._mt = { key: key, mask: mask };
+  };
+  // 草案将拆除的房屋：草案新增或改动的地面 / 高架部分占用、正式线网尚未占用的子地块上的现有房屋
+  Renderer.prototype.demolitionBoxes = function () {
+    const g = this.game, d = g.draft, city = g.city, MT = CM.Metro, off = g.net;
+    const key = d.ver + ':' + city.version + ':' + (this._mt ? this._mt.key : '');
+    if (this._dmb && this._dmb.key === key) return this._dmb;
+    const changed = function (id, kind) {
+      if (kind === 'seg') { const a = d.net.segments[id], b = off.segments[id]; return !b || a.type !== b.type || a.curve !== b.curve || MT.trackKey(a) !== MT.trackKey(b); }
+      const a = d.net.stations[id], b = off.stations[id];
+      return !b || a.x !== b.x || a.y !== b.y || a.type !== b.type || a.size !== b.size || JSON.stringify(a.lv || null) !== JSON.stringify(b.lv || null) || JSON.stringify(a.pd || null) !== JSON.stringify(b.pd || null);
+    };
+    const dm = this.metroMaskOf(d.net, changed), cur = this._mt ? this._mt.mask : new Map(), boxes = [];
+    dm.forEach(function (bits, c) {
+      const free = bits & ~(cur.get(c) || 0); if (!free) return;
+      const bl = this.cellBuildings(c); if (!bl) return;
+      for (const b of bl) if (boxBits(b) & free) boxes.push({ i: c % city.W, j: (c / city.W) | 0, b: b });
+    }, this);
+    this._dmb = { key: key, boxes: boxes };
+    return this._dmb;
+  };
+  Renderer.prototype.drawDemolitions = function (ctx, under) {
+    const g = this.game;
+    if (!g.draft || g.preview || under > 0.5) return;
+    const D = this.demolitionBoxes(); if (!D.boxes.length) return;
+    const v = this.view, pulse = 0.9 + 0.1 * Math.sin(this.time * 4), a = 1 - 2 * under;
+    const vis = function (i, j) { return i >= v.x0 - 1 && i <= v.x1 + 1 && j >= v.y0 - 1 && j <= v.y1 + 1; };
+    ctx.save(); ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    // 将拆除的房屋：柔和淡红体块与屋顶「×」，不铺设街区底色
+    const lw = U.clamp(this.z * 0.03, 1, 2);
+    for (const it of D.boxes) {
+      if (!vis(it.i, it.j)) continue;
+      const b = it.b, h = b[4] * EX, x0 = it.i + b[0], y0 = it.j + b[1], x1 = it.i + b[2], y1 = it.j + b[3];
+      const corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+      const base = corners.map(function (c) { return this.P(c[0], c[1], 0, {}); }, this), top = corners.map(function (c) { return this.P(c[0], c[1], h, {}); }, this);
+      ctx.globalAlpha = a * 0.42 * pulse; ctx.fillStyle = '#eab0b2';
+      for (let k = 0; k < 4; k++) {
+        const k2 = (k + 1) % 4;
+        ctx.beginPath(); ctx.moveTo(base[k].x, base[k].y); ctx.lineTo(base[k2].x, base[k2].y); ctx.lineTo(top[k2].x, top[k2].y); ctx.lineTo(top[k].x, top[k].y); ctx.closePath(); ctx.fill();
+      }
+      ctx.globalAlpha = a * 0.65 * pulse; ctx.fillStyle = '#f0babc';
+      ctx.beginPath(); top.forEach(function (t, k) { if (k) ctx.lineTo(t.x, t.y); else ctx.moveTo(t.x, t.y); }); ctx.closePath(); ctx.fill();
+      ctx.globalAlpha = a * 0.75; ctx.strokeStyle = '#c97f86'; ctx.lineWidth = lw; ctx.stroke();
+      ctx.beginPath();
+      for (let k = 0; k < 4; k++) { ctx.moveTo(base[k].x, base[k].y); ctx.lineTo(top[k].x, top[k].y); }
+      ctx.moveTo(top[0].x, top[0].y); ctx.lineTo(top[2].x, top[2].y); ctx.moveTo(top[1].x, top[1].y); ctx.lineTo(top[3].x, top[3].y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  };
   Renderer.prototype.pickFacility = function (sx, sy, wx, wy) {
     const g = this.game, model = g && g.model;
     if (!model || !model.fn) return null;
@@ -2858,6 +4145,8 @@
       let best = null, bd = 1e9;
       for (const it of this._facPx) { const d = Math.hypot(sx - it.x, sy - it.y); if (d <= it.r && d < bd) { bd = d; best = it.id; } }
       if (best) return best;
+    } else if (this._portals) {
+      for (const p of this._portals) if (p.card && sx >= p.card.x - 3 && sx <= p.card.x + p.card.w + 3 && sy >= p.card.y - 3 && sy <= p.card.y + p.card.h + 3) return p.f.id;   // 地图外设施的提示卡
     }
     let best = null, bd = 1e9;
     for (const f of model.fn.list) {
@@ -2879,7 +4168,7 @@
       const rt = C.routes[r], re = net.rideEdge[r];
       for (let k = 0; k < rt.segRefs.length; k++) {
         let lf = 0;
-        for (let p = 0; p < 4; p++) { const P = model.ctxs[dt].per[p]; if (!P.load || P.load.length !== net.nE) continue; const cap = Math.max(1, P.freq[r] * rt.cap); lf = Math.max(lf, P.load[re[2 * k]] / cap, P.load[re[2 * k + 1]] / cap); }
+        for (let p = 0; p < 4; p++) { const P = model.resultsFor(dt).per[p]; if (!P.load || P.load.length !== net.nE) continue; const cap = Math.max(1, P.freq[r] * rt.cap); lf = Math.max(lf, P.load[re[2 * k]] / cap, P.load[re[2 * k + 1]] / cap); }
         if (lf <= 1) continue;
         const arr = this.segPx && this.segPx.get(rt.segRefs[k].id); if (!arr) continue;
         ctx.strokeStyle = 'rgba(239,138,58,0.75)'; ctx.lineWidth = this.lineWidthPx() + 8 * zk; this.strokeArr(ctx, arr);
@@ -3009,14 +4298,25 @@
     }
   };
   // ---------------- 标注 ----------------
+  // 图层自带圆点与标注的位置摘要（按 6 px 取整）：变化时重新排站名
+  Renderer.prototype.layerSig = function () {
+    if (this._layerRectsFor !== this.layer || !this._layerRects) return '';
+    let s = '';
+    for (const b of this._layerRects) s += ((b[0] / 6) | 0) + ',' + ((b[1] / 6) | 0) + ',' + ((b[2] / 6) | 0) + ',' + ((b[3] / 6) | 0) + ';';
+    return s;
+  };
   Renderer.prototype.drawLabels = function (ctx, ui) {
     if (this.game.preview) return;
     const step = (this.dt || 0.016) / 0.25;
     const labA = U.clamp((this.labA == null ? (this.labelsOn ? 1 : 0) : this.labA) + (this.labelsOn ? step : -step), 0, 1);
     const mapLabA = U.clamp((this.mapLabA == null ? (this.mapLabelsOn !== false ? 1 : 0) : this.mapLabA) + (this.mapLabelsOn !== false ? step : -step), 0, 1);
-    const key = [this.w, this.h, this.dpr, this.z, this.ox, this.oy, this.hs, this.M.join(','), this.cam.under, this.tEase > 0.5, this.bFade > 0.5, this.game.city.version, this.game.netVersion, this.layer, labA, mapLabA, this.themeName, document.fonts ? document.fonts.status : ''].join('|');
+    const key = [this.w, this.h, this.dpr, this.z, this.ox, this.oy, this.hs, this.M.join(','), this.cam.under, this.tEase > 0.5, this.bFade > 0.5, this.game.city.version, this.game.netVersion, this.layer, labA, mapLabA, this.themeName, AX.flag(), document.fonts ? document.fonts.status : '', this.layerSig()].join('|');
     let image = this.labelImage;
     if (!image || image.key !== key || image.C !== this.drawnC) {
+      if (this.lastLabelKey !== key || this.lastLabelC !== this.drawnC) {
+        this.lastLabelKey = key; this.lastLabelC = this.drawnC;
+        this.drawLabelContent(ctx, ui); return;
+      }
       const cv = image && image.cv.width === this.cv.width && image.cv.height === this.cv.height ? image.cv : makeCanvas(this.cv.width, this.cv.height);
       const x = cv.getContext('2d');
       x.setTransform(1, 0, 0, 1, 0, 0); x.clearRect(0, 0, cv.width, cv.height); x.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
@@ -3033,25 +4333,54 @@
     this.labA = U.clamp((this.labA == null ? (this.labelsOn ? 1 : 0) : this.labA) + (this.labelsOn ? step : -step), 0, 1);
     this.mapLabA = U.clamp((this.mapLabA == null ? (this.mapLabelsOn !== false ? 1 : 0) : this.mapLabA) + (this.mapLabelsOn !== false ? step : -step), 0, 1);
     const placed = new Map(), tile = 48;
+    const occupy = function (x0, y0, x1, y1) {
+      const i0 = Math.floor(x0 / tile), i1 = Math.floor(x1 / tile), j0 = Math.floor(y0 / tile), j1 = Math.floor(y1 / tile), rect = [x0, y0, x1, y1];
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) { const key = i + ':' + j; let list = placed.get(key); if (!list) { list = []; placed.set(key, list); } list.push(rect); }
+    };
+
     const fits = function (x0, y0, x1, y1) {
       const i0 = Math.floor(x0 / tile), i1 = Math.floor(x1 / tile), j0 = Math.floor(y0 / tile), j1 = Math.floor(y1 / tile);
       for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
         const list = placed.get(i + ':' + j);
         if (list) for (const r of list) if (x0 < r[2] && x1 > r[0] && y0 < r[3] && y1 > r[1]) return false;
       }
-      const rect = [x0, y0, x1, y1];
-      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) { const key = i + ':' + j; let list = placed.get(key); if (!list) { list = []; placed.set(key, list); } list.push(rect); }
+      occupy(x0, y0, x1, y1);
       return true;
     };
-    const halo = function (text, x, y, font, fill, align) {
-      ctx.font = font; ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
-      ctx.lineWidth = 3.2; ctx.strokeStyle = TH.halo; ctx.lineJoin = 'round';
-      ctx.strokeText(text, x, y); ctx.fillStyle = fill; ctx.fillText(text, x, y);
+    const halo = (text, x, y, font, fill, align) => {
+      const s = this.labelSprite(ctx, text, font, fill);
+      // 保留后续测量文字所使用的字体，与直接绘制文字时一致。
+      ctx.font = font;
+      ctx.drawImage(s.cv, x + s.left - (align === 'center' ? s.width / 2 : 0), y + s.top, s.cv.width / this.dpr, s.cv.height / this.dpr);
     };
     // 车站名
     const C = this.drawnC;
-    const busyLayer = this.layer === 'cong' || this.layer === 'flow' || this.layer === 'station' || this.layer === 'fac' || this.layer === 'gap';   // 这两个图层自带标注，隐藏站名、区名与未开放区域
-    if (C && this.stPx && z >= 8.5 && this.labA > 0.01 && !busyLayer) {
+    if (AX.enabled() && C && this.segPx) {
+      const seen = new Map(); let count = 0;
+      ctx.font = '800 11px ' + FONT; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      for (const [id, arr] of this.segPx) {
+        const cs = C.segs.get(id), line = cs && C.net.lines[cs.seg.line];
+        if (!line || arr.length < 4 || count >= 48) continue;
+        const old = seen.get(line.id) || [];
+        if (old.length >= 3 || U.dist(arr[0], arr[1], arr[arr.length - 2], arr[arr.length - 1]) < 70) continue;
+        const label = AX.number(line), w = Math.max(22, ctx.measureText(label).width + 10), col = AX.line(line);
+        for (const f of [0.5, 0.7, 0.3]) {
+          const i = Math.round((arr.length / 2 - 1) * f) * 2, x = arr[i], y = arr[i + 1];
+          if (x < w || x > this.w - w || y < 15 || y > this.h - 15 || old.some(function (p) { return U.dist(x, y, p[0], p[1]) < 190; })) continue;
+          if (this.stPx && this.stPx.some(function (p) { return p && U.dist(x, y, p.x, p.y) < 26; })) continue;
+          if (!fits(x - w / 2 - 3, y - 12, x + w / 2 + 3, y + 12)) continue;
+          ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x - w / 2, y - 9, w, 18, 6); else ctx.rect(x - w / 2, y - 9, w, 18);
+          ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+          ctx.fillStyle = AX.ink(col); ctx.fillText(label, x, y + 0.5);
+          old.push([x, y]); seen.set(line.id, old); count++; break;
+        }
+      }
+    }
+    const busyLayer = this.layer === 'cong' || this.layer === 'flow' || this.layer === 'station' || this.layer === 'fac' || this.layer === 'gap';   // 分析图层隐藏区名与未开放区域，站名尽量避让显示
+    const lr = busyLayer && this._layerRectsFor === this.layer ? this._layerRects : null;
+    if (lr) for (const b of lr) occupy(b[0], b[1], b[2], b[3]);
+    const named = this.layer === 'station' && this._layerRectsFor === 'station' ? this._layerNamed : null;
+    if (C && this.stPx && z >= 8.5 && this.labA > 0.01) {
       ctx.globalAlpha = this.labA;
       const fs = z >= 22 ? 12.5 : 11.5;
       ctx.font = fs + 'px ' + FONT;
@@ -3059,9 +4388,19 @@
       order.sort(function (a, b) { return (C.stationLines[b[1]].size - C.stationLines[a[1]].size) || ({ L: 2, M: 1, S: 0 }[C.stations[b[1]].size] - { L: 2, M: 1, S: 0 }[C.stations[a[1]].size]); });
       for (const it of order) {
         const p = it[0], s = C.stations[it[1]];
+        if (s.portal && CM.Fac && CM.Fac.isPortalStation(s) && this.layer === 'none' && this.cam.under < 0.5) continue;
+        if (named && named.has(s.id)) continue;
         const w = this.textWidth(ctx, s.name);
-        const x = p.x + p.r + 4, y = p.y;
-        if (!fits(x - 2, y - fs / 2 - 2, x + w + 2, y + fs / 2 + 2)) continue;
+        // 右侧放不下时依次试左侧、上方（图层标注较多时站名仍尽量显示）
+        let x = p.x + p.r + 4, y = p.y;
+        if (!fits(x - 2, y - fs / 2 - 2, x + w + 2, y + fs / 2 + 2)) {
+          x = p.x - p.r - 4 - w;
+          if (!fits(x - 2, y - fs / 2 - 2, x + w + 2, y + fs / 2 + 2)) {
+            x = p.x - w / 2; y = p.y - p.r - fs / 2 - 4;
+            if (!fits(x - 2, y - fs / 2 - 2, x + w + 2, y + fs / 2 + 2)) continue;
+          }
+        }
+
         halo(s.name, x, y, (C.stationLines[it[1]].size > 1 ? '600 ' : '') + fs + 'px ' + FONT, TH.ink);
       }
       ctx.globalAlpha = 1;
@@ -3112,25 +4451,32 @@
     if (z < 16 && this.mapLabA > 0.01 && this.layer !== 'flow') {
       const a = U.clamp((16 - z) / 5, 0, 1) * 0.75;
       for (const dl of (city.districtLabels || [])) {
-        const p = this.P(dl[1], dl[2], 0);
+        const p = this.P(dl[1], dl[2], 0), font = '600 ' + (z < 9 ? 15 : 17) + 'px ' + FONT;
         ctx.globalAlpha = a * this.mapLabA;
-        halo(dl[0], p.x, p.y, '600 ' + (z < 9 ? 15 : 17) + 'px ' + FONT, TH.district, 'center');
+        halo(dl[0], p.x, p.y, font, TH.district, 'center');
+        // 占位：之后的未开放区域标签避开区名
+        ctx.font = font; const tw = this.textWidth(ctx, dl[0]); fits(p.x - tw / 2 - 2, p.y - 11, p.x + tw / 2 + 2, p.y + 11);
       }
       ctx.globalAlpha = 1;
     }
     ctx.globalAlpha = 1;
     // 未开放区域标签
     if (z < 24 && !busyLayer) {
-      const shown = new Set();
+      const shown = new Set(), lock = city.lockState();
       for (let k = 0; k < city.regions.length; k++) {
         const rg = city.regions[k];
-        if (city.regionOpen[k] || rg.scenic || rg.cx == null || !rg.cells || shown.has(k)) continue;
-        const cx = rg.cx, cy = rg.cy;
+        if (!lock.info[k].n || rg.scenic || rg.cx == null || !rg.cells || shown.has(k)) continue;
+        const cx = lock.info[k].x, cy = lock.info[k].y;
         if (cx < v.x0 || cx > v.x1 || cy < v.y0 || cy > v.y1) continue;
         const p = this.P(cx, cy, 0);
-        const text = '🔒 ' + rg.name.replace(/（.*）/, '') + ' · ' + U.regionLock(rg);
+        const text = '🔒 ' + rg.name.replace(/（.*）/, '') + ' · ' + city.lockText(city.cellAt(cx, cy));
         ctx.font = '11px ' + FONT;
         const w = this.textWidth(ctx, text);
+        // 靠近地图边缘的区域：标签整体收进地图范围，不越出边界
+        const xl = this.P(0, cy, 0).x + w / 2 + 6, xr = this.P(CFG.W, cy, 0).x - w / 2 - 6;
+        if (xl <= xr) p.x = U.clamp(p.x, xl, xr);
+        const yt = this.P(cx, 0, 0).y + 12, yb = this.P(cx, CFG.H, 0).y - 12;
+        if (yt <= yb) p.y = U.clamp(p.y, yt, yb);
         if (!fits(p.x - w / 2, p.y - 8, p.x + w / 2, p.y + 8)) continue;
         halo(text, p.x, p.y, '11px ' + FONT, TH.lockInk, 'center');
         shown.add(k);
@@ -3181,10 +4527,9 @@
     for (const L of arr) { const d = U.distToPoly(wx, wy, L.pts); if (d < bd) { bd = d; best = L; } }
     return best;
   };
-  Renderer.prototype.fitAll = function () {
-    const zx = this.w / (CFG.W + 4), zy = this.h / (CFG.H + 4);
-    this.cam.tz = this.cam.zoom = U.clamp(Math.min(zx, zy) * 1.05, 5, 96);
-    this.cam.cx = CFG.W / 2; this.cam.cy = CFG.H / 2;
+  Renderer.prototype.fitAllSmooth = function () {
+    const z = U.clamp(Math.min(this.w / (CFG.W + 4), this.h / (CFG.H + 4)) * 1.05, 5, 96);
+    this.flyTo(CFG.W / 2, CFG.H / 2, z); this.cam.fly.duration = 0.9;
   };
   CM.RENDER_CONST = { EX: EX, HSF: HSF, ISO: ISO, UNDER_DEPTH: UNDER_DEPTH };
 })(window.CM);
