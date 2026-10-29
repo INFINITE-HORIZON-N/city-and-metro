@@ -1,0 +1,19 @@
+{
+  "passed": [
+    "1990: no premature fallback runway",
+    "1990: World Window is not active",
+    "1994: park opens without expo blocks",
+    "1998: terminal phase invalidates 2D cache",
+    "Airport keeps its operating restriction beneath landmarks",
+    "Protected footprint corner blocks stations",
+    "Expo gaps are passable and do not add protection cost",
+    "Exact collision detects a thin slice and unions duplicate parts",
+    "Shenzhong gate activates in June, not December",
+    "2004 MixC demand node is in Luohu",
+    "Save restores water, land use, active landmarks and restrictions",
+    "Generated ordinary buildings do not cross visible road centerlines",
+    "Underground depth, station, track and inverse projection agree during transitions",
+    "Station editing handle and no-op drag preserve underground coordinates",
+    "Airport closure preserves the operating restriction until closure and survives a save"
+  ]
+}

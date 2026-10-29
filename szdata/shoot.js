@@ -98,6 +98,7 @@ const sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms
     await sleep(3500);
   }
   if (process.env.UNDER) { await send('Runtime.evaluate', { expression: "CM.R.cam.under=CM.R.cam.tu=1;1", returnByValue: true }); await sleep(2500); }
+  if (process.env.THEME) { await send('Runtime.evaluate', { expression: "try{CM.setTheme('" + process.env.THEME + "');}catch(e){} 1", returnByValue: true }); await sleep(2500); }
   // 可选：直接把城市地形与路网推到某一年（只用于看画面，不推进模型与账目）
   if (process.env.FORCEYEAR) {
     const y = +process.env.FORCEYEAR;

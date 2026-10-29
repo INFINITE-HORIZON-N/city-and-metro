@@ -1,0 +1,25 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>深圳地标 · 参考修订模型</title><style>body{margin:0;background:#eef3f5}canvas{display:block}#theme{position:fixed;right:18px;top:15px;z-index:10;background:#dbe8ef;border:0;border-radius:12px;padding:12px;cursor:pointer}</style><button id="theme">切换日夜</button><a id="download" download="深圳地标-参考修订.png" style="position:fixed;right:130px;top:26px;z-index:10;color:#2a536c">保存模型图</a><script src="js/util.js"></script><script src="js/config.js"></script><script src="js/news.js"></script><script src="js/geo_gz.js"></script><script src="js/geo.js"></script><script src="js/data_gz.js"></script><script src="js/data_tutorial.js"></script><script src="js/geo_hz.js"></script><script src="js/data_hz.js"></script><script src="js/geo_hk.js"></script><script src="js/data_hk.js"></script><script src="js/geo_tk.js"></script><script src="js/data_tk.js"></script><script src="js/geo_tp.js"></script><script src="js/data_tp.js"></script><script src="js/geo_sz.js"></script><script src="js/landmarks_sz.js"></script><script src="js/data_sz.js"></script><script src="js/maps.js"></script><script src="js/facility.js"></script><script src="js/city.js"></script><script src="js/metro.js"></script><script src="js/sim.js"></script><script src="js/economy.js"></script><script src="js/macro.js"></script><script src="js/game.js"></script><script src="js/milestones.js"></script><script src="js/save.js"></script><script src="js/landmark_meshes_sz.js"></script><script src="js/landmark_models_sz.js"></script><script src="js/render.js"></script><script src="js/agents.js"></script><script src="js/icons.js"></script><script src="js/settings.js"></script><script src="js/sound.js"></script><script src="js/soundscape.js"></script><script src="js/tools.js"></script><script src="js/ui.js"></script><script src="js/screens.js"></script><script src="js/pages.js"></script><script src="js/stats.js"></script><script src="js/netmap.js"></script><script src="js/follow.js"></script><script src="js/tutorial.js"></script><script>function renderModels(){(()=>{
+ CM.useMap('sz');if(!CM.R){const c=new CM.City();c.generate(19900101,1990);for(let y=1991;y<=2026;y++){c.applyReclaim(y);c.applyRoads(y);c.activateLandmarks(y)}CM.R=new CM.Renderer(document.createElement('canvas'));CM.R.game={city:c,clock:{y:2026}};}
+ let cv=document.getElementById('modelGallery');if(!cv){cv=document.createElement('canvas');cv.id='modelGallery';document.body.appendChild(cv)}
+ Object.assign(cv.style,{position:'relative',width:'100%',height:'auto'});cv.width=1600;cv.height=1530;
+ const ctx=cv.getContext('2d'),night=window.galleryNight||false;CM.R.setTheme(night?'dark':'light');
+ ctx.fillStyle=night?'#101e2d':'#eef3f5';ctx.fillRect(0,0,1600,1530);
+ ctx.fillStyle=night?'#e8edf3':'#19334a';ctx.font='bold 26px sans-serif';ctx.fillText('深圳 · 地标精细模型',38,43);
+ ctx.fillStyle=night?'#a7bacb':'#667d8e';ctx.font='14px sans-serif';ctx.fillText('机场 / 红色大屋顶 / 春茧 / 春笋 / 文化广场 / 平安金融中心 / COCO Park   ·   2026 年展示',38,72);
+ const ids=['ba_t3','ba_sat','ba_ab','ft_szh','ft_bay','ns_culture','ns_crc','ft_pingan','ft_cocopark','ba_cec2','ft_cec'];const stats=[];
+ ids.forEach((id,k)=>{
+ const lm=CM.DATA.landmarks.find(l=>l.id===id),x=24+k%3*524,y=96+Math.floor(k/3)*350,w=508,h=334;
+ ctx.fillStyle=night?'#172c3e':'#fff';ctx.beginPath();ctx.roundRect(x,y,w,h,14);ctx.fill();
+ const pts=[],proj=(X,Y,H)=>{const dx=X-lm.x,dy=Y-lm.y;return[(dx-dy)*.70710678,(dx+dy)*.35355339-H*.82]};
+ CM.R.isoLandmark(ctx,(X,Y,H)=>{const p=proj(X,Y,H);pts.push(p);return[0,0]},lm,64);
+ const minX=Math.min(...pts.map(p=>p[0])),maxX=Math.max(...pts.map(p=>p[0])),minY=Math.min(...pts.map(p=>p[1])),maxY=Math.max(...pts.map(p=>p[1]));
+ const z=Math.min((w-60)/(maxX-minX),(h-85)/(maxY-minY));let n=0;const t=performance.now();
+ CM.R.isoLandmark(ctx,(X,Y,H)=>{n++;const p=proj(X,Y,H);return[x+w/2+(p[0]-(minX+maxX)/2)*z,y+23+(p[1]-minY)*z]},lm,64);
+ ctx.fillStyle=night?'#e7eff4':'#213d52';ctx.font='bold 17px sans-serif';ctx.textAlign='left';ctx.fillText(lm.name,x+18,y+h-24);
+ ctx.font='12px sans-serif';ctx.fillStyle=night?'#9bafc2':'#7e919f';ctx.fillText('参考影像重建 / 比例简化 / 年代分期',x+18,y+h-7);
+ stats.push({id,projectedPoints:n,drawMilliseconds:Math.round((performance.now()-t)*10)/10});
+ });
+ window.modelStats=stats;document.getElementById('download').href=cv.toDataURL('image/png');return stats;
+})()
+}
+renderModels();document.getElementById("theme").onclick=()=>{window.galleryNight=!window.galleryNight;renderModels()};</script></html>

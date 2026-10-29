@@ -359,8 +359,8 @@
     out.y = this.oy + (M[2] * x + M[3] * y) * z - (h || 0) * this.hs;
     return out;
   };
-  Renderer.prototype.unproject = function (sx, sy) {
-    const M = this.M, a = (sx - this.ox) / this.z, b = (sy - this.oy) / this.z;
+  Renderer.prototype.unproject = function (sx, sy, h) {
+    const M = this.M, a = (sx - this.ox) / this.z, b = (sy + (h || 0) * this.hs - this.oy) / this.z;
     return { x: (M[3] * a - M[1] * b) / this.det, y: (-M[2] * a + M[0] * b) / this.det };
   };
   Renderer.prototype.screenToWorldDelta = function (dx, dy) {
@@ -385,6 +385,8 @@
   };
   Renderer.prototype.setView = function (iso) { this.cam.view = iso ? 1 : 0; };
   Renderer.prototype.setUnder = function (on) { this.cam.tu = on ? 1 : 0; };
+  Renderer.prototype.displayHeight = function (h) { return h < 0 ? h * U.smooth(this.cam.under) * UNDER_DEPTH : h; };
+  Renderer.prototype.typeHeight = function (type) { return this.displayHeight(CFG.metro.height[type] || 0); };
   Renderer.prototype.clampCam = function () {
     const c = this.cam;
     c.cx = U.clamp(c.cx, -2, CFG.W + 2); c.cy = U.clamp(c.cy, -2, CFG.H + 2);
@@ -493,7 +495,7 @@
     for (let v = 0; v < 4; v++) for (let u = 0; u < 4; u++) {
       let maj = 0, mn = 0;
       for (let y = 0; y < 2; y++) { const row = (j * BS + v * 2 + y) * BW + i * BS + u * 2; for (let x = 0; x < 2; x++) { const m = bm[row + x]; if (m >= 2) maj++; else if (m === 1) mn++; } }
-      const f = maj === 0 && mn <= 1 ? 1 : 0;
+      const f = maj === 0 && mn === 0 ? 1 : 0;
       free[v * 4 + u] = f; nFree += f;
     }
     if (!nFree) return null;
@@ -590,7 +592,7 @@
     ctx.globalAlpha = 1;
     // 公园（真实范围）
     const pp = new Path2D();
-    for (const f of Geo.parks) if (inBox(f.bbox, 0.5)) pp.addPath(this.featurePath(f, true));
+    for (const f of Geo.parks) if ((!D.parkYears || !D.parkYears[f.name] || D.parkYears[f.name] <= g.clock.y) && inBox(f.bbox, 0.5)) pp.addPath(this.featurePath(f, true));
     ctx.fillStyle = GROUND.park; ctx.fill(pp, 'evenodd');
     if (lvl >= 16) { ctx.strokeStyle = GROUND.parkEdge; ctx.lineWidth = px * 1.2; ctx.stroke(pp); }
     // 旧机场跑道
@@ -612,7 +614,7 @@
         ctx.strokeStyle = '#f4f4f0'; ctx.lineWidth = Math.max(px, 0.02); ctx.setLineDash([0.3, 0.3]); ctx.stroke(); ctx.setLineDash([]);
       }
     }
-    if (!drewRw && ab && city.lu.indexOf(LU.AIRPORT) >= 0 && inBox(ab, 1)) {
+    if ((!rws || !rws.length) && ab && city.lu.indexOf(LU.AIRPORT) >= 0 && inBox(ab, 1)) {
       const cx = (ab[0] + ab[2]) / 2, len = (ab[3] - ab[1]) * 0.78, y0 = (ab[1] + ab[3]) / 2 - len / 2;
       ctx.fillStyle = GROUND.apron; ctx.fillRect(cx - 1.3, y0 + len * 0.3, 0.9, len * 0.32);
       ctx.fillStyle = GROUND.runway; ctx.fillRect(cx - 0.12, y0, 0.24, len);
@@ -620,18 +622,18 @@
       ctx.beginPath(); ctx.moveTo(cx, y0 + 0.2); ctx.lineTo(cx, y0 + len - 0.2); ctx.stroke(); ctx.setLineDash([]);
     }
     // 水系（真实岸线）
-    const wpth = new Path2D();
-    for (const f of Geo.water) if (inBox(f.bbox, 0.5)) wpth.addPath(this.featurePath(f, true));
+    const wpth = new Path2D(), waterFeats = Geo.water.filter(f => inBox(f.bbox, 0.5));
+    for (const f of waterFeats) wpth.addPath(this.featurePath(f, true));
     ctx.lineJoin = 'round'; ctx.lineCap = 'round';
     // 历史海岸线：尚未填海成陆的区域仍画成水面（单独以 nonzero 填充，避免与海域多边形的奇偶规则抵消）
     const rpth = new Path2D(); let anyRc = false;
-    for (const f of city.reclaimFeats ? city.reclaimFeats(true) : []) if (inBox(f.bbox, 0.5)) { const path = this.featurePath(f, true); rpth.addPath(path); wpth.addPath(path); anyRc = true; }
+    for (const f of city.reclaimFeats ? city.reclaimFeats(true) : []) if (inBox(f.bbox, 0.5)) { const path = this.featurePath(f, true); rpth.addPath(path); wpth.addPath(path); waterFeats.push(f); anyRc = true; }
     ctx.strokeStyle = GROUND.bank; ctx.lineWidth = Math.max(0.05, px * 2.4); ctx.stroke(wpth);
-    ctx.fillStyle = GROUND.water; ctx.fill(wpth, 'evenodd');
+    ctx.fillStyle = GROUND.water; ctx.fill(wpth, 'nonzero');
     if (anyRc) ctx.fill(rpth, 'nonzero');
     // 水面波纹（近景）
     if (lvl >= 16) {
-      ctx.save(); ctx.clip(wpth, 'evenodd');
+      ctx.save(); ctx.clip(wpth, 'nonzero');
       ctx.strokeStyle = GROUND.glint; ctx.lineWidth = px * 1.2;
       ctx.beginPath();
       for (let j = Math.floor(Y0); j < Y1; j += 0.7) for (let i = Math.floor(X0); i < X1; i += 1.3) {
@@ -758,8 +760,11 @@
       ctx.save();
       ctx.clip(lock);
       // 只覆盖陆地：沿岸的格按真实岸线裁掉水面，避免锯齿状的斜线压在江面上
-      const land = new Path2D(); land.rect(X0 - 1, Y0 - 1, X1 - X0 + 2, Y1 - Y0 + 2); land.addPath(wpth);
-      ctx.clip(land, 'evenodd');
+      // 陆地是各水体补集的交集。整条合并路径取反会让重叠海域再次出现锁区斜线。
+      for (const f of waterFeats) {
+        const land = new Path2D(); land.rect(X0 - 1, Y0 - 1, X1 - X0 + 2, Y1 - Y0 + 2);
+        land.addPath(this.featurePath(f, true)); ctx.clip(land, 'evenodd');
+      }
       ctx.fillStyle = TH.lockFill; ctx.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
       ctx.strokeStyle = TH.lockHatch; ctx.lineWidth = Math.max(px, 0.04);
       ctx.beginPath();
@@ -768,11 +773,23 @@
       ctx.restore();
     }
   };
+  // 旧版通用模型的硬编码体量也必须留在声明的场地范围内。
+  function landmarkScale(lm) {
+    if (lm.parts) return 1;
+    const bounds = { box: [116, 116], library: [124, 72], concert: [116, 76], hall: [98, 98] };
+    let b = bounds[lm.kind];
+    if (lm.kind === 'stadium' && lm.w > 500) b = [700, 500];
+    if (lm.kind === 'skyscraper' && lm.style === 'citic') b = [200, 200];
+    return b ? Math.min(1, lm.w / b[0], lm.d / b[1]) : 1;
+  }
   // 地标占地（2D 平面）：真实场地范围 + 主体建筑轮廓
   Renderer.prototype.drawLandmark2D = function (ctx, lm, lvl) {
+    if (lm.kind === 'park') return;
+    if (CM.SZModels && CM.SZModels.drawPlan(ctx, lm, lvl, TH.night)) return;
     const F = TH.lm2d, N = TH.night, CMM = CFG.CELL_M;
     const ang = (lm.rot || 0) * Math.PI / 180, ca = Math.cos(ang), sa = Math.sin(ang);
-    const T = function (u, v) { return [lm.x + (u * ca - v * sa) / CMM, lm.y + (u * sa + v * ca) / CMM]; };
+    const modelScale = landmarkScale(lm);
+    const T = function (u, v) { u *= modelScale; v *= modelScale; return [lm.x + (u * ca - v * sa) / CMM, lm.y + (u * sa + v * ca) / CMM]; };
     const hw = lm.w / 2, hd = lm.d / 2;
     ctx.save();
     ctx.lineWidth = Math.max(1 / lvl, 0.012); ctx.strokeStyle = F.stroke;
@@ -780,8 +797,15 @@
     const rect = function (u0, v0, u1, v1, fill, stroke) { poly([T(u0, v0), T(u1, v0), T(u1, v1), T(u0, v1)], fill, stroke); };
     const ngon = function (cu, cv, r, n, rot, rv) { const o = []; for (let k = 0; k < n; k++) { const t = k / n * Math.PI * 2 + (rot || 0); o.push(T(cu + Math.cos(t) * r, cv + Math.sin(t) * (rv == null ? r : rv))); } return o; };
     const lawn = N ? '#1f3a28' : '#cfe4bf', plaza = N ? '#2c3340' : '#ece6da', bld = F.fill;
+    if (lm.parts) {
+      for (const part of lm.parts) {
+        if (part.year && part.year > this.game.clock.y) continue;
+        poly(part.p.map(p => T(p[0], p[1])), N ? '#52647b' : '#dbe5ed');
+      }
+      ctx.restore(); return;
+    }
     switch (lm.kind) {
-      case 'campus': ctx.globalAlpha = 0.35; rect(-hw, -hd, hw, hd, lawn, false); ctx.globalAlpha = 1; break; // 校园内建筑由街区生成，此处只铺草地底色
+      case 'campus': rect(-30, -22, 30, 22, bld); break; // 校园内建筑由街区生成，此处只铺草地底色
       case 'memorial': case 'hall':
         rect(-hw, -hd, hw, hd, lawn, false);
         rect(-12, -hd, 12, hd, plaza, false);
@@ -911,7 +935,8 @@
   };
   // 地标精灵：每个地标按缩放级别单独缓存（大型场地不受分块裁切），在其中心所在分块之后绘制
   Renderer.prototype.landmarkSprite = function (k, lvl) {
-    const key = 'L' + lvl + ':' + k;
+    const phases = (D.landmarks[k].parts || []).filter(p => !p.year || p.year <= this.game.clock.y).length;
+    const key = 'L' + lvl + ':' + k + ':' + phases;
     let e = this.iso.get(key);
     if (e && !e.stale) { e.used = this.frame; return e; }
     const lm = D.landmarks[k], s = lvl;
@@ -1189,9 +1214,12 @@
 
   // 地标精细模型：局部坐标为米（u 向东、v 向南，绕场地中心旋转 rot 度），高度为米
   Renderer.prototype.isoLandmark = function (ctx, pj, lm, s) {
+    if (lm.kind === 'park') return;
+    if (CM.SZModels && CM.SZModels.draw(ctx, pj, lm, s, { night: TH.night, ex: EX, year: this.game.clock.y })) return;
     const N = TH.night, CMM = CFG.CELL_M, kind = lm.kind, detail = true;
     const ang = (lm.rot || 0) * Math.PI / 180, ca = Math.cos(ang), sa = Math.sin(ang);
-    const T = function (u, v) { return [lm.x + (u * ca - v * sa) / CMM, lm.y + (u * sa + v * ca) / CMM]; };
+    const modelScale = landmarkScale(lm);
+    const T = function (u, v) { u *= modelScale; v *= modelScale; return [lm.x + (u * ca - v * sa) / CMM, lm.y + (u * sa + v * ca) / CMM]; };
     const tall = kind === 'tvtower' || kind === 'skyscraper' || kind === 'lattice';
     const E =EX * (tall ? 1 : 1.6);
     const hw = lm.w / 2, hd = lm.d / 2;
@@ -1243,6 +1271,30 @@
       }
     };
     const glass = N ? [70, 96, 130] : [176, 205, 228], white = N ? [120, 126, 140] : [242, 242, 238], stone = N ? [112, 108, 104] : [214, 206, 192];
+    if (lm.parts) {
+      // 同一组米制轮廓用于平面/立体，机场指廊和展馆间隙不再被通用矩形模型填满。
+      const parts = lm.parts.filter(p => !p.year || p.year <= this.game.clock.y).map(part => {
+        const pts = part.p.map(p => T(p[0], p[1]));
+        return { part: part, pts: pts, depth: Math.max(...pts.map(p => p[0] + p[1])) };
+      }).sort((a, b) => a.depth - b.depth);
+      for (const item of parts) {
+        const part = item.part, pts = item.pts, h = part.h || lm.h || 20;
+        const wall = N ? [65, 88, 116] : [166, 193, 212], roof = N ? [113, 134, 159] : [232, 238, 242];
+        prism(ctx, pj, pts, 0, h * E, wall, roof, { lines: function (fc, q) {
+          if (s < 16) return;
+          ctx.strokeStyle = N ? 'rgba(255,222,161,0.32)' : 'rgba(255,255,255,0.32)'; ctx.lineWidth = 0.7;
+          ctx.beginPath();
+          const rows = Math.min(12, Math.max(1, Math.floor(h / 12)));
+          for (let row = 1; row <= rows; row++) {
+            const t = row / (rows + 1);
+            ctx.moveTo(q[0][0] + (q[3][0] - q[0][0]) * t, q[0][1] + (q[3][1] - q[0][1]) * t);
+            ctx.lineTo(q[1][0] + (q[2][0] - q[1][0]) * t, q[1][1] + (q[2][1] - q[1][1]) * t);
+          }
+          ctx.stroke();
+        } });
+      }
+      return;
+    }
     switch (kind) {
       case 'hall': { // 中山纪念堂：八角形宝蓝琉璃瓦大屋顶、四面抱厦
         const wall = [238, 228, 206], blue = [40, 96, 170], gold = [222, 176, 64];
@@ -1990,7 +2042,7 @@
     let cached = !out && this.segScreens.get(cs);
     if (cached && cached.key === key) return cached.arr;
     const arr = out || (cached ? cached.arr : new Float32Array(n * 2));
-    const uw = U.smooth(under);
+    const uw = under;
     const ty = cs.seg.type;
     for (let i = 0; i < n; i++) {
       let h = hs[i];
@@ -2119,7 +2171,7 @@
         xfer.add(ia); xfer.add(ib); xLinks.push([ia, ib]);
       }
     }
-    const stH = function (s) { let hh = CFG.metro.height[s.type]; if (hh < 0) hh = hh * under * UNDER_DEPTH; return hh; };
+    const stH = (s) => this.typeHeight(s.type);
     if (xLinks.length) {
       ctx.strokeStyle = TH.stInter; ctx.globalAlpha = 0.55; ctx.lineWidth = Math.max(2, lw * 0.45); ctx.setLineDash([3, 4]); ctx.lineCap = 'round';
       ctx.beginPath();
@@ -3161,6 +3213,18 @@
   };
 
   // ---------------- 拾取 ----------------
+  Renderer.prototype.worldOnSegment = function (id, sx, sy) {
+    const cs = this.drawnC && this.drawnC.segs.get(id), arr = this.segPx && this.segPx.get(id);
+    if (!cs || !arr) return this.unproject(sx, sy);
+    let best = Infinity, point = null;
+    for (let i = 0; i + 3 < arr.length; i += 2) {
+      const dx = arr[i + 2] - arr[i], dy = arr[i + 3] - arr[i + 1], len2 = dx * dx + dy * dy;
+      const t = len2 ? U.clamp(((sx - arr[i]) * dx + (sy - arr[i + 1]) * dy) / len2, 0, 1) : 0;
+      const d = Math.hypot(sx - arr[i] - dx * t, sy - arr[i + 1] - dy * t);
+      if (d < best) { best = d; const a = cs.g.pts[i / 2], b = cs.g.pts[i / 2 + 1]; point = { x: U.lerp(a[0], b[0], t), y: U.lerp(a[1], b[1], t) }; }
+    }
+    return point || this.unproject(sx, sy);
+  };
   Renderer.prototype.pickStation = function (sx, sy) {
     if (!this.stPx) return null;
     let best = null, bd = 1e9;

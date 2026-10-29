@@ -85,8 +85,8 @@
     c.setTransform(S, 0, 0, S, 0, 0);
     const poly = function (rows, col) {
       c.fillStyle = col; c.beginPath();
-      for (const row of rows) for (let k = 1; k < row.length; k++) { if (typeof row[k] !== 'string') continue; const p = dec(row[k], 1); c.moveTo(p[0], p[1]); for (let q = 2; q < p.length; q += 2) c.lineTo(p[q], p[q + 1]); }
-      c.fill('evenodd');
+      for (const row of rows) CM.Geo.tracePoly(c, { rings: row.slice(1).filter(s => typeof s === 'string').map(s => ({outer: s[0] === 'o', p: dec(s, 1)})) });
+      c.fill('nonzero');
     };
     poly(G.woods || [], dark ? '#22362f' : '#dbe9dc');
     poly(G.reserves || [], dark ? '#2a4238' : '#c9dfcc');

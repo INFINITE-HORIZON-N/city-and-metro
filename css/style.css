@@ -1583,3 +1583,23 @@ td .tag { margin-left: 4px; padding: 0 6px; font-size: 10px; }
 .tbl tr.clickable { cursor: pointer; }
 .tbl tr.clickable:hover td { background: var(--hover); }
 .tbl td small { font-size: 11px; }
+
+/* Explicit surface / underground view controls. */
+#dock .dockbtn.view { height: 50px; align-content: center; gap: 2px; }
+.view-label { font-size: 10px; font-weight: 650; line-height: 13px; }
+#underViewCard { top: 78px; left: 80px; padding: 11px 13px; display: flex; align-items: center; gap: 18px; pointer-events: auto; }
+#underViewCard strong { display: block; font-size: 13px; }
+#underViewCard span { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }
+#underViewCard .btn { gap: 6px; }
+@media (max-width: 760px) {
+  #dock .dockbtn.view { height: 43px; }
+  #underViewCard { top: calc(104px + env(safe-area-inset-top)); left: 66px; right: 12px; gap: 8px; justify-content: space-between; padding: 8px 10px; }
+  #underViewCard kbd { display: none; }
+}
+
+body.cinema #underViewCard { opacity: 0 !important; pointer-events: none !important; }
+#app:has(#underViewCard:not(.hidden)) #legendCard { top: 154px; }
+@media (max-width: 760px) {
+  #app:has(#underViewCard:not(.hidden)) #legendCard { top: calc(168px + env(safe-area-inset-top)); }
+  #app:has(#underViewCard:not(.hidden)) .pausechip { display: none; }
+}

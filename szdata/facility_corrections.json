@@ -1,0 +1,16 @@
+{
+  "date": "2026-10-28",
+  "facility": "sz_mixc",
+  "name": "罗湖万象城",
+  "old": [
+    22.538,
+    114.065
+  ],
+  "corrected": [
+    22.54243,
+    114.10586
+  ],
+  "source": "OpenStreetMap way 182958974 (万象城中区), supported by adjacent ways 781181213 and 781181215",
+  "source_url": "https://www.openstreetmap.org/way/182958974",
+  "note": "从本次任务已下载的 OSM 节点计算中区参考点；设施位置为接驳需求代表点，不表示完整建筑轮廓。"
+}

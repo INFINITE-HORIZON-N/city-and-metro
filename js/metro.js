@@ -120,11 +120,12 @@
       if (rg.scenic) { hillC += ds; if (!hillHit) hillHit = [mx, my, rg.name]; }
       else if (!city.regionOpen[city.region[c]]) {
         if (!locked.some(function (l) { return l.name === rg.name; })) locked.push({ x: mx, y: my, name: rg.name, open: rg.open, lockNote: rg.lockNote });
-      } else if (city.lu[c] === LU.AIRPORT) {
+      } else if (city.airportAt(mx, my)) {
         if (airOk) { airC += ds; if (!airHit) airHit = [mx, my]; }
         else if (!locked.some(function (l) { return l.open === D.airport.closeYear; })) locked.push({ x: mx, y: my, name: (D.airport.name || '机场') + '（运营中）', open: D.airport.closeYear });
       }
-      if (city.protectedId[c] > 0 && D.landmarks[city.protectedId[c] - 1].kind !== 'campus') { protC += ds; protNames.add(D.landmarks[city.protectedId[c] - 1].name); if (!protHit) protHit = [mx, my]; }
+      const protectedSpan = city.protectedAlong(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]);
+      if (protectedSpan.fraction > 0) { protC += ds * protectedSpan.fraction; protectedSpan.names.forEach(n => protNames.add(n)); if (!protHit) { const t = protectedSpan.t; protHit = [pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t]; } }
       cellLen.set(c, (cellLen.get(c) || 0) + ds);
     }
     // 曲线半径：用相隔约 60 m 的三点外接圆估计，减少采样噪声
@@ -471,13 +472,14 @@
     const rg = city.regions[city.region[c]];
     if (rg.scenic) return { ok: false, msg: rg.name + '：山地风景区不能设站', how: '把车站移出风景区，轨道可以地下穿越。' };
     if (!city.regionOpen[city.region[c]]) return { ok: false, msg: rg.name + ' 尚未开放（' + U.regionLock(rg) + '）', how: rg.open == null ? '该区域不开放建设，请把车站移到其他区域。' : '区域开放前不能建设。可推进时间等待开放，或把车站移到已开放区域。' };
-    if (city.lu[c] === LU.AIRPORT) {
+    if (city.airportAt(x, y)) {
       if (!D.airport.buildable) return { ok: false, msg: (D.airport.name || '机场') + '仍在运营（' + D.airport.closeYear + ' 年关闭）', how: '机场关闭前不能建设，请把车站移到机场范围以外。' };
       if (type !== 'underground') return { ok: false, msg: (D.airport.name || '机场') + '照常运营：范围内只能建地下车站', how: '把车站改为地下站（建设方式选「地下」），或移到机场范围以外。' };
     }
     // 地面铁路（v1.9）：地面车站不能压在运营中的铁路上；地下与高架车站可以
     if (type === 'surface' && city.railDist && city.railDist(x, y) < 0.3) return { ok: false, msg: '地面车站不能建在铁路上', how: '把车站移离铁路约 80 m 以上，或改为地下 / 高架车站。' };
-    if (city.protectedId[c] > 0 && D.landmarks[city.protectedId[c] - 1].kind !== 'campus' && city.inLandmarkSite(city.protectedId[c] - 1, x, y)) return { ok: false, msg: '受保护建筑「' + D.landmarks[city.protectedId[c] - 1].name + '」，不能设站或拆除', how: '把车站移到相邻街区，保护建筑周边仍可通过车站出入口服务。' };
+    const protectedK = city.protectedLandmarkAt(x, y);
+    if (protectedK >= 0) return { ok: false, msg: '受保护建筑「' + D.landmarks[protectedK].name + '」，不能设站或拆除', how: '把车站移到相邻街区，保护建筑周边仍可通过车站出入口服务。' };
     return { ok: true };
   };
 
