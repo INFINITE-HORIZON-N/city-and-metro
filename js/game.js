@@ -20,10 +20,26 @@
     this.netVersion = 0;
     this.rev = 0;            // 持久状态版本：日结算、建设、票价等变化时递增（时钟另行比较）
     this.favs = { stations: [], lines: [] };
+    this.mech = Object.assign({}, (CM.Mech && CM.Mech.DEF) || {});   // 可选玩法的本局开关
   }
   Game.prototype = Object.create(U.Emitter.prototype);
   CM.Game = Game;
   Game.prototype.touch = function () { this.rev++; };
+  // 切换本局的可选玩法。工期决定哪些区段算“在建”，必须立刻重编译，让客流与画面当月生效。
+  Game.prototype.setMech = function (kind, mode) {
+    if (mode !== 'on' && mode !== 'off') return false;
+    if (!this.mech) this.mech = Object.assign({}, (CM.Mech && CM.Mech.DEF) || {});
+    if (this.mech[kind] === mode) return false;
+    this.mech[kind] = mode;
+    if (kind === 'buildTime') {
+      this.compiled = M.compile(this.net, this.city, nowFor(this));
+      if (this.model) this.model.setNetwork(this.compiled);
+      if (this.draft) { this.draft.compVer = -1; this.invalidatePrediction('可选玩法已改变，请重新计算预测'); }
+    }
+    this.rev++;
+    if (this.emit) { this.emit('mech', { kind: kind, mode: mode }); this.emit('autosave', 'mech'); }
+    return true;
+  };
 
   Game.create = function (opts) {
     const g = new Game();
@@ -35,6 +51,9 @@
     if (opts.tutorial) g.tutorial = { step: 0, done: [], started: Date.now() };
     g.createdAt = Date.now();
     g.clock = Object.assign({}, CFG.START);
+    // 机制矩阵：本局的可选玩法，默认全关，玩家在开局简报或游戏中自行开启
+    g.mech = Object.assign({}, (CM.Mech && CM.Mech.DEF) || {}, opts.mech || {});
+    if (CM.Mech) CM.Mech.attach(g);
     g.city = new CM.City();
     g.city.generate(g.seed, g.clock.y);
     g.model = new CM.Model(g.city);
@@ -592,6 +611,7 @@
       tutorial: this.tutorial || null,
       milestones: this.milestones || null,
       mapInit: this.mapInit || null,
+      mech: this.mech || null,
       macro: this.macro && CM.Macro ? CM.Macro.serialize(this.macro) : null,
       traffic: this.traffic || { v: CFG.TRAFFIC_MODEL },
     };
@@ -601,8 +621,11 @@
     const m = s.meta;
     g.id = m.gameId; g.name = m.name; g.mode = m.mode; g.seed = m.seed; g.createdAt = m.createdAt;
     g.mapId = m.map || 'gz';   // 调用前 CM.useMap 已切换到该地图
+    // 机制矩阵：1.9 及更早的存档没有 mech 字段，按全关处理
+    g.mech = Object.assign({}, (CM.Mech && CM.Mech.DEF) || {}, s.mech || {});
     if (s.tutorial) g.tutorial = s.tutorial;
     g.clock = Object.assign({}, s.clock);
+    if (CM.Mech) CM.Mech.attach(g);
     g.city = new CM.City();
     g.city.generate(g.seed, CFG.START.y);
     g.city.restore(s.city, g.clock.y);

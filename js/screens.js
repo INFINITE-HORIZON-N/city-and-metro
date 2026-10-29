@@ -259,6 +259,25 @@
       h('div', null, h('span', null, '已开放区域'), h('b', null, open + ' / ' + regs)),
       h('div', null, h('span', null, '票价'), h('b', null, CFG.money.sym + g.econ.fare.flat)),
       g.macro && CM.Macro ? (function () { const mv = CM.Macro.view(g); return h('div', { 'data-tip': '地图范围的经济规模（估算），每年 1 月结算上一年' }, h('span', null, '城市经济'), h('b', null, (mv.last ? mv.last.y + ' 年 ' + UI.fmtBig(mv.last.nom) : '约 ' + UI.fmtBig(mv.fc.nom)) + ' · ' + mv.env.label)); })() : null));
+    // 可选玩法：本局独立开关，默认全关；开局前和游戏中都可在简报里切换
+    if (CM.Mech && CM.Mech.KINDS && CM.Mech.KINDS.length && g.mech) {
+      parts.push(h('div', { class: 'msel-sec' }, ic('gear', 15), '可选玩法（本局生效，默认关闭）'));
+      parts.push(h('div', { class: 'msel-facts brief-facts' }, CM.Mech.KINDS.map(function (kind) {
+        let bOff, bOn;
+        const paint = function () {
+          const on = g.mech[kind] === 'on';
+          if (bOff) bOff.className = 'btn tiny' + (on ? '' : ' primary');
+          if (bOn) bOn.className = 'btn tiny' + (on ? ' primary' : '');
+        };
+        const flip = function (v) { if (g.setMech) g.setMech(kind, v); paint(); };
+        bOff = h('button', { class: 'btn tiny', onclick: function () { flip('off'); } }, '关');
+        bOn = h('button', { class: 'btn tiny', onclick: function () { flip('on'); } }, '开');
+        paint();
+        return h('div', { 'data-tip': CM.Mech.HINT[kind] || '' },
+          h('span', null, CM.Mech.LABEL[kind]),
+          h('b', { style: { display: 'inline-flex', gap: '6px' } }, bOff, bOn));
+      })));
+    }
     const tasks = (g.tasks.active || []).slice(0, 3);
     if (tasks.length) {
       parts.push(h('div', { class: 'msel-sec' }, ic('tasks', 15), atStart ? '首批任务' : '进行中的任务'));

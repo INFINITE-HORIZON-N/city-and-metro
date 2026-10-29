@@ -170,26 +170,26 @@ ok(e4.projects.length === 1 && e4.projects[0].halted === 1, '读档恢复在建�
 
 console.log('\n== 11. 机制矩阵解析 ==');
 const D = CM.DATA;
+CM.Mech.attach(null);
 CFG.buildTime.enabled = false;
-ok(CM.Mech.on('buildTime') === false, '未声明且无设置时工期关闭');
+ok(CM.Mech.on('buildTime') === false, '新局默认关闭');
 CFG.buildTime.enabled = true;
 ok(CM.Mech.on('buildTime') === true, '老字段 CFG.buildTime.enabled 仍作为回落生效');
 CFG.buildTime.enabled = false;
+const fakeGame = { mech: { buildTime: 'on', landValue: 'off', incidents: 'off' } };
+CM.Mech.attach(fakeGame);
+ok(CM.Mech.on('buildTime') === true, '本局开关 on 时开启');
+fakeGame.mech.buildTime = 'off';
+ok(CM.Mech.on('buildTime') === false, '本局开关 off 时关闭');
+CM.Mech.attach({ mech: {} });
 D.mechanics = { buildTime: { mode: 'on', downPayment: 0.25 } };
 ok(CM.Mech.mapMode('buildTime') === 'on', '地图声明被读到');
-ok(CM.Mech.on('buildTime') === true, '地图声明 on 时开启');
+ok(CM.Mech.on('buildTime') === true, '本局未声明时跟随地图');
 ok(CM.Mech.opt('buildTime', 'downPayment', 0.4) === 0.25, 'M.opt 取地图声明的 downPayment');
-const store = { mechBuildTime: 'off' };
-CM.Settings = { get: function (k) { return store[k]; } };
-ok(CM.Mech.on('buildTime') === false, '玩家强制 off 覆盖地图的 on');
-store.mechBuildTime = 'on';
-D.mechanics = { buildTime: { mode: 'off' } };
-ok(CM.Mech.on('buildTime') === true, '玩家强制 on 优先于地图的 off');
-store.mechBuildTime = 'auto';
-ok(CM.Mech.on('buildTime') === false, 'auto 时回到地图声明');
 delete D.mechanics;
 ok(CM.Mech.on('landValue') === false, '未实现的机制默认关闭');
-delete CM.Settings;
+ok(CM.Mech.DEF.buildTime === 'off', '默认值表为全关');
+CM.Mech.attach(null);
 
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);
