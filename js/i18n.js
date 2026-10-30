@@ -86,7 +86,7 @@
   function apply(next){
     if(!allowed.includes(next))next='zh-CN';language=next;cache.clear();
     if(typeof document==='undefined')return;document.documentElement.lang=language;document.documentElement.dataset.language=language;
-    localize(document.body);document.title=text('城市与地铁');invalidate();for(const f of listeners)f(language);
+    localize(document.body);document.title=text('城市与地铁')+' · 社区版';invalidate();for(const f of listeners)f(language);
   }
   CM.I18n={text,get:()=>language,apply,localize,name:nameEnglish,search:s=>(String(s)+' '+text(String(s))).toLowerCase(),on(fn){listeners.add(fn);return()=>listeners.delete(fn);},missing:()=>[...missing]};
   if(typeof document==='undefined')return;
