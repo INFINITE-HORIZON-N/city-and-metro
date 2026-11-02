@@ -21,13 +21,21 @@
         if(settled){req.result.close();return;}
         settled=true;db=req.result;const opened=db;
         opened.onversionchange=function(){opened.close();if(db===opened){db=null;dbFailed=false;}};
+        opened.onclose=function(){if(db===opened){db=null;dbFailed=false;}};
         resolve(db);
       };
       req.onerror = req.onblocked = fail;
     }).finally(function(){opening=null;});
     return opening;
   }
-  function idbOp(mode, fn) {
+  // 连接正在关闭 / 已失效：浏览器回收、另一个标签页关闭数据库、或 onversionchange 后 close() 尚未结束时都会这样。
+  // 这类错误是可以自己恢复的，不应该直接抛给玩家。
+  function connDead(e) {
+    if (!e) return false;
+    if (e.name === 'InvalidStateError') return true;
+    return /connection is closing|is not active|database connection/i.test(String(e.message || ''));
+  }
+  function idbOp(mode, fn, retried) {
     return openDB().then(function (d) {
       if (!d) throw new Error('IndexedDB 不可用');
       return new Promise(function (resolve, reject) {
@@ -40,12 +48,18 @@
         tx.onerror = function () { reject(tx.error || new Error('IndexedDB 写入失败')); };
         tx.onabort = function () { reject(tx.error || new Error('IndexedDB 事务中止')); };
       });
+    }).catch(function (e) {
+      if (!retried && connDead(e)) { db = null; dbFailed = false; return idbOp(mode, fn, true); }
+      throw e;
     });
   }
   const store = {
     put: function (key, str) {
       return idbOp('readwrite', function (st) { return st.put(str, key); }).then(function () { return 'idb'; })
-        .catch(function (e) { if (db) throw e; localStorage.setItem(key, str); return 'ls'; });
+        .catch(function (e) {
+          // 重试后仍然失败：退到 localStorage 保住这一次写入；两边都写不进时才把原始错误抛出去
+          try { localStorage.setItem(key, str); return 'ls'; } catch (e2) { throw e; }
+        });
     },
     get: function (key, where) {
       if (where === 'ls') return Promise.resolve(localStorage.getItem(key));
